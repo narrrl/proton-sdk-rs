@@ -51,6 +51,22 @@ impl PrivateKey {
         messages::decrypt_binary(ciphertext, &self.key, &self.password())
     }
 
+    /// Decrypt an armored message addressed to this key and verify its inline
+    /// signature (if any) against `ring`. The plaintext is always returned; the
+    /// [`VerificationStatus`] is non-fatal metadata (C# `NodeCrypto.DecryptMessage`).
+    pub fn decrypt_armored_verify(
+        &self,
+        armored: &str,
+        ring: &super::VerificationKeyRing,
+    ) -> Result<(Vec<u8>, super::VerificationStatus), CryptoError> {
+        super::verify::decrypt_and_verify(armored, &self.key, &self.password(), ring)
+    }
+
+    /// The public half of this key, for use as an anonymous-fallback verifier.
+    pub(crate) fn signed_public_key(&self) -> pgp::composed::SignedPublicKey {
+        self.key.signed_public_key()
+    }
+
     /// Verify an armored detached signature over `data` against this key's
     /// public key. Returns `Ok(())` only on a good signature.
     pub fn verify_detached_signature(&self, armored_sig: &str, data: &[u8]) -> Result<(), CryptoError> {

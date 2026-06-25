@@ -82,9 +82,13 @@ string_id!(
     /// Identifies a Drive link (node) within a volume.
     LinkId
 );
+string_id!(
+    /// Identifies a Drive volume event; doubles as the enumeration cursor.
+    DriveEventId
+);
 
 /// Globally addresses a Drive node: a [`LinkId`] qualified by its [`VolumeId`].
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct NodeUid {
     pub volume_id: VolumeId,
     pub link_id: LinkId,

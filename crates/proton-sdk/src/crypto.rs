@@ -12,6 +12,7 @@ mod errors;
 mod keys;
 mod messages;
 mod srp;
+mod verify;
 
 pub use content::ContentKey;
 pub use derive::derive_key_passphrase;
@@ -19,6 +20,7 @@ pub use encrypt::{generate_node_hash_key, generate_node_key, GeneratedNodeKey};
 pub use errors::CryptoError;
 pub use keys::{decrypt_armored_with_keys, PrivateKey};
 pub use srp::{generate_proofs, SrpProofs, DEFAULT_BIT_LENGTH};
+pub use verify::{verify_detached, PublicKey, VerificationKeyRing, VerificationStatus};
 
 /// Result alias for crypto operations.
 pub type CryptoResult<T> = std::result::Result<T, CryptoError>;
