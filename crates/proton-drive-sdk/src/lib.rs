@@ -31,12 +31,21 @@
 //! # }
 //! ```
 
+mod cache;
 mod client;
 mod crypto;
 mod dtos;
+mod events;
 mod node;
+mod photos;
 
+pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
+pub use events::DriveEvent;
+pub use photos::{PhotoTag, PhotosTimelineItem, ProtonPhotosClient};
+pub use proton_sdk::cache::{
+    CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository,
+};
 pub use node::{Node, NodeKind, Thumbnail, ThumbnailType};
 
 pub use proton_sdk;

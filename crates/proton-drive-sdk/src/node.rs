@@ -1,9 +1,11 @@
 //! Public, decrypted node model returned to callers.
 
+use proton_sdk::crypto::VerificationStatus;
 use proton_sdk::ids::NodeUid;
+use serde::{Deserialize, Serialize};
 
 /// A decrypted Drive node (folder or file).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub uid: NodeUid,
     pub parent_uid: Option<NodeUid>,
@@ -17,16 +19,71 @@ pub struct Node {
     pub trashed: bool,
     /// Email address that signed the node, if present.
     pub signature_email: Option<String>,
+    /// Per-field signature-verification results gathered while decrypting the
+    /// node. Non-fatal metadata (mirrors C# `AuthorshipVerificationFailure`):
+    /// the node is always returned; the caller inspects this to decide trust.
+    #[serde(default)]
+    pub verification: NodeVerification,
+}
+
+/// Outcome of verifying the signatures encountered while decrypting a node.
+///
+/// Each field carries the [`VerificationStatus`] of one signed artifact. The
+/// file-only fields are `None` for folders (and when the artifact is absent).
+/// Mirrors the set of authorship checks C# `NodeCrypto` records.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NodeVerification {
+    /// The node name (inline-signed to the parent key).
+    pub name: VerificationStatus,
+    /// The node passphrase (detached `NodePassphraseSignature`).
+    pub passphrase: VerificationStatus,
+    /// The file content key (`ContentKeyPacketSignature`); `None` for folders.
+    pub content_key: Option<VerificationStatus>,
+    /// The active revision's extended attributes; `None` when absent.
+    pub extended_attributes: Option<VerificationStatus>,
+}
+
+impl Default for NodeVerification {
+    fn default() -> Self {
+        Self {
+            name: VerificationStatus::NotSigned,
+            passphrase: VerificationStatus::NotSigned,
+            content_key: None,
+            extended_attributes: None,
+        }
+    }
+}
+
+impl NodeVerification {
+    /// Whether every signature that was present verified successfully.
+    ///
+    /// `NotSigned` is treated as acceptable (Proton metadata is not always
+    /// signed); only `NoVerifier`/`Failed` count against trust.
+    pub fn is_fully_verified(&self) -> bool {
+        let ok =
+            |s: VerificationStatus| matches!(s, VerificationStatus::Ok | VerificationStatus::NotSigned);
+        ok(self.name)
+            && ok(self.passphrase)
+            && self.content_key.map_or(true, ok)
+            && self.extended_attributes.map_or(true, ok)
+    }
 }
 
 /// Folder- or file-specific node data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
     Folder,
     File {
         media_type: String,
         /// Total encrypted size on cloud storage, in bytes.
         total_size_on_storage: i64,
+        /// Authoritative plaintext size from the active revision's decrypted
+        /// extended attributes (C# `ClaimedSize`). `None` when the revision has
+        /// no `XAttr` or it failed to decrypt.
+        claimed_size: Option<i64>,
+        /// ISO-8601 modification time from the decrypted extended attributes
+        /// (C# `ClaimedModificationTime`), verbatim as written by the uploader.
+        claimed_modification_time: Option<String>,
     },
 }
 

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use proton_sdk::ids::{AddressId, LinkId, ShareId, VolumeId};
+use proton_sdk::ids::{AddressId, DriveEventId, LinkId, ShareId, VolumeId};
 
 /// `GET v2/shares/my-files`
 #[derive(Debug, Deserialize)]
@@ -53,6 +53,45 @@ pub struct LinkDetailsResponse {
     pub links: Vec<LinkDetailsDto>,
 }
 
+/// `GET volumes/{vid}/photos` response (C# `TimelinePhotoListResponse`).
+#[derive(Debug, Deserialize)]
+pub struct TimelinePhotoListResponse {
+    #[serde(rename = "Photos")]
+    pub photos: Vec<TimelinePhotoDto>,
+}
+
+/// One timeline entry (C# `TimelinePhotoDto`). Only the id + capture time are
+/// consumed; the remaining fields are kept for wire fidelity.
+#[derive(Debug, Deserialize)]
+pub struct TimelinePhotoDto {
+    #[serde(rename = "LinkID")]
+    pub id: LinkId,
+    #[serde(rename = "CaptureTime")]
+    pub capture_time: i64,
+    #[serde(rename = "Hash")]
+    pub name_hash: Option<String>,
+    #[serde(rename = "ContentHash")]
+    pub content_hash: Option<String>,
+}
+
+/// `GET volumes/{vid}/trash` response. Trashed links are grouped by the share
+/// they belong to (C# `VolumeTrashResponse` / `ShareTrashDto`).
+#[derive(Debug, Deserialize)]
+pub struct VolumeTrashResponse {
+    #[serde(rename = "Trash")]
+    pub trash_by_share: Vec<ShareTrashDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShareTrashDto {
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "LinkIDs")]
+    pub link_ids: Vec<LinkId>,
+    #[serde(rename = "ParentIDs", default)]
+    pub parent_ids: Vec<LinkId>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LinkDetailsDto {
     #[serde(rename = "Link")]
@@ -81,6 +120,11 @@ pub struct LinkDto {
     pub trash_time: Option<i64>,
     #[serde(rename = "Name")]
     pub name: String,
+    /// Lowercase-hex HMAC-SHA256 name hash under the parent's hash key (C#
+    /// `LinkDto.NameHashDigest`, JSON `NameHash`). Cached as a node's
+    /// `OriginalHash` for later move/rename without re-decrypting the name.
+    #[serde(rename = "NameHash", default)]
+    pub name_hash: Option<String>,
     #[serde(rename = "NodeKey")]
     pub key: String,
     #[serde(rename = "NodePassphrase")]
@@ -135,6 +179,45 @@ pub struct ActiveRevisionDto {
     pub creation_time: i64,
     #[serde(rename = "EncryptedSize")]
     pub encrypted_size: i64,
+    /// Email of the revision signer; empty/absent means the node key signed.
+    /// Resolves the `XAttr` authorship claim (C# `SignatureEmailAddress`).
+    #[serde(rename = "SignatureEmail", default)]
+    pub signature_email: Option<String>,
+    /// Armored PGP message (encrypted to the node key, signed) carrying the
+    /// revision's extended attributes. Decrypts to [`DecryptedExtendedAttributes`].
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: Option<String>,
+}
+
+/// The decrypted `XAttr` JSON payload, read side. Mirrors C# `ExtendedAttributes`
+/// / `CommonExtendedAttributes`; every field is optional because the payload is
+/// produced by heterogeneous clients (the upload-side [`ExtendedAttributes`]
+/// struct only writes a subset).
+#[derive(Debug, Default, Deserialize)]
+pub struct DecryptedExtendedAttributes {
+    #[serde(rename = "Common", default)]
+    pub common: Option<DecryptedCommonExtendedAttributes>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DecryptedCommonExtendedAttributes {
+    /// Authoritative plaintext file size, in bytes.
+    #[serde(rename = "Size", default)]
+    pub size: Option<i64>,
+    /// ISO-8601 modification timestamp, as written by the uploading client.
+    #[serde(rename = "ModificationTime", default)]
+    pub modification_time: Option<String>,
+    #[serde(rename = "BlockSizes", default)]
+    pub block_sizes: Option<Vec<i64>>,
+    #[serde(rename = "Digests", default)]
+    pub digests: Option<DecryptedFileContentDigests>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DecryptedFileContentDigests {
+    /// Lowercase-hex SHA-1 of the full plaintext.
+    #[serde(rename = "SHA1", default)]
+    pub sha1: Option<String>,
 }
 
 /// `GET v2/volumes/{vid}/files/{lid}/revisions/{rid}` — one page of a revision's
@@ -178,11 +261,55 @@ pub struct BlockDto {
 
 #[derive(Debug, Deserialize)]
 pub struct ThumbnailDto {
+    /// Server-assigned thumbnail block id (C# `ThumbnailDto.Id`); resolved to a
+    /// download URL via the `volumes/{vid}/thumbnails` endpoint.
+    #[serde(rename = "ThumbnailID")]
+    pub id: Option<String>,
     #[serde(rename = "Type")]
     pub thumbnail_type: i32,
     /// Base64 SHA-256 digest of the thumbnail's ciphertext (manifest input).
     #[serde(rename = "Hash")]
     pub hash_digest: Option<String>,
+}
+
+/// `POST volumes/{vid}/thumbnails` request: resolve thumbnail ids to download
+/// URLs (C# `ThumbnailBlockListRequest`).
+#[derive(Debug, Serialize)]
+pub struct ThumbnailBlockListRequest {
+    #[serde(rename = "ThumbnailIDs")]
+    pub thumbnail_ids: Vec<String>,
+}
+
+/// `POST volumes/{vid}/thumbnails` response (C# `ThumbnailBlockListResponse`).
+#[derive(Debug, Deserialize)]
+pub struct ThumbnailBlockListResponse {
+    #[serde(rename = "Thumbnails", default)]
+    pub blocks: Vec<ThumbnailBlock>,
+    #[serde(rename = "Errors", default)]
+    pub errors: Vec<ThumbnailBlockError>,
+}
+
+/// A resolved thumbnail block: where to fetch it and the storage token to use
+/// (C# `ThumbnailBlock`).
+#[derive(Debug, Deserialize)]
+pub struct ThumbnailBlock {
+    #[serde(rename = "ThumbnailID")]
+    pub thumbnail_id: String,
+    #[serde(rename = "BareURL")]
+    pub bare_url: String,
+    #[serde(rename = "Token")]
+    pub token: String,
+}
+
+/// Per-thumbnail resolution error (C# `ThumbnailBlockError`).
+#[derive(Debug, Deserialize)]
+pub struct ThumbnailBlockError {
+    #[serde(rename = "ThumbnailID")]
+    pub thumbnail_id: String,
+    #[serde(rename = "Error")]
+    pub error: String,
+    #[serde(rename = "Code", default)]
+    pub code: i32,
 }
 
 /// `GET v2/volumes/{vid}/folders/{lid}/children`
@@ -360,6 +487,39 @@ pub struct MoveLinkRequest {
     pub original_hash: String,
 }
 
+/// `POST v2/volumes/{vid}/links/{folderId}/checkAvailableHashes` request: ask
+/// which of a batch of candidate name hashes are free in a folder (C#
+/// `NodeNameAvailabilityRequest`).
+#[derive(Debug, Serialize)]
+pub struct NodeNameAvailabilityRequest {
+    #[serde(rename = "Hashes")]
+    pub name_hashes: Vec<String>,
+    #[serde(rename = "ClientUID")]
+    pub client_uid: Vec<String>,
+}
+
+/// Response to `checkAvailableHashes` (C# `NodeNameAvailabilityResponse`): the
+/// subset of the requested hashes that are available, plus the taken ones.
+#[derive(Debug, Deserialize)]
+pub struct NodeNameAvailabilityResponse {
+    #[serde(rename = "AvailableHashes", default)]
+    pub available_hashes: Vec<String>,
+    #[serde(rename = "PendingHashes", default)]
+    pub unavailable_hashes: Vec<NameHashUnavailabilityDto>,
+}
+
+/// One taken name hash and the node that holds it (C#
+/// `NameHashDigestUnavailabilityDto`).
+#[derive(Debug, Deserialize)]
+pub struct NameHashUnavailabilityDto {
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "ClientUID")]
+    pub client_uid: Option<String>,
+}
+
 /// `{ LinkIDs: [...] }` — batch link-id body for trash / restore / delete.
 /// Mirrors C# `MultipleLinksNullaryRequest`.
 #[derive(Debug, Serialize)]
@@ -507,6 +667,32 @@ pub struct RevisionUpdateRequest {
     pub checksum_verified: bool,
     #[serde(rename = "XAttr", skip_serializing_if = "Option::is_none")]
     pub extended_attributes: Option<String>,
+    /// Photo-specific seal metadata (capture time, content hash, tags). Present
+    /// only for photo uploads. Mirrors C# `RevisionUpdateRequest.PhotosAttributes`
+    /// (`[JsonPropertyName("Photo")]`).
+    #[serde(rename = "Photo", skip_serializing_if = "Option::is_none")]
+    pub photos_attributes: Option<PhotosAttributesDto>,
+}
+
+/// Photo-specific revision attributes, attached to the seal request for photo
+/// uploads. Mirrors C# `PhotosAttributesDto`.
+#[derive(Debug, Serialize)]
+pub struct PhotosAttributesDto {
+    /// Capture time in seconds since the Unix epoch (C# `EpochSecondsJsonConverter`).
+    #[serde(rename = "CaptureTime")]
+    pub capture_time: i64,
+    /// Lowercase-hex HMAC-SHA256 of the lowercase-hex plaintext SHA-1, keyed by
+    /// the parent folder's hash key (C# `ContentHashDigest`,
+    /// `ForgivingBytesToHexJsonConverter`).
+    #[serde(rename = "ContentHash")]
+    pub content_hash: String,
+    /// Link id of the main photo, when this is a related photo (live/burst).
+    #[serde(rename = "MainPhotoLinkID", skip_serializing_if = "Option::is_none")]
+    pub main_photo_link_id: Option<LinkId>,
+    /// Photo classification tags (their `PhotoTag` discriminants); always
+    /// present, empty when none (C# `Tags ?? []`).
+    #[serde(rename = "Tags")]
+    pub tags: Vec<i32>,
 }
 
 /// The decrypted `XAttr` JSON payload for a revision (encrypted to the node key
@@ -532,4 +718,54 @@ pub struct FileContentDigests {
     /// Lowercase hex SHA-1 of the full plaintext.
     #[serde(rename = "SHA1")]
     pub sha1: String,
+}
+
+/// `GET volumes/{vid}/events/latest` — seeds the enumeration cursor.
+/// C# `LatestVolumeEventResponse`.
+#[derive(Debug, Deserialize)]
+pub struct LatestVolumeEventResponse {
+    #[serde(rename = "EventID")]
+    pub event_id: DriveEventId,
+}
+
+/// `GET v2/volumes/{vid}/events/{cursor}` — one page of volume events.
+/// C# `VolumeEventListResponse`.
+#[derive(Debug, Deserialize)]
+pub struct VolumeEventListResponse {
+    /// Cursor to use for the next request (the last event id in this page).
+    #[serde(rename = "EventID")]
+    pub last_event_id: DriveEventId,
+    #[serde(rename = "Events", default)]
+    pub events: Vec<VolumeEventDto>,
+    /// More pages exist beyond this one.
+    #[serde(rename = "More")]
+    pub more_entries_exist: bool,
+    /// Continuity lost — caller must resync from server state.
+    #[serde(rename = "Refresh")]
+    pub refresh_required: bool,
+}
+
+/// A single volume event. C# `VolumeEventDto`.
+#[derive(Debug, Deserialize)]
+pub struct VolumeEventDto {
+    #[serde(rename = "EventID")]
+    pub id: DriveEventId,
+    /// `VolumeEventType`: 0 = Delete, 1 = Create, 2 = Update, 3 = UpdateMetadata.
+    #[serde(rename = "EventType")]
+    pub event_type: i32,
+    #[serde(rename = "Link")]
+    pub link: VolumeEventLinkDto,
+}
+
+/// The affected link of a volume event. C# `VolumeEventLinkDto`.
+#[derive(Debug, Deserialize)]
+pub struct VolumeEventLinkDto {
+    #[serde(rename = "LinkID")]
+    pub id: LinkId,
+    #[serde(rename = "ParentLinkID")]
+    pub parent_id: Option<LinkId>,
+    #[serde(rename = "IsShared", default)]
+    pub is_shared: bool,
+    #[serde(rename = "IsTrashed", default)]
+    pub is_trashed: bool,
 }
