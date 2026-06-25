@@ -1704,6 +1704,7 @@ dependencies = [
 name = "proton-sdk"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64",
  "bcrypt",
@@ -1711,6 +1712,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "hmac",
  "num-bigint",
  "num-traits",

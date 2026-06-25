@@ -10,28 +10,42 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use proton_sdk::account::AccountClient;
+use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
-use proton_sdk::crypto::{generate_node_hash_key, generate_node_key, ContentKey};
-use proton_sdk::ids::{AddressId, LinkId, NodeUid, ShareId, VolumeId};
+use proton_sdk::crypto::{
+    generate_node_hash_key, generate_node_key, verify_detached, ContentKey, VerificationKeyRing,
+    VerificationStatus,
+};
+use proton_sdk::ids::{AddressId, DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_sdk::session::ProtonApiSession;
+use proton_sdk::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
-use crate::crypto::{decrypt_link, decrypt_share_key};
+use crate::crypto::{
+    decrypt_content_key_verified, decrypt_extended_attributes_verified, decrypt_link,
+    decrypt_link_verified, decrypt_share_key,
+};
 use crate::dtos::{
     AggregateLinksResponse, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
     BlockUploadPreparationResponse, BlockVerificationInputResponse, BlockVerifier,
     CommonExtendedAttributes, ExtendedAttributes, FileContentDigests, FileCreationRequest,
     FileCreationResponse, FolderChildrenResponse, FolderCreationRequest, FolderCreationResponse,
     LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto, LinkType, MoveLinkRequest,
-    MultipleLinksRequest, MyFilesShareResponse, RenameLinkRequest, RevisionCreationRequest,
+    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
+    NodeNameAvailabilityResponse, RenameLinkRequest, RevisionCreationRequest,
     RevisionCreationResponse, RevisionDto, RevisionResponse, RevisionUpdateRequest,
-    ThumbnailCreationRequest, ThumbnailDto,
+    LatestVolumeEventResponse, PhotosAttributesDto, ThumbnailBlockListRequest,
+    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
+    VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
-use crate::node::{Node, NodeKind, Thumbnail};
+use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
+use crate::cache::DriveEntityCache;
+use crate::events::DriveEvent;
+use crate::node::{Node, NodeKind, Thumbnail, ThumbnailType};
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
 const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
@@ -39,6 +53,17 @@ const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
 /// Maximum links per batch trash/restore/delete request (C#
 /// `NodeOperations.MaximumBatchCount`).
 const MAX_BATCH_COUNT: usize = 150;
+
+/// Trashed links requested per page when enumerating the trash (C#
+/// `VolumeOperations.TrashPageSize`).
+const TRASH_PAGE_SIZE: usize = 500;
+
+/// Photos returned per timeline page (C# `PhotosNodeOperations.TimelinePageSize`).
+const TIMELINE_PAGE_SIZE: usize = 500;
+
+/// Candidate name hashes checked per `checkAvailableHashes` request (C#
+/// `NodeOperations.GetAvailableNameAsync` `batchSize`).
+const NAME_AVAILABILITY_BATCH: usize = 10;
 
 /// High-level Proton Drive client.
 ///
@@ -49,7 +74,19 @@ const MAX_BATCH_COUNT: usize = 150;
 pub struct ProtonDriveClient {
     http: ApiHttpClient,
     account: AccountClient,
+    /// In-memory session/secret cache: the resolved My Files share key, root,
+    /// volume id and per-folder decrypted node keys. Mirrors the C#
+    /// `DriveSecretCache` (kept in-memory; PGP keys are not serialized here).
     cache: Arc<Mutex<DriveCache>>,
+    /// Persistable entity cache (node metadata, ids). Mirrors C#
+    /// `DriveEntityCache`; defaults to an in-memory repository but accepts any
+    /// [`CacheRepository`] (e.g. an encrypted/on-disk one) via
+    /// [`ProtonDriveClient::with_entity_cache`].
+    entities: DriveEntityCache,
+    /// Telemetry sink for instrumented operations. Defaults to
+    /// [`NoopTelemetry`]; supply one via
+    /// [`ProtonDriveClient::with_telemetry`].
+    telemetry: Arc<dyn Telemetry>,
 }
 
 #[derive(Default)]
@@ -57,6 +94,14 @@ struct DriveCache {
     main_volume_id: Option<VolumeId>,
     my_files_share: Option<ShareKey>,
     my_files_root: Option<NodeUid>,
+    /// Resolved Photos share + root, populated on first photos access. `None`
+    /// until [`ProtonDriveClient::ensure_photos`] runs; the share fields stay
+    /// `None` when the account has no photos volume yet.
+    photos_share: Option<ShareKey>,
+    photos_root: Option<NodeUid>,
+    /// `Some(false)` records a confirmed-absent photos volume so we don't re-hit
+    /// `v2/shares/photos` on every timeline page; `None` means "not yet checked".
+    photos_volume_exists: Option<bool>,
     /// Decrypted node key per folder, used as the parent key for its children.
     folder_keys: HashMap<NodeUid, PrivateKey>,
 }
@@ -75,6 +120,10 @@ struct RevisionDraft {
     address_id: AddressId,
     email: String,
     signing_key: PrivateKey,
+    /// The parent folder's hash key (HMAC key). Carried from draft creation so a
+    /// photo seal can compute its `ContentHash` without re-fetching it. Empty for
+    /// new-revision drafts (which don't recompute it).
+    parent_hash_key: Vec<u8>,
 }
 
 /// Outcome of writing every content block of a revision: the content manifest
@@ -89,7 +138,6 @@ struct BlockWriteResult {
 
 #[derive(Clone)]
 struct ShareKey {
-    #[allow(dead_code)]
     share_id: ShareId,
     /// The address that owns the share — the membership/signing address used
     /// when creating nodes under it.
@@ -99,12 +147,47 @@ struct ShareKey {
 
 impl ProtonDriveClient {
     /// Build a Drive client from a resumed session and the mailbox password.
+    ///
+    /// The entity cache defaults to an in-memory store; use
+    /// [`with_entity_cache`](Self::with_entity_cache) to supply a persistent
+    /// (e.g. encrypted/on-disk) [`CacheRepository`].
     pub fn new(session: &ProtonApiSession, mailbox_password: impl Into<Vec<u8>>) -> Self {
+        Self::with_entity_cache(session, mailbox_password, InMemoryCacheRepository::shared())
+    }
+
+    /// Build a Drive client backed by a caller-supplied entity-cache
+    /// repository. Wrap it in an
+    /// [`EncryptedCacheRepository`](proton_sdk::cache::EncryptedCacheRepository)
+    /// and/or an on-disk implementation to persist node metadata across runs.
+    pub fn with_entity_cache(
+        session: &ProtonApiSession,
+        mailbox_password: impl Into<Vec<u8>>,
+        entity_repository: Arc<dyn CacheRepository>,
+    ) -> Self {
         Self {
             http: session.http().clone(),
             account: AccountClient::new(session, mailbox_password),
             cache: Arc::new(Mutex::new(DriveCache::default())),
+            entities: DriveEntityCache::new(entity_repository),
+            telemetry: NoopTelemetry::shared(),
         }
+    }
+
+    /// Attach a telemetry observer to receive a
+    /// [`TelemetryEvent`](proton_sdk::telemetry::TelemetryEvent) for each
+    /// instrumented operation (transfers, navigation, mutations) plus a
+    /// per-request event from the shared HTTP client (`http_request` for API
+    /// calls, `storage_download` / `storage_upload` for block storage).
+    /// Defaults to a no-op sink; pass
+    /// [`TracingTelemetry::shared`](proton_sdk::telemetry::TracingTelemetry::shared)
+    /// to bridge into `tracing`, or any custom [`Telemetry`] implementation.
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn Telemetry>) -> Self {
+        // Also feed the shared HTTP client so per-request events (the
+        // `http_request` / `storage_download` / `storage_upload` ops) reach the
+        // same sink as the high-level Drive ops.
+        self.http.set_telemetry(telemetry.clone());
+        self.telemetry = telemetry;
+        self
     }
 
     /// Resolve (and cache) the user's "My Files" root folder.
@@ -126,10 +209,13 @@ impl ProtonDriveClient {
 
     /// Fetch a single node's decrypted metadata, or `None` if it does not exist.
     pub async fn get_node(&self, uid: &NodeUid) -> Result<Option<Node>> {
+        let mut timer = self.telemetry.start("get_node");
         let response = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
         let Some(details) = response.links.into_iter().next() else {
+            // Not found is a successful lookup, not a failure.
+            timer.success();
             return Ok(None);
         };
 
@@ -137,11 +223,13 @@ impl ProtonDriveClient {
             .resolve_parent_key(&uid.volume_id, &details.link)
             .await?;
         let node = self.build_node(&uid.volume_id, &details, &parent_key).await?;
+        timer.success();
         Ok(Some(node))
     }
 
     /// Enumerate the (non-trashed) children of a folder.
     pub async fn enumerate_folder_children(&self, folder_uid: &NodeUid) -> Result<Vec<Node>> {
+        let mut timer = self.telemetry.start("enumerate_folder_children");
         let folder_key = self.folder_node_key(folder_uid).await?;
 
         let mut nodes = Vec::new();
@@ -186,6 +274,95 @@ impl ProtonDriveClient {
             }
         }
 
+        timer.attr("node_count", nodes.len());
+        timer.success();
+        Ok(nodes)
+    }
+
+    /// Fetch decrypted metadata for many nodes in one pass.
+    ///
+    /// Mirrors C# `NodeOperations.EnumerateNodesAsync(uids)`: the uids are
+    /// grouped by volume and their link details fetched in batches of
+    /// [`MAX_BATCH_COUNT`], then each node is decrypted against its resolved
+    /// parent key. A node that does not exist is simply omitted; one that fails
+    /// to decrypt is logged and skipped (matching enumeration's partial-node
+    /// behavior), so the result may be shorter than `uids`.
+    pub async fn enumerate_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
+        let mut nodes = Vec::new();
+
+        for (volume_id, link_ids) in group_by_volume(uids) {
+            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
+                let details = self.get_link_details(&volume_id, chunk).await?;
+                for detail in &details.links {
+                    let parent_key = match self.resolve_parent_key(&volume_id, &detail.link).await {
+                        Ok(key) => key,
+                        Err(e) => {
+                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping node: parent key unavailable");
+                            continue;
+                        }
+                    };
+                    match self.build_node(&volume_id, detail, &parent_key).await {
+                        Ok(node) => nodes.push(node),
+                        Err(e) => {
+                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping undecryptable node");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(nodes)
+    }
+
+    /// Enumerate the trashed nodes of the main volume.
+    ///
+    /// Mirrors C# `VolumeOperations.EnumerateTrashAsync`: page the trash listing
+    /// (`GET volumes/{vid}/trash`), which groups trashed links by share, then
+    /// decrypt each group's links against their resolved parent keys. As with
+    /// other enumeration paths, a node that fails to decrypt is logged and
+    /// skipped rather than aborting the listing.
+    pub async fn enumerate_trash(&self) -> Result<Vec<Node>> {
+        let volume_id = self.main_volume_id().await?;
+
+        let mut nodes = Vec::new();
+        let mut page = 0_usize;
+
+        loop {
+            let path =
+                format!("volumes/{volume_id}/trash?pageSize={TRASH_PAGE_SIZE}&page={page}");
+            let response: VolumeTrashResponse = self.http.get(&path).await?;
+
+            let mut count = 0_usize;
+            for group in &response.trash_by_share {
+                count += group.link_ids.len();
+                for chunk in group.link_ids.chunks(MAX_BATCH_COUNT) {
+                    let details = self.get_link_details(&volume_id, chunk).await?;
+                    for detail in &details.links {
+                        let parent_key =
+                            match self.resolve_parent_key(&volume_id, &detail.link).await {
+                                Ok(key) => key,
+                                Err(e) => {
+                                    tracing::warn!(link_id = %detail.link.id, error = %e, "skipping trashed node: parent key unavailable");
+                                    continue;
+                                }
+                            };
+                        match self.build_node(&volume_id, detail, &parent_key).await {
+                            Ok(node) => nodes.push(node),
+                            Err(e) => {
+                                tracing::warn!(link_id = %detail.link.id, error = %e, "skipping undecryptable trashed node");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // A full page implies there may be more (C# `mustTryMoreResults`).
+            if count < TRASH_PAGE_SIZE {
+                break;
+            }
+            page += 1;
+        }
+
         Ok(nodes)
     }
 
@@ -199,6 +376,75 @@ impl ProtonDriveClient {
             .main_volume_id
             .clone()
             .expect("ensure_my_files populates the volume id"))
+    }
+
+    /// The latest event id for a volume — the cursor seed for incremental sync.
+    ///
+    /// C# `VolumesApiClient.GetLatestEventAsync` (`GET volumes/{vid}/events/latest`).
+    pub async fn latest_event_id(&self, volume_id: &VolumeId) -> Result<DriveEventId> {
+        let path = format!("volumes/{volume_id}/events/latest");
+        let response: LatestVolumeEventResponse = self.http.get(&path).await?;
+        Ok(response.event_id)
+    }
+
+    /// Enumerate volume events from `cursor`, draining every page.
+    ///
+    /// Mirrors C# `VolumeOperations.EnumerateEventsAsync`:
+    /// - `cursor == None` seeds the stream: returns a single
+    ///   [`DriveEvent::CursorAdvanced`] carrying the latest event id; the caller
+    ///   persists it and passes it as `cursor` next time.
+    /// - otherwise pages `GET v2/volumes/{vid}/events/{cursor}` until `More` is
+    ///   false. A `Refresh` page yields a terminal [`DriveEvent::ContinuityLost`]
+    ///   (caller must resync). An empty page only emits
+    ///   [`DriveEvent::CursorAdvanced`] when the server cursor moved.
+    ///
+    /// The caller persists the last returned event's [`id`](DriveEvent::id) as
+    /// the next cursor.
+    pub async fn enumerate_events(
+        &self,
+        volume_id: &VolumeId,
+        cursor: Option<&DriveEventId>,
+    ) -> Result<Vec<DriveEvent>> {
+        let mut cursor = match cursor {
+            Some(cursor) => cursor.clone(),
+            None => {
+                let id = self.latest_event_id(volume_id).await?;
+                return Ok(vec![DriveEvent::CursorAdvanced { id }]);
+            }
+        };
+
+        let mut events = Vec::new();
+        loop {
+            let path = format!("v2/volumes/{volume_id}/events/{cursor}");
+            let page: VolumeEventListResponse = self.http.get(&path).await?;
+
+            if page.refresh_required {
+                events.push(DriveEvent::ContinuityLost {
+                    id: page.last_event_id,
+                });
+                break;
+            }
+
+            if page.events.is_empty() {
+                if page.last_event_id != cursor {
+                    events.push(DriveEvent::CursorAdvanced {
+                        id: page.last_event_id,
+                    });
+                }
+                break;
+            }
+
+            for event in &page.events {
+                events.push(to_drive_event(volume_id, event)?);
+            }
+
+            if !page.more_entries_exist {
+                break;
+            }
+            cursor = page.last_event_id;
+        }
+
+        Ok(events)
     }
 
     /// Download and decrypt a file's active revision, returning its plaintext.
@@ -224,6 +470,7 @@ impl ProtonDriveClient {
         uid: &NodeUid,
         output: &mut W,
     ) -> Result<()> {
+        let mut timer = self.telemetry.start("download_file");
         let details = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
@@ -256,6 +503,7 @@ impl ProtonDriveClient {
         let (revision, blocks) = self
             .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
             .await?;
+        timer.attr("block_count", blocks.len());
 
         // Manifest: thumbnail digests (ordered by type) then block digests in order.
         let mut manifest = Vec::new();
@@ -283,8 +531,96 @@ impl ProtonDriveClient {
             manifest.extend_from_slice(&digest);
         }
 
-        verify_manifest(&revision, &node_key, &manifest);
+        verify_manifest(&self.account, &revision, &node_key, &manifest).await;
+        timer.success();
         Ok(())
+    }
+
+    /// Download and decrypt a file's thumbnail of the given type, if it has one.
+    ///
+    /// Mirrors C# `FileOperations.EnumerateThumbnailsAsync` (single-file): pick
+    /// the active revision's thumbnail header of `thumbnail_type`, resolve its
+    /// block to a download URL (`POST volumes/{vid}/thumbnails`), fetch the
+    /// ciphertext from block storage and decrypt it with the content key — the
+    /// same session key and block format as content blocks. Returns `Ok(None)`
+    /// when the file has no thumbnail of that type.
+    pub async fn download_thumbnail(
+        &self,
+        uid: &NodeUid,
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>> {
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let detail = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("file {uid} not found")))?;
+        let link = detail.link;
+        let file = detail
+            .file
+            .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
+
+        let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
+            ProtonError::invalid_operation("file is missing its content key packet")
+        })?;
+        let content_key_packet = BASE64
+            .decode(content_key_packet_b64.trim())
+            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let revision_id = file
+            .active_revision
+            .map(|r| r.id)
+            .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?;
+
+        let parent_key = self.resolve_parent_key(&uid.volume_id, &link).await?;
+        let node_key = decrypt_link(&parent_key, &link)?.node_key;
+        let content_key = node_key.decrypt_content_key(&content_key_packet)?;
+
+        // The revision's thumbnail headers carry the block id we resolve below.
+        let (revision, _blocks) = self
+            .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
+            .await?;
+        let wanted = thumbnail_type.as_i32();
+        let thumbnail_id = revision
+            .thumbnails
+            .iter()
+            .find(|t| t.thumbnail_type == wanted)
+            .and_then(|t| t.id.clone());
+        let thumbnail_id = match thumbnail_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let response: ThumbnailBlockListResponse = self
+            .http
+            .post(
+                &format!("volumes/{}/thumbnails", uid.volume_id),
+                &ThumbnailBlockListRequest {
+                    thumbnail_ids: vec![thumbnail_id.clone()],
+                },
+            )
+            .await?;
+        let block = response
+            .blocks
+            .into_iter()
+            .find(|b| b.thumbnail_id == thumbnail_id)
+            .ok_or_else(|| {
+                let reason = response
+                    .errors
+                    .iter()
+                    .find(|e| e.thumbnail_id == thumbnail_id)
+                    .map(|e| e.error.clone())
+                    .unwrap_or_else(|| "thumbnail block not returned".to_string());
+                ProtonError::invalid_operation(format!("resolve thumbnail block: {reason}"))
+            })?;
+
+        let ciphertext = self
+            .http
+            .get_storage_blob(&block.bare_url, &block.token)
+            .await?;
+        let plaintext = content_key.decrypt_block(&ciphertext)?;
+        Ok(Some(plaintext))
     }
 
     /// Upload a new file under `parent_uid` with the given plaintext `contents`.
@@ -340,14 +676,18 @@ impl ProtonDriveClient {
         thumbnails: Vec<Thumbnail>,
         aead: bool,
     ) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("upload_file");
+        timer.attr("aead", aead);
         let draft = self
-            .create_file_draft(parent_uid, name, media_type, intended_size, aead)
+            .create_file_draft(parent_uid, name, media_type, intended_size, aead, false)
             .await?;
         let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
 
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
-        self.seal_revision(&draft, &written).await?;
+        timer.attr("size", written.total_size);
+        self.seal_revision(&draft, &written, None).await?;
 
+        timer.success();
         Ok(file_uid)
     }
 
@@ -378,12 +718,62 @@ impl ProtonDriveClient {
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
     ) -> Result<()> {
+        let mut timer = self.telemetry.start("upload_new_revision");
         let draft = self.create_revision_draft(file_uid, intended_size).await?;
 
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
-        self.seal_revision(&draft, &written).await?;
+        timer.attr("size", written.total_size);
+        self.seal_revision(&draft, &written, None).await?;
 
+        timer.success();
         Ok(())
+    }
+
+    /// Upload a photo under the Photos root, sealing the revision with photo
+    /// metadata (capture time, content hash, tags).
+    ///
+    /// Mirrors C# `ProtonPhotosClient.GetFileUploaderAsync` +
+    /// `RevisionWriter.CreatePhotosRevisionUpdateRequest`: the draft is a normal
+    /// file under the photos root (photos-routed key/hash-key resolution and the
+    /// photos share's membership address), and the seal adds a `Photo` attribute
+    /// block. Errors when the account has no photos volume. Live validation
+    /// pending.
+    pub(crate) async fn upload_photo_from<R: Read + Send>(
+        &self,
+        name: &str,
+        media_type: &str,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        metadata: &PhotoUploadMetadata,
+        aead: bool,
+    ) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("upload_photo");
+        timer.attr("aead", aead);
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation("account has no photos volume"));
+        }
+        let parent_uid = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+
+        let draft = self
+            .create_file_draft(&parent_uid, name, media_type, intended_size, aead, true)
+            .await?;
+        let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
+
+        let written = self.write_blocks(&draft, reader, thumbnails).await?;
+        timer.attr("size", written.total_size);
+        let photos_attributes = build_photos_attributes(&draft.parent_hash_key, &written, metadata);
+        self.seal_revision(&draft, &written, Some(photos_attributes))
+            .await?;
+
+        timer.success();
+        Ok(file_uid)
     }
 
     /// Create a new (empty) folder named `name` under `parent_uid`, returning
@@ -394,6 +784,7 @@ impl ProtonDriveClient {
     /// and sign the name/passphrase/hash-key to the parent (the hash key to the
     /// folder's own node key), then POST the folder. Live validation pending.
     pub async fn create_folder(&self, parent_uid: &NodeUid, name: &str) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("create_folder");
         let volume_id = parent_uid.volume_id.clone();
 
         // Resolve the parent folder key + hash key and the membership address.
@@ -425,7 +816,63 @@ impl ProtonDriveClient {
         let path = format!("v2/volumes/{volume_id}/folders");
         let created: FolderCreationResponse = self.http.post(&path, &request).await?;
 
+        timer.success();
         Ok(NodeUid::new(volume_id, created.folder.link_id))
+    }
+
+    /// Resolve a free name for a new child of `parent_uid`, starting from
+    /// `name`.
+    ///
+    /// Mirrors C# `NodeOperations.GetAvailableNameAsync`: hash `name` and a
+    /// stream of alternates (`name`, `name (1)`, `name (2)`, …) under the parent
+    /// folder's hash key and ask the server which hashes are free
+    /// (`checkAvailableHashes`), a batch of [`NAME_AVAILABILITY_BATCH`] at a
+    /// time, returning the first available candidate. Call before create/upload
+    /// to dodge `NameHashDigest` collisions. Returns `name` unchanged when it is
+    /// already free.
+    pub async fn get_available_name(&self, parent_uid: &NodeUid, name: &str) -> Result<String> {
+        let parent_key = self.folder_node_key(parent_uid).await?;
+        let parent_hash_key = self.parent_hash_key(parent_uid, &parent_key).await?;
+        let client_uid = self.http.session_id().to_string();
+
+        // Candidate stream: the original name first, then `name (1)`, `name (2)`…
+        let mut candidates = std::iter::once(name.to_string()).chain(alternate_names(name));
+
+        loop {
+            // Build one batch of candidates and their hex name-hash digests.
+            let mut by_digest: HashMap<String, String> = HashMap::new();
+            let mut order: Vec<String> = Vec::new();
+            for candidate in candidates.by_ref().take(NAME_AVAILABILITY_BATCH) {
+                let digest = hex::encode(hmac_sha256(&parent_hash_key, candidate.as_bytes()));
+                order.push(digest.clone());
+                by_digest.insert(digest, candidate);
+            }
+            if order.is_empty() {
+                // Unreachable in practice (the alternate stream is unbounded).
+                return Err(ProtonError::invalid_operation(
+                    "exhausted candidate names without finding a free one",
+                ));
+            }
+
+            let request = NodeNameAvailabilityRequest {
+                name_hashes: order,
+                client_uid: vec![client_uid.clone()],
+            };
+            let path = format!(
+                "v2/volumes/{}/links/{}/checkAvailableHashes",
+                parent_uid.volume_id, parent_uid.link_id
+            );
+            let response: NodeNameAvailabilityResponse = self.http.post(&path, &request).await?;
+
+            // Take the first hash the server reports free and map it back to its
+            // name (C# returns `AvailableHashes[0]`).
+            if let Some(digest) = response.available_hashes.into_iter().next() {
+                return by_digest.remove(&digest).ok_or_else(|| {
+                    ProtonError::invalid_operation("server returned an unknown name hash digest")
+                });
+            }
+            // Whole batch taken — try the next batch of alternates.
+        }
     }
 
     /// Rename `uid` to `new_name`, re-encrypting the name to its parent folder.
@@ -435,6 +882,7 @@ impl ProtonDriveClient {
     /// node's *current* name hash as `OriginalHash`. `MIMEType` is the file's
     /// media type (unchanged) or `null` for a folder. Live validation pending.
     pub async fn rename_node(&self, uid: &NodeUid, new_name: &str) -> Result<()> {
+        let mut timer = self.telemetry.start("rename_node");
         let details = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
@@ -455,9 +903,12 @@ impl ProtonDriveClient {
         let parent_hash_key = self.parent_hash_key(&parent_uid, &parent_key).await?;
         let (_address_id, email, signing_key) = self.membership_address().await?;
 
-        // The original (current) name hash, recomputed from the decrypted name.
-        let current_name = parent_key.decrypt_armored_message(&link.name)?;
-        let original_hash = hex::encode(hmac_sha256(&parent_hash_key, &current_name));
+        // The original (current) name hash: from cache if the node was read
+        // earlier (C# reads it from `CachedNodeInfo`), else from the link DTO,
+        // else recomputed from the decrypted name.
+        let original_hash = self
+            .original_name_hash(uid, &link, &parent_key, &parent_hash_key)
+            .await?;
 
         let encrypted_name =
             parent_key.encrypt_and_sign(&signing_key, new_name.as_bytes(), true, false)?;
@@ -473,6 +924,7 @@ impl ProtonDriveClient {
         };
         let path = format!("v2/volumes/{}/links/{}/rename", uid.volume_id, uid.link_id);
         let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+        timer.success();
         Ok(())
     }
 
@@ -489,6 +941,7 @@ impl ProtonDriveClient {
     /// same-volume moves are supported (cross-volume needs `NewShareID` +
     /// re-signing). Live validation pending.
     pub async fn move_node(&self, uid: &NodeUid, new_parent: &NodeUid) -> Result<()> {
+        let mut timer = self.telemetry.start("move_node");
         if uid.volume_id != new_parent.volume_id {
             return Err(ProtonError::invalid_operation(
                 "cross-volume move is not supported",
@@ -518,7 +971,13 @@ impl ProtonDriveClient {
             .parent_hash_key(&source_parent_uid, &source_parent_key)
             .await?;
         let name = source_parent_key.decrypt_armored_message(&link.name)?;
-        let original_hash = hex::encode(hmac_sha256(&source_hash_key, &name));
+        // Prefer the cached/server name hash (C# `CachedNodeInfo.NameHashDigest`);
+        // the decrypted name is needed below for re-encryption regardless, so the
+        // fallback recompute here is free.
+        let original_hash = match self.cached_original_name_hash(uid, &link).await? {
+            Some(hash) => hash,
+            None => hex::encode(hmac_sha256(&source_hash_key, &name)),
+        };
 
         // Destination side: rewrap the passphrase, re-encrypt + sign the name,
         // and hash it under the destination's hash key.
@@ -542,12 +1001,15 @@ impl ProtonDriveClient {
         };
         let path = format!("v2/volumes/{}/links/{}/move", uid.volume_id, uid.link_id);
         let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+        timer.success();
         Ok(())
     }
 
     /// Move `uids` to the trash. Mirrors C# `NodeOperations.TrashAsync`
     /// (`POST v2/volumes/{vid}/trash_multiple`). Live validation pending.
     pub async fn trash_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+        let mut timer = self.telemetry.start("trash_nodes");
+        timer.attr("node_count", uids.len());
         for (volume_id, link_ids) in group_by_volume(uids) {
             for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
                 let path = format!("v2/volumes/{volume_id}/trash_multiple");
@@ -556,6 +1018,7 @@ impl ProtonDriveClient {
                 check_aggregate("trash", response)?;
             }
         }
+        timer.success();
         Ok(())
     }
 
@@ -563,6 +1026,8 @@ impl ProtonDriveClient {
     /// `NodeOperations.RestoreFromTrashAsync`
     /// (`PUT v2/volumes/{vid}/trash/restore_multiple`). Live validation pending.
     pub async fn restore_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+        let mut timer = self.telemetry.start("restore_nodes");
+        timer.attr("node_count", uids.len());
         for (volume_id, link_ids) in group_by_volume(uids) {
             for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
                 let path = format!("v2/volumes/{volume_id}/trash/restore_multiple");
@@ -571,6 +1036,7 @@ impl ProtonDriveClient {
                 check_aggregate("restore", response)?;
             }
         }
+        timer.success();
         Ok(())
     }
 
@@ -578,6 +1044,8 @@ impl ProtonDriveClient {
     /// C# `NodeOperations.DeleteFromTrashAsync`
     /// (`POST v2/volumes/{vid}/trash/delete_multiple`). Live validation pending.
     pub async fn delete_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+        let mut timer = self.telemetry.start("delete_nodes");
+        timer.attr("node_count", uids.len());
         for (volume_id, link_ids) in group_by_volume(uids) {
             for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
                 let path = format!("v2/volumes/{volume_id}/trash/delete_multiple");
@@ -586,6 +1054,7 @@ impl ProtonDriveClient {
                 check_aggregate("delete", response)?;
             }
         }
+        timer.success();
         Ok(())
     }
 
@@ -593,9 +1062,11 @@ impl ProtonDriveClient {
     /// `TrashApiClient.EmptyAsync` (`DELETE volumes/{vid}/trash`). Live
     /// validation pending.
     pub async fn empty_trash(&self) -> Result<()> {
+        let mut timer = self.telemetry.start("empty_trash");
         let volume_id = self.main_volume_id().await?;
         let path = format!("volumes/{volume_id}/trash");
         let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        timer.success();
         Ok(())
     }
 
@@ -611,13 +1082,21 @@ impl ProtonDriveClient {
         media_type: &str,
         intended_upload_size: i64,
         aead: bool,
+        for_photos: bool,
     ) -> Result<RevisionDraft> {
         let volume_id = parent_uid.volume_id.clone();
 
         // Resolve the parent folder key + hash key and the membership address.
+        // For photos these route to the photos volume / share.
         let parent_key = self.folder_node_key(parent_uid).await?;
-        let parent_hash_key = self.parent_hash_key(parent_uid, &parent_key).await?;
-        let (address_id, email, signing_key) = self.membership_address().await?;
+        let parent_hash_key = self
+            .parent_hash_key_ctx(parent_uid, &parent_key, for_photos)
+            .await?;
+        let (address_id, email, signing_key) = if for_photos {
+            self.photos_membership_address().await?
+        } else {
+            self.membership_address().await?
+        };
 
         // Generate the node key + content key and the file-creation secrets.
         let node = generate_node_key()?;
@@ -661,6 +1140,7 @@ impl ProtonDriveClient {
             address_id,
             email,
             signing_key,
+            parent_hash_key,
         })
     }
 
@@ -723,6 +1203,7 @@ impl ProtonDriveClient {
             address_id,
             email,
             signing_key,
+            parent_hash_key: Vec::new(),
         })
     }
 
@@ -878,6 +1359,7 @@ impl ProtonDriveClient {
         &self,
         draft: &RevisionDraft,
         written: &BlockWriteResult,
+        photos_attributes: Option<PhotosAttributesDto>,
     ) -> Result<()> {
         let manifest_signature = draft.signing_key.sign_detached(&written.manifest)?;
 
@@ -900,6 +1382,7 @@ impl ProtonDriveClient {
             signature_address: draft.email.clone(),
             checksum_verified: false,
             extended_attributes: Some(encrypted_xattr),
+            photos_attributes,
         };
         let seal_path = format!(
             "v2/volumes/{}/files/{}/revisions/{}",
@@ -922,7 +1405,33 @@ impl ProtonDriveClient {
             .expect("ensure_my_files populates the share")
             .address_id
             .clone();
+        self.resolve_membership_address(address_id).await
+    }
 
+    /// The membership address for the Photos share. Errors when the account has
+    /// no photos volume. C# resolves this from the node's context share; here the
+    /// photos share's `MembershipAddressId` is cached by [`ensure_photos`].
+    async fn photos_membership_address(&self) -> Result<(AddressId, String, PrivateKey)> {
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation("account has no photos volume"));
+        }
+        let address_id = self
+            .cache
+            .lock()
+            .await
+            .photos_share
+            .as_ref()
+            .expect("ensure_photos populated the photos share")
+            .address_id
+            .clone();
+        self.resolve_membership_address(address_id).await
+    }
+
+    /// Resolve a membership address id to its email + primary signing key.
+    async fn resolve_membership_address(
+        &self,
+        address_id: AddressId,
+    ) -> Result<(AddressId, String, PrivateKey)> {
         let address = self
             .account
             .addresses()
@@ -946,8 +1455,23 @@ impl ProtonDriveClient {
         parent_uid: &NodeUid,
         parent_key: &PrivateKey,
     ) -> Result<Vec<u8>> {
+        self.parent_hash_key_ctx(parent_uid, parent_key, false).await
+    }
+
+    /// As [`parent_hash_key`](Self::parent_hash_key), but routes the link-details
+    /// lookup to the photos volume endpoint when `for_photos`.
+    async fn parent_hash_key_ctx(
+        &self,
+        parent_uid: &NodeUid,
+        parent_key: &PrivateKey,
+        for_photos: bool,
+    ) -> Result<Vec<u8>> {
         let details = self
-            .get_link_details(&parent_uid.volume_id, std::slice::from_ref(&parent_uid.link_id))
+            .get_link_details_ctx(
+                &parent_uid.volume_id,
+                std::slice::from_ref(&parent_uid.link_id),
+                for_photos,
+            )
             .await?;
         let folder = details
             .links
@@ -1074,6 +1598,266 @@ impl ProtonDriveClient {
             .clone())
     }
 
+    /// Resolve the Photos share + root folder, caching them.
+    ///
+    /// Mirrors C# `PhotosNodeOperations.GetFreshExistingPhotosFolderAsync`:
+    /// `GET v2/shares/photos`, decrypt the share key, decrypt the root link.
+    /// Returns `false` (and records the absence) when the account has no photos
+    /// volume — the API answers [`ResponseCode::DoesNotExist`], which C# catches
+    /// the same way. Read-only: it does not create a photos volume.
+    async fn ensure_photos(&self) -> Result<bool> {
+        {
+            let cache = self.cache.lock().await;
+            if let Some(exists) = cache.photos_volume_exists {
+                return Ok(exists);
+            }
+        }
+
+        let response: MyFilesShareResponse = match self.http.get("v2/shares/photos").await {
+            Ok(response) => response,
+            Err(ProtonError::Api(e)) if e.code == proton_sdk::api::ResponseCode::DoesNotExist => {
+                self.cache.lock().await.photos_volume_exists = Some(false);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let volume_id = response.volume.id.clone();
+        let share_id = response.share.id.clone();
+        let share_key = decrypt_share_key(&self.account, &response.share).await?;
+
+        let root_link = &response.link.link;
+        let root_uid = NodeUid::new(volume_id.clone(), root_link.id.clone());
+        let decrypted_root = decrypt_link(&share_key, root_link)?;
+
+        let mut cache = self.cache.lock().await;
+        cache.photos_root = Some(root_uid.clone());
+        cache.folder_keys.insert(root_uid, decrypted_root.node_key);
+        cache.photos_share = Some(ShareKey {
+            share_id,
+            address_id: response.share.address_id.clone(),
+            key: share_key,
+        });
+        cache.photos_volume_exists = Some(true);
+        Ok(true)
+    }
+
+    async fn photos_share_key(&self) -> Result<PrivateKey> {
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
+        }
+        Ok(self
+            .cache
+            .lock()
+            .await
+            .photos_share
+            .as_ref()
+            .expect("ensure_photos populated the photos share")
+            .key
+            .clone())
+    }
+
+    /// The resolved Photos share id, if Photos has been resolved.
+    async fn photos_share_id(&self) -> Option<ShareId> {
+        self.cache
+            .lock()
+            .await
+            .photos_share
+            .as_ref()
+            .map(|share| share.share_id.clone())
+    }
+
+    /// The Photos root folder, or `None` if the account has no photos volume.
+    /// C# `PhotosNodeOperations.TryGetExistingPhotosFolderAsync` (read-only:
+    /// does not create one).
+    pub(crate) async fn get_photos_root(&self) -> Result<Option<Node>> {
+        if !self.ensure_photos().await? {
+            return Ok(None);
+        }
+        let root_uid = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+        self.get_photos_node(&root_uid).await
+    }
+
+    /// Fetch a single photo/photos-volume node, routed to the photos endpoint.
+    /// C# `ProtonPhotosClient.GetNodeAsync` (`EnumerateNodesAsync forPhotos`).
+    pub(crate) async fn get_photos_node(&self, uid: &NodeUid) -> Result<Option<Node>> {
+        let response = self
+            .get_link_details_ctx(&uid.volume_id, std::slice::from_ref(&uid.link_id), true)
+            .await?;
+        let Some(details) = response.links.into_iter().next() else {
+            return Ok(None);
+        };
+        let parent_key = self
+            .resolve_parent_key_ctx(&uid.volume_id, &details.link, true)
+            .await?;
+        let node = self
+            .build_node_ctx(&uid.volume_id, &details, &parent_key, true)
+            .await?;
+        Ok(Some(node))
+    }
+
+    /// Fetch decrypted metadata for many photo nodes (photos routing).
+    /// C# `ProtonPhotosClient.EnumerateNodesAsync`. Undecryptable nodes are
+    /// logged and skipped, matching the main-volume enumeration behavior.
+    pub(crate) async fn enumerate_photos_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
+        let mut nodes = Vec::new();
+        for (volume_id, link_ids) in group_by_volume(uids) {
+            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
+                let details = self.get_link_details_ctx(&volume_id, chunk, true).await?;
+                for detail in &details.links {
+                    let parent_key = match self
+                        .resolve_parent_key_ctx(&volume_id, &detail.link, true)
+                        .await
+                    {
+                        Ok(key) => key,
+                        Err(e) => {
+                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping photo: parent key unavailable");
+                            continue;
+                        }
+                    };
+                    match self
+                        .build_node_ctx(&volume_id, detail, &parent_key, true)
+                        .await
+                    {
+                        Ok(node) => nodes.push(node),
+                        Err(e) => {
+                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping undecryptable photo");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// Page the photos timeline newest-first.
+    ///
+    /// Mirrors C# `PhotosNodeOperations.EnumeratePhotosTimelineAsync`:
+    /// `GET volumes/{vid}/photos`, 500 per page, anchored on the last link id of
+    /// a full page. Returns an empty list when no photos volume exists.
+    pub(crate) async fn enumerate_photos_timeline(&self) -> Result<Vec<PhotosTimelineItem>> {
+        if !self.ensure_photos().await? {
+            return Ok(Vec::new());
+        }
+        let volume_id = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .as_ref()
+            .expect("ensure_photos populated the photos root")
+            .volume_id
+            .clone();
+
+        let mut items = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+        loop {
+            let mut path = format!("volumes/{volume_id}/photos");
+            if let Some(anchor_id) = &anchor {
+                path.push_str(&format!("?PreviousPageLastLinkID={anchor_id}"));
+            }
+            let page: TimelinePhotoListResponse = self.http.get(&path).await?;
+            let count = page.photos.len();
+
+            for photo in &page.photos {
+                items.push(PhotosTimelineItem {
+                    uid: NodeUid::new(volume_id.clone(), photo.id.clone()),
+                    capture_time: photo.capture_time,
+                });
+            }
+
+            if count == TIMELINE_PAGE_SIZE {
+                anchor = page.photos.last().map(|p| p.id.clone());
+            } else {
+                break;
+            }
+            if anchor.is_none() {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// Download and decrypt a photo's active revision into `output` (photos
+    /// routing). C# `PhotosFileDownloader`: the node is resolved via the photos
+    /// endpoint; blocks are fetched from their absolute storage URLs exactly as
+    /// for main-volume files.
+    pub(crate) async fn download_photo_to<W: std::io::Write>(
+        &self,
+        uid: &NodeUid,
+        output: &mut W,
+    ) -> Result<()> {
+        let details = self
+            .get_link_details_ctx(&uid.volume_id, std::slice::from_ref(&uid.link_id), true)
+            .await?;
+        let detail = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?;
+        let link = detail.link;
+        let file = detail
+            .file
+            .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
+
+        let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
+            ProtonError::invalid_operation("photo is missing its content key packet")
+        })?;
+        let content_key_packet = BASE64
+            .decode(content_key_packet_b64.trim())
+            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let revision_id = file
+            .active_revision
+            .map(|r| r.id)
+            .ok_or_else(|| ProtonError::invalid_operation("photo has no active revision"))?;
+
+        let parent_key = self
+            .resolve_parent_key_ctx(&uid.volume_id, &link, true)
+            .await?;
+        let node_key = decrypt_link(&parent_key, &link)?.node_key;
+        let content_key = node_key.decrypt_content_key(&content_key_packet)?;
+
+        let (revision, blocks) = self
+            .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
+            .await?;
+
+        let mut manifest = Vec::new();
+        let mut thumbnails: Vec<&ThumbnailDto> = revision.thumbnails.iter().collect();
+        thumbnails.sort_by_key(|t| t.thumbnail_type);
+        for thumb in thumbnails {
+            if let Some(hash_b64) = &thumb.hash_digest {
+                let digest = BASE64.decode(hash_b64.trim()).map_err(|e| {
+                    ProtonError::invalid_operation(format!("decode thumbnail digest: {e}"))
+                })?;
+                manifest.extend_from_slice(&digest);
+            }
+        }
+
+        for block in &blocks {
+            let ciphertext = self
+                .http
+                .get_storage_blob(&block.bare_url, &block.token)
+                .await?;
+            let digest = Sha256::digest(&ciphertext);
+            let plaintext = content_key.decrypt_block(&ciphertext)?;
+            output
+                .write_all(&plaintext)
+                .map_err(|e| ProtonError::invalid_operation(format!("write block: {e}")))?;
+            manifest.extend_from_slice(&digest);
+        }
+
+        verify_manifest(&self.account, &revision, &node_key, &manifest).await;
+        Ok(())
+    }
+
     /// Decrypted node key for a folder, decrypting (and caching) ancestors as
     /// needed.
     async fn folder_node_key(&self, uid: &NodeUid) -> Result<PrivateKey> {
@@ -1108,6 +1892,18 @@ impl ProtonDriveClient {
     /// down, caching each ancestor's node key. Iterative to avoid async
     /// recursion. Mirrors `GetEntryPointKeyOrThrowAsync`.
     async fn resolve_parent_key(&self, volume_id: &VolumeId, link: &LinkDto) -> Result<PrivateKey> {
+        self.resolve_parent_key_ctx(volume_id, link, false).await
+    }
+
+    /// As [`resolve_parent_key`](Self::resolve_parent_key), but for `for_photos`
+    /// it routes ancestor lookups to the photos endpoint and falls back to the
+    /// photos share key (not My Files) at the volume root.
+    async fn resolve_parent_key_ctx(
+        &self,
+        volume_id: &VolumeId,
+        link: &LinkDto,
+        for_photos: bool,
+    ) -> Result<PrivateKey> {
         let mut ancestry: Vec<LinkDto> = Vec::new();
         let mut current = link.parent_id.clone();
         let mut base_key: Option<PrivateKey> = None;
@@ -1121,7 +1917,7 @@ impl ProtonDriveClient {
             }
 
             let details = self
-                .get_link_details(volume_id, std::slice::from_ref(&parent_id))
+                .get_link_details_ctx(volume_id, std::slice::from_ref(&parent_id), for_photos)
                 .await?;
             let ancestor = details
                 .links
@@ -1138,6 +1934,7 @@ impl ProtonDriveClient {
         // for a root) and decrypt downward toward `link`'s parent.
         let mut key = match base_key {
             Some(key) => key,
+            None if for_photos => self.photos_share_key().await?,
             None => self.root_share_key().await?,
         };
 
@@ -1160,7 +1957,23 @@ impl ProtonDriveClient {
         volume_id: &VolumeId,
         link_ids: &[LinkId],
     ) -> Result<LinkDetailsResponse> {
-        let path = format!("v2/volumes/{volume_id}/links");
+        self.get_link_details_ctx(volume_id, link_ids, false).await
+    }
+
+    /// Link details, routed to the photos volume endpoint when `for_photos`.
+    /// Mirrors C# `IPhotosApiClient.GetDetailsAsync` vs `ILinksApiClient`
+    /// (`photos/volumes/{vid}/links` vs `v2/volumes/{vid}/links`).
+    async fn get_link_details_ctx(
+        &self,
+        volume_id: &VolumeId,
+        link_ids: &[LinkId],
+        for_photos: bool,
+    ) -> Result<LinkDetailsResponse> {
+        let path = if for_photos {
+            format!("photos/volumes/{volume_id}/links")
+        } else {
+            format!("v2/volumes/{volume_id}/links")
+        };
         let body = LinkDetailsRequest { link_ids };
         self.http.post(&path, &body).await
     }
@@ -1171,8 +1984,20 @@ impl ProtonDriveClient {
         details: &LinkDetailsDto,
         parent_key: &PrivateKey,
     ) -> Result<Node> {
+        self.build_node_ctx(volume_id, details, parent_key, false)
+            .await
+    }
+
+    async fn build_node_ctx(
+        &self,
+        volume_id: &VolumeId,
+        details: &LinkDetailsDto,
+        parent_key: &PrivateKey,
+        for_photos: bool,
+    ) -> Result<Node> {
         let link = &details.link;
-        let decrypted = decrypt_link(parent_key, link)?;
+        let (decrypted, mut verification) =
+            decrypt_link_verified(&self.account, parent_key, link).await?;
 
         let uid = NodeUid::new(volume_id.clone(), link.id.clone());
         let parent_uid = link
@@ -1194,9 +2019,69 @@ impl ProtonDriveClient {
                 let file = details.file.as_ref().ok_or_else(|| {
                     ProtonError::invalid_operation("file node missing file properties")
                 })?;
+
+                // Decrypt + verify the content key (`ContentKeyPacketSignature`).
+                // Best-effort: a decode/decrypt failure leaves the status absent
+                // rather than failing the whole node.
+                if let Some(packet_b64) = file.content_key_packet.as_deref() {
+                    match BASE64.decode(packet_b64) {
+                        Ok(packet) => {
+                            match decrypt_content_key_verified(
+                                &self.account,
+                                &decrypted.node_key,
+                                link.signature_email.as_deref(),
+                                &packet,
+                                file.content_key_signature.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok((_content_key, status)) => {
+                                    verification.content_key = Some(status);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(link_id = %link.id, error = %e, "failed to decrypt content key");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(link_id = %link.id, error = %e, "failed to decode content key packet");
+                        }
+                    }
+                }
+
+                // Decrypt + verify the active revision's extended attributes
+                // (best-effort, mirroring C# `DtoToMetadataConverter`): a failure
+                // leaves the claimed metadata absent rather than failing the node.
+                let mut claimed_size = None;
+                let mut claimed_modification_time = None;
+                if let Some(rev) = file.active_revision.as_ref() {
+                    if let Some(xattr) = rev.extended_attributes.as_deref() {
+                        match decrypt_extended_attributes_verified(
+                            &self.account,
+                            &decrypted.node_key,
+                            rev.signature_email.as_deref(),
+                            xattr,
+                        )
+                        .await
+                        {
+                            Ok((attrs, status)) => {
+                                verification.extended_attributes = Some(status);
+                                if let Some(common) = attrs.common {
+                                    claimed_size = common.size;
+                                    claimed_modification_time = common.modification_time;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(link_id = %link.id, error = %e, "failed to decrypt extended attributes");
+                            }
+                        }
+                    }
+                }
                 NodeKind::File {
                     media_type: file.media_type.clone(),
                     total_size_on_storage: file.total_size_on_storage,
+                    claimed_size,
+                    claimed_modification_time,
                 }
             }
             LinkType::Unknown => {
@@ -1207,8 +2092,8 @@ impl ProtonDriveClient {
             }
         };
 
-        Ok(Node {
-            uid,
+        let node = Node {
+            uid: uid.clone(),
             parent_uid,
             kind,
             name: decrypted.name,
@@ -1216,40 +2101,113 @@ impl ProtonDriveClient {
             modification_time: link.modification_time,
             trashed: link.is_trashed(),
             signature_email: link.signature_email.clone(),
-        })
+            verification,
+        };
+
+        // Cache the node with its server-provided name hash + membership share so
+        // later move/rename can supply `OriginalHash` without re-decrypting the
+        // name (C# `DtoToMetadataConverter` → `SetNodeAsync`). Best-effort: a
+        // cache failure must not fail the read.
+        if let Some(name_hash) = &link.name_hash {
+            let membership = if for_photos {
+                self.photos_share_id().await
+            } else {
+                self.my_files_share_id().await
+            };
+            if let Err(e) = self
+                .entities
+                .set_node(&uid, &node, membership.as_ref(), name_hash)
+                .await
+            {
+                tracing::warn!(link_id = %link.id, error = %e, "failed to cache node metadata");
+            }
+        }
+
+        Ok(node)
+    }
+
+    /// The resolved My Files share id, if My Files has been resolved.
+    async fn my_files_share_id(&self) -> Option<ShareId> {
+        self.cache
+            .lock()
+            .await
+            .my_files_share
+            .as_ref()
+            .map(|share| share.share_id.clone())
+    }
+
+    /// A node's current name hash digest from the entity cache or the link DTO,
+    /// without decrypting the name. `None` when neither source carries it.
+    /// Mirrors the C# move/rename path reading `CachedNodeInfo.NameHashDigest`.
+    async fn cached_original_name_hash(
+        &self,
+        uid: &NodeUid,
+        link: &LinkDto,
+    ) -> Result<Option<String>> {
+        if let Some(info) = self.entities.try_get_node(uid).await? {
+            if !info.name_hash_digest.is_empty() {
+                return Ok(Some(info.name_hash_digest));
+            }
+        }
+        Ok(link.name_hash.clone())
+    }
+
+    /// A node's current name hash digest, falling back to recomputing it from
+    /// the decrypted name (HMAC-SHA256 under the parent's hash key) when neither
+    /// the entity cache nor the link DTO supplies it.
+    async fn original_name_hash(
+        &self,
+        uid: &NodeUid,
+        link: &LinkDto,
+        parent_key: &PrivateKey,
+        parent_hash_key: &[u8],
+    ) -> Result<String> {
+        if let Some(hash) = self.cached_original_name_hash(uid, link).await? {
+            return Ok(hash);
+        }
+        let current_name = parent_key.decrypt_armored_message(&link.name)?;
+        Ok(hex::encode(hmac_sha256(parent_hash_key, &current_name)))
     }
 }
 
-/// Best-effort verification of a downloaded revision's content manifest.
+/// Verify a downloaded revision's content manifest signature, returning the
+/// non-fatal [`VerificationStatus`].
 ///
-/// Mirrors C# `RevisionReader.VerifyManifestAsync`, but only the node-key
-/// branch is enforced; an address-key signer requires public-key resolution
-/// (`core/v4/keys/all`), still unimplemented, so it is logged and skipped.
-/// Failures are logged rather than fatal, matching this milestone's best-effort
-/// stance on signature verification.
-fn verify_manifest(revision: &RevisionDto, node_key: &PrivateKey, manifest: &[u8]) {
+/// Mirrors C# `RevisionReader.VerifyManifestAsync`: an anonymous (empty
+/// `SignatureEmail`) signer is the node key itself; a named signer is an
+/// address key resolved via `core/v4/keys/all` (`account.public_keys`). A
+/// failed or unverifiable signature is logged but never fatal, matching the
+/// metadata-only verification policy.
+async fn verify_manifest(
+    account: &AccountClient,
+    revision: &RevisionDto,
+    node_key: &PrivateKey,
+    manifest: &[u8],
+) -> VerificationStatus {
     let Some(signature) = &revision.manifest_signature else {
         tracing::debug!("revision has no manifest signature; skipping integrity check");
-        return;
+        return VerificationStatus::NotSigned;
     };
 
-    let signed_by_node = revision
-        .signature_email
-        .as_deref()
-        .unwrap_or("")
-        .is_empty();
-    if !signed_by_node {
-        tracing::warn!(
-            email = ?revision.signature_email,
-            "manifest signed by an address key; verification pending public-key resolution"
-        );
-        return;
-    }
+    let email = revision.signature_email.as_deref().unwrap_or("");
+    let ring = if email.is_empty() {
+        VerificationKeyRing::from_private(node_key)
+    } else {
+        VerificationKeyRing::from_public_keys(&account.public_keys(email).await)
+    };
 
-    match node_key.verify_detached_signature(signature, manifest) {
-        Ok(()) => tracing::debug!("manifest signature verified"),
-        Err(e) => tracing::warn!(error = %e, "manifest signature verification failed"),
+    let status = verify_detached(signature, manifest, &ring);
+    match status {
+        VerificationStatus::Ok => tracing::debug!("manifest signature verified"),
+        VerificationStatus::NoVerifier => {
+            tracing::warn!(email, "no verification key for manifest signature")
+        }
+        VerificationStatus::Failed => {
+            tracing::warn!(email, "manifest signature verification failed")
+        }
+        VerificationStatus::NotSigned => {}
     }
+    status
 }
 
 /// Fill `buf` from `reader`, returning the number of bytes read. Reads
@@ -1281,6 +2239,48 @@ fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
     groups
 }
 
+/// Map a wire `VolumeEventDto` to a public [`DriveEvent`]. C#
+/// `VolumeEventDtoExtensions.ToDriveEvent`: Create/Update/UpdateMetadata →
+/// `NodeUpdated`, Delete → `NodeDeleted`; any other type is rejected.
+fn to_drive_event(volume_id: &VolumeId, event: &VolumeEventDto) -> Result<DriveEvent> {
+    let node_uid = NodeUid::new(volume_id.clone(), event.link.id.clone());
+    let parent_node_uid = event
+        .link
+        .parent_id
+        .clone()
+        .map(|parent| NodeUid::new(volume_id.clone(), parent));
+
+    // VolumeEventType: 0 Delete, 1 Create, 2 Update, 3 UpdateMetadata.
+    match event.event_type {
+        1 | 2 | 3 => Ok(DriveEvent::NodeUpdated {
+            id: event.id.clone(),
+            node_uid,
+            parent_node_uid,
+            is_trashed: event.link.is_trashed,
+            is_shared: event.link.is_shared,
+        }),
+        0 => Ok(DriveEvent::NodeDeleted {
+            id: event.id.clone(),
+            node_uid,
+            parent_node_uid,
+        }),
+        other => Err(ProtonError::invalid_operation(format!(
+            "unknown volume event type {other}"
+        ))),
+    }
+}
+
+/// Unbounded stream of alternate names for a taken name: `name (1).ext`,
+/// `name (2).ext`, … (C# `AlternateFileNameGenerator.GetNames`). The extension
+/// is everything from the last `.`, matching .NET `Path.GetFileNameWithoutExtension`.
+fn alternate_names(original: &str) -> impl Iterator<Item = String> + '_ {
+    let (stem, ext) = match original.rfind('.') {
+        Some(idx) => original.split_at(idx),
+        None => (original, ""),
+    };
+    (1..).map(move |i| format!("{stem} ({i}){ext}"))
+}
+
 /// Fail if any per-link response in a batch aggregate carries a non-success
 /// code (the top-level envelope is `MultipleResponses`, so the real status is
 /// per link). `op` names the operation for the error message.
@@ -1302,6 +2302,30 @@ fn check_aggregate(op: &str, response: AggregateLinksResponse) -> Result<()> {
     }
 }
 
+/// Build the photo seal attributes from a completed block write + caller
+/// metadata. Mirrors C# `RevisionWriter.CreatePhotosRevisionUpdateRequest`:
+/// `CaptureTime` defaults to now when unset, and `ContentHash` is the lowercase
+/// hex HMAC-SHA256 of the lowercase-hex plaintext SHA-1, keyed by the parent
+/// folder's hash key.
+fn build_photos_attributes(
+    parent_hash_key: &[u8],
+    written: &BlockWriteResult,
+    metadata: &PhotoUploadMetadata,
+) -> PhotosAttributesDto {
+    let capture_time = metadata.capture_time.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    PhotosAttributesDto {
+        capture_time,
+        content_hash: hex::encode(hmac_sha256(parent_hash_key, written.sha1_hex.as_bytes())),
+        main_photo_link_id: metadata.main_photo_uid.as_ref().map(|u| u.link_id.clone()),
+        tags: metadata.tags.iter().map(|t| *t as i32).collect(),
+    }
+}
+
 /// HMAC-SHA256 of `data` under `key` (the parent folder hash key).
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key length");
@@ -1317,4 +2341,142 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         .enumerate()
         .map(|(i, c)| c ^ ciphertext.get(i).copied().unwrap_or(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alternate_names, to_drive_event, DriveEvent};
+    use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
+    use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
+
+    fn event(event_type: i32, parent: Option<&str>) -> VolumeEventDto {
+        VolumeEventDto {
+            id: DriveEventId::new("evt-1"),
+            event_type,
+            link: VolumeEventLinkDto {
+                id: LinkId::new("link-1"),
+                parent_id: parent.map(LinkId::new),
+                is_shared: true,
+                is_trashed: true,
+            },
+        }
+    }
+
+    #[test]
+    fn maps_update_event_to_node_updated() {
+        let vid = VolumeId::new("vol-1");
+        // 1 = Create, 2 = Update, 3 = UpdateMetadata all map to NodeUpdated.
+        for ty in [1, 2, 3] {
+            let mapped = to_drive_event(&vid, &event(ty, Some("parent-1"))).unwrap();
+            match mapped {
+                DriveEvent::NodeUpdated {
+                    node_uid,
+                    parent_node_uid,
+                    is_trashed,
+                    is_shared,
+                    ..
+                } => {
+                    assert_eq!(node_uid.link_id, LinkId::new("link-1"));
+                    assert_eq!(
+                        parent_node_uid.map(|p| p.link_id),
+                        Some(LinkId::new("parent-1"))
+                    );
+                    assert!(is_trashed && is_shared);
+                }
+                other => panic!("expected NodeUpdated, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn maps_delete_event_to_node_deleted() {
+        let vid = VolumeId::new("vol-1");
+        let mapped = to_drive_event(&vid, &event(0, None)).unwrap();
+        match mapped {
+            DriveEvent::NodeDeleted {
+                node_uid,
+                parent_node_uid,
+                ..
+            } => {
+                assert_eq!(node_uid.link_id, LinkId::new("link-1"));
+                assert!(parent_node_uid.is_none());
+            }
+            other => panic!("expected NodeDeleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_event_type() {
+        let vid = VolumeId::new("vol-1");
+        assert!(to_drive_event(&vid, &event(99, None)).is_err());
+    }
+
+    #[test]
+    fn alternate_names_keeps_extension() {
+        let got: Vec<String> = alternate_names("report.txt").take(3).collect();
+        assert_eq!(got, ["report (1).txt", "report (2).txt", "report (3).txt"]);
+    }
+
+    #[test]
+    fn alternate_names_no_extension() {
+        let got: Vec<String> = alternate_names("folder").take(2).collect();
+        assert_eq!(got, ["folder (1)", "folder (2)"]);
+    }
+
+    #[test]
+    fn alternate_names_uses_last_dot_only() {
+        // .NET `Path.GetFileNameWithoutExtension` strips only the final segment.
+        let first = alternate_names("archive.tar.gz").next().unwrap();
+        assert_eq!(first, "archive.tar (1).gz");
+    }
+
+    #[test]
+    fn photos_attributes_content_hash_and_tags() {
+        use super::{build_photos_attributes, hmac_sha256, BlockWriteResult};
+        use crate::photos::{PhotoTag, PhotoUploadMetadata};
+        use proton_sdk::ids::NodeUid;
+
+        let hash_key = b"parent-folder-hash-key-bytes".to_vec();
+        let written = BlockWriteResult {
+            manifest: Vec::new(),
+            block_sizes: vec![10],
+            total_size: 10,
+            sha1_hex: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        };
+        let metadata = PhotoUploadMetadata {
+            capture_time: Some(1_700_000_000),
+            main_photo_uid: Some(NodeUid::new(VolumeId::new("vol-1"), LinkId::new("main-link"))),
+            tags: vec![PhotoTag::Video, PhotoTag::Selfie],
+        };
+
+        let attrs = build_photos_attributes(&hash_key, &written, &metadata);
+
+        // ContentHash = lowercase-hex HMAC-SHA256 over the lowercase-hex SHA-1.
+        let expected = hex::encode(hmac_sha256(&hash_key, written.sha1_hex.as_bytes()));
+        assert_eq!(attrs.content_hash, expected);
+        assert_eq!(attrs.capture_time, 1_700_000_000);
+        assert_eq!(attrs.main_photo_link_id, Some(LinkId::new("main-link")));
+        // Tags carry their `PhotoTag` discriminants.
+        assert_eq!(attrs.tags, vec![PhotoTag::Video as i32, PhotoTag::Selfie as i32]);
+    }
+
+    #[test]
+    fn photos_attributes_default_capture_time_and_empty_tags() {
+        use super::{build_photos_attributes, BlockWriteResult};
+        use crate::photos::PhotoUploadMetadata;
+
+        let written = BlockWriteResult {
+            manifest: Vec::new(),
+            block_sizes: Vec::new(),
+            total_size: 0,
+            sha1_hex: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+        };
+        let attrs = build_photos_attributes(b"k", &written, &PhotoUploadMetadata::default());
+
+        // Unset capture time defaults to the (positive) upload time; no main
+        // photo; tags serialize as an empty array.
+        assert!(attrs.capture_time > 0);
+        assert_eq!(attrs.main_photo_link_id, None);
+        assert!(attrs.tags.is_empty());
+    }
 }
