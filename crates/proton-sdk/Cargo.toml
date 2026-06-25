@@ -1,0 +1,30 @@
+[package]
+name = "proton-sdk"
+description = "Core Proton account/session/crypto primitives for the Rust Proton SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_repr.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+bytes.workspace = true
+base64.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+bcrypt.workspace = true
+pgp.workspace = true
+tracing.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+getrandom.workspace = true
+rand.workspace = true
