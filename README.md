@@ -75,22 +75,22 @@ use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::ProtonApiSession;
 use proton_drive_sdk::ProtonDriveClient;
 
-# async fn run() -> proton_sdk::error::Result<()> {
-let config = ProtonClientConfiguration::new("external-drive-myapp@0.1.0-alpha");
+async fn run() -> proton_sdk::error::Result<()> {
+    let config = ProtonClientConfiguration::new("external-drive-myapp@0.1.0-alpha");
 
-let mut session =
-    ProtonApiSession::begin(config, "user@proton.me", b"mailbox-password").await?;
-if session.is_waiting_for_second_factor() {
-    session.apply_second_factor_code("123456").await?;
-}
+    let mut session =
+        ProtonApiSession::begin(config, "user@proton.me", b"mailbox-password").await?;
+    if session.is_waiting_for_second_factor() {
+        session.apply_second_factor_code("123456").await?;
+    }
 
-let drive = ProtonDriveClient::new(&session, b"mailbox-password".to_vec());
-let root = drive.get_my_files_folder().await?;
-for child in drive.enumerate_folder_children(&root.uid).await? {
-    println!("{} ({:?})", child.name, child.kind);
+    let drive = ProtonDriveClient::new(&session, b"mailbox-password".to_vec());
+    let root = drive.get_my_files_folder().await?;
+    for child in drive.enumerate_folder_children(&root.uid).await? {
+        println!("{} ({:?})", child.name, child.kind);
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 Already have tokens? Use `ProtonApiSession::resume(config, ResumeParameters {..})`
