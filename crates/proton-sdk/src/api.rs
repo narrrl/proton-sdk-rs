@@ -33,6 +33,8 @@ pub enum ResponseCode {
     Unauthorized = 401,
     Forbidden = 403,
     RequestTimeout = 408,
+    TooManyRequests = 429,
+    ServiceUnavailable = 503,
 
     Success = 1000,
     MultipleResponses = 1001,
@@ -70,6 +72,8 @@ impl ResponseCode {
             401 => Self::Unauthorized,
             403 => Self::Forbidden,
             408 => Self::RequestTimeout,
+            429 => Self::TooManyRequests,
+            503 => Self::ServiceUnavailable,
             1000 => Self::Success,
             1001 => Self::MultipleResponses,
             2000 => Self::InvalidRequirements,

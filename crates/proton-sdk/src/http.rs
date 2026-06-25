@@ -6,16 +6,19 @@
 //! no `DelegatingHandler` pipeline.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use rand::Rng;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::api::{ApiResponse, ResponseCode};
-use crate::config::{ProtonClientConfiguration, API_CONTENT_TYPE};
+use crate::config::{ProtonClientConfiguration, RetryPolicy, API_CONTENT_TYPE};
 use crate::error::{ProtonApiError, ProtonError, Result};
 use crate::ids::SessionId;
+use crate::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 
 const SESSION_ID_HEADER: &str = "x-pm-uid";
 const APP_VERSION_HEADER: &str = "x-pm-appversion";
@@ -44,6 +47,12 @@ struct Inner {
     config: ProtonClientConfiguration,
     session_id: SessionId,
     tokens: Mutex<Tokens>,
+    /// Telemetry sink for per-request events. Interior-mutable because the
+    /// client is already shared (cloned into the Drive client) by the time a
+    /// caller attaches a sink via [`ApiHttpClient::set_telemetry`]. Defaults to
+    /// a no-op. `std::sync::Mutex` (not tokio's) — held only for the cheap
+    /// clone/replace, never across an await.
+    telemetry: std::sync::Mutex<Arc<dyn Telemetry>>,
 }
 
 impl ApiHttpClient {
@@ -66,6 +75,7 @@ impl ApiHttpClient {
                 config,
                 session_id,
                 tokens: Mutex::new(tokens),
+                telemetry: std::sync::Mutex::new(NoopTelemetry::shared()),
             }),
         })
     }
@@ -73,6 +83,25 @@ impl ApiHttpClient {
     /// Snapshot the current tokens (e.g. to persist for a later `resume`).
     pub async fn current_tokens(&self) -> Tokens {
         self.inner.tokens.lock().await.clone()
+    }
+
+    /// Attach a telemetry sink to receive a per-request
+    /// [`TelemetryEvent`](crate::telemetry::TelemetryEvent) (operation
+    /// `http_request` for API calls, `storage_download` / `storage_upload` for
+    /// block storage; attributes carry the HTTP method and status). Replaces any
+    /// previous sink. Takes effect for every clone of this client, since they
+    /// share state.
+    pub fn set_telemetry(&self, telemetry: Arc<dyn Telemetry>) {
+        *self.inner.telemetry.lock().expect("telemetry mutex poisoned") = telemetry;
+    }
+
+    /// Snapshot the current telemetry sink.
+    fn telemetry(&self) -> Arc<dyn Telemetry> {
+        self.inner
+            .telemetry
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .clone()
     }
 
     /// `GET {url}` against block storage, returning the raw (still-encrypted)
@@ -84,18 +113,18 @@ impl ApiHttpClient {
     /// .GetBlobStreamAsync`. A successful response is raw binary; an error
     /// response is the usual JSON envelope.
     pub async fn get_storage_blob(&self, url: &str, token: &str) -> Result<Vec<u8>> {
-        let mut request = self
-            .inner
-            .http
-            .get(url)
-            .header(STORAGE_TOKEN_HEADER, token);
-
-        if !self.inner.config.user_agent.is_empty() {
-            request = request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
-        }
-
-        let response = request.send().await?;
+        let mut timer = self.telemetry().start("storage_download");
+        let response = send_retrying(&self.inner.config.retry_policy, || {
+            let mut request = self.inner.http.get(url).header(STORAGE_TOKEN_HEADER, token);
+            if !self.inner.config.user_agent.is_empty() {
+                request =
+                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+            }
+            request
+        })
+        .await?;
         let status = response.status();
+        timer.attr("status", status.as_u16());
         let bytes = response.bytes().await?;
 
         // Success bodies are raw block bytes (not JSON); only error responses
@@ -108,6 +137,7 @@ impl ApiHttpClient {
             return Err(api_error(status, &bytes));
         }
 
+        timer.success();
         Ok(bytes.to_vec())
     }
 
@@ -118,25 +148,36 @@ impl ApiHttpClient {
     /// authorized by the per-block `pm-storage-token` header rather than the
     /// session bearer. The response is the usual JSON envelope.
     pub async fn post_storage_blob(&self, url: &str, token: &str, blob: Vec<u8>) -> Result<()> {
-        let part = reqwest::multipart::Part::bytes(blob)
-            .file_name("blob")
+        // Validate the part once up front; the multipart body itself is rebuilt
+        // per attempt inside the retry closure (a stream body can't be cloned).
+        reqwest::multipart::Part::bytes(Vec::new())
             .mime_str("application/octet-stream")
             .map_err(ProtonError::from)?;
-        let form = reqwest::multipart::Form::new().part("Block", part);
 
-        let mut request = self
-            .inner
-            .http
-            .post(url)
-            .header(STORAGE_TOKEN_HEADER, token)
-            .multipart(form);
+        let mut timer = self.telemetry().start("storage_upload");
+        let response = send_retrying(&self.inner.config.retry_policy, || {
+            let part = reqwest::multipart::Part::bytes(blob.clone())
+                .file_name("blob")
+                .mime_str("application/octet-stream")
+                .expect("octet-stream is a valid MIME type");
+            let form = reqwest::multipart::Form::new().part("Block", part);
 
-        if !self.inner.config.user_agent.is_empty() {
-            request = request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
-        }
+            let mut request = self
+                .inner
+                .http
+                .post(url)
+                .header(STORAGE_TOKEN_HEADER, token)
+                .multipart(form);
 
-        let response = request.send().await?;
+            if !self.inner.config.user_agent.is_empty() {
+                request =
+                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+            }
+            request
+        })
+        .await?;
         let status = response.status();
+        timer.attr("status", status.as_u16());
         let bytes = response.bytes().await?;
 
         if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes) {
@@ -146,6 +187,7 @@ impl ApiHttpClient {
         } else if !status.is_success() {
             return Err(api_error(status, &bytes));
         }
+        timer.success();
         Ok(())
     }
 
@@ -179,8 +221,12 @@ impl ApiHttpClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<T> {
+        let mut timer = self.telemetry().start("http_request");
+        timer.attr("method", method.as_str());
+
         let access_token = self.inner.tokens.lock().await.access_token.clone();
 
+        // An early `?` here records the op as a failure (OpTimer defaults to it).
         let response = self
             .send_with_token(method.clone(), path, body, &access_token)
             .await?;
@@ -192,7 +238,10 @@ impl ApiHttpClient {
             response
         };
 
-        parse_response(response).await
+        timer.attr("status", response.status().as_u16());
+        let parsed = parse_response(response).await?;
+        timer.success();
+        Ok(parsed)
     }
 
     async fn handle_unauthorized<B: Serialize>(
@@ -226,24 +275,28 @@ impl ApiHttpClient {
         access_token: &str,
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.inner.base_url, path.trim_start_matches('/'));
-        let mut request = self
-            .inner
-            .http
-            .request(method, url)
-            .header(SESSION_ID_HEADER, self.inner.session_id.as_str())
-            .header(APP_VERSION_HEADER, &self.inner.config.app_version)
-            .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
-            .bearer_auth(access_token);
+        send_retrying(&self.inner.config.retry_policy, || {
+            let mut request = self
+                .inner
+                .http
+                .request(method.clone(), &url)
+                .header(SESSION_ID_HEADER, self.inner.session_id.as_str())
+                .header(APP_VERSION_HEADER, &self.inner.config.app_version)
+                .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
+                .bearer_auth(access_token);
 
-        if !self.inner.config.user_agent.is_empty() {
-            request = request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
-        }
+            if !self.inner.config.user_agent.is_empty() {
+                request =
+                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+            }
 
-        if let Some(body) = body {
-            request = request.json(body);
-        }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
 
-        Ok(request.send().await?)
+            request
+        })
+        .await
     }
 
     /// Refresh the session tokens, deduplicating concurrent refreshes: if the
@@ -272,16 +325,16 @@ impl ApiHttpClient {
 
         // The refresh call carries the session id but, deliberately, no bearer
         // token (the access token is the thing being replaced).
-        let response = self
-            .inner
-            .http
-            .post(url)
-            .header(SESSION_ID_HEADER, self.inner.session_id.as_str())
-            .header(APP_VERSION_HEADER, &self.inner.config.app_version)
-            .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_retrying(&self.inner.config.retry_policy, || {
+            self.inner
+                .http
+                .post(&url)
+                .header(SESSION_ID_HEADER, self.inner.session_id.as_str())
+                .header(APP_VERSION_HEADER, &self.inner.config.app_version)
+                .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
+                .json(&body)
+        })
+        .await?;
 
         let refreshed: SessionRefreshResponse = parse_response(response).await?;
         Ok(Tokens {
@@ -328,17 +381,20 @@ pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
     let base_url = ensure_trailing_slash(&config.base_url);
     let url = format!("{}{}", base_url, path.trim_start_matches('/'));
 
-    let mut request = http
-        .post(url)
-        .header(APP_VERSION_HEADER, &config.app_version)
-        .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
-        .json(body);
+    let response = send_retrying(&config.retry_policy, || {
+        let mut request = http
+            .post(&url)
+            .header(APP_VERSION_HEADER, &config.app_version)
+            .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
+            .json(body);
+        if !config.user_agent.is_empty() {
+            request = request.header(reqwest::header::USER_AGENT, &config.user_agent);
+        }
+        request
+    })
+    .await?;
 
-    if !config.user_agent.is_empty() {
-        request = request.header(reqwest::header::USER_AGENT, &config.user_agent);
-    }
-
-    parse_response(request.send().await?).await
+    parse_response(response).await
 }
 
 /// Read a response body, enforce the Proton success envelope, and deserialize
@@ -379,10 +435,148 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
     })
 }
 
+/// Send a request, transparently retrying retryable failures per `policy`.
+///
+/// `build` is called once per attempt to produce a fresh `RequestBuilder`
+/// (reqwest builders are consumed by `send`, and streaming bodies like
+/// `multipart` can't be cloned), so every retry resends the full request.
+///
+/// Retryable = HTTP 408/429/502/503/504 or a transient transport error
+/// (timeout / connect). A `Retry-After` header (delta-seconds) is honoured;
+/// otherwise the delay is exponential backoff with full jitter. Non-retryable
+/// responses and errors — including ordinary 4xx and the 401 that drives token
+/// refresh — pass straight through to the caller untouched.
+async fn send_retrying<F>(policy: &RetryPolicy, build: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match build().send().await {
+            Ok(response) => {
+                if attempt < policy.max_retries && is_retryable_status(response.status()) {
+                    let delay = retry_after(&response).unwrap_or_else(|| backoff(policy, attempt));
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) => {
+                if attempt < policy.max_retries && is_retryable_error(&err) {
+                    tokio::time::sleep(backoff(policy, attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+}
+
+/// Status codes Proton (or an intermediary) returns for transient conditions:
+/// request timeout, rate limit, and the gateway/unavailable family.
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
+}
+
+/// A transport error worth retrying: a timeout or a failure to connect. A
+/// mid-body error (`is_body`) is not retried — the request may have been
+/// applied server-side.
+fn is_retryable_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+/// Parse a `Retry-After` header expressed as delta-seconds. The HTTP-date form
+/// is not emitted by the Proton API, so it is ignored (falls back to backoff).
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    parse_retry_after_secs(value)
+}
+
+/// Parse a `Retry-After` delta-seconds value into a delay. Non-numeric values
+/// (the HTTP-date form, which Proton does not emit) yield `None`.
+fn parse_retry_after_secs(value: &str) -> Option<Duration> {
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+
+/// Exponential backoff with full jitter: a uniformly random delay in
+/// `[0, base_delay * 2^attempt]`, capped at `max_delay`.
+fn backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let ceiling = policy
+        .base_delay
+        .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
+        .min(policy.max_delay);
+    let ceiling_ms = ceiling.as_millis() as u64;
+    if ceiling_ms == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand::thread_rng().gen_range(0..=ceiling_ms))
+}
+
 fn ensure_trailing_slash(url: &str) -> String {
     if url.ends_with('/') {
         url.to_owned()
     } else {
         format!("{url}/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_statuses() {
+        for code in [408u16, 429, 502, 503, 504] {
+            assert!(is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
+        for code in [200u16, 400, 401, 403, 404, 500] {
+            assert!(!is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_only() {
+        assert_eq!(parse_retry_after_secs("5"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after_secs("  12 "), Some(Duration::from_secs(12)));
+        assert_eq!(parse_retry_after_secs("0"), Some(Duration::ZERO));
+        // HTTP-date form is unsupported -> falls back to backoff.
+        assert_eq!(parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after_secs(""), None);
+    }
+
+    #[test]
+    fn backoff_grows_then_caps_within_jitter_bounds() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(1000),
+        };
+        // Full jitter: every sample stays within [0, ceiling] where the
+        // ceiling is base*2^attempt capped at max_delay.
+        for attempt in 0..8u32 {
+            let ceiling = Duration::from_millis(100u64.saturating_mul(1 << attempt.min(20)))
+                .min(policy.max_delay);
+            for _ in 0..64 {
+                assert!(backoff(&policy, attempt) <= ceiling);
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_handles_large_attempt_without_overflow() {
+        let policy = RetryPolicy::default();
+        // attempt >= 32 would overflow a naive shift; must saturate to max_delay.
+        assert!(backoff(&policy, 64) <= policy.max_delay);
+    }
+
+    #[test]
+    fn disabled_policy_has_no_retries() {
+        assert_eq!(RetryPolicy::disabled().max_retries, 0);
     }
 }
