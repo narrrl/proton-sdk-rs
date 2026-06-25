@@ -102,3 +102,34 @@ pub(super) struct KeySalt {
     #[serde(rename = "KeySalt")]
     pub value: Option<String>,
 }
+
+/// Response for `core/v4/keys/all` — the active public keys for an email
+/// address. Mirrors C# `AddressPublicKeyListResponse`.
+#[derive(Debug, Deserialize)]
+pub(super) struct AddressPublicKeyListResponse {
+    #[serde(rename = "Address")]
+    pub address: PublicKeyListAddress,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PublicKeyListAddress {
+    #[serde(rename = "Keys")]
+    pub keys: Vec<PublicKeyEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PublicKeyEntry {
+    /// Status flags; bit `1` = not compromised, bit `2` = not obsolete.
+    #[serde(rename = "Flags")]
+    pub flags: i32,
+    #[serde(rename = "PublicKey")]
+    pub public_key: String,
+}
+
+impl PublicKeyEntry {
+    /// Bit `1` of `Flags` (C# `PublicKeyStatus.IsNotCompromised`): only
+    /// non-compromised keys are used to verify authorship.
+    pub fn is_not_compromised(&self) -> bool {
+        self.flags & 1 != 0
+    }
+}

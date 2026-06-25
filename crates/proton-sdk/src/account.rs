@@ -17,13 +17,16 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::crypto::{self, PrivateKey};
+use crate::crypto::{self, PrivateKey, PublicKey};
 use crate::error::{ProtonError, Result};
 use crate::http::ApiHttpClient;
 use crate::ids::AddressId;
 use crate::session::ProtonApiSession;
 
-use dtos::{AddressDto, AddressListResponse, KeySaltListResponse, UserResponse};
+use dtos::{
+    AddressDto, AddressListResponse, AddressPublicKeyListResponse, KeySaltListResponse,
+    UserResponse,
+};
 
 /// Public view of an email address attached to the account.
 #[derive(Debug, Clone)]
@@ -58,6 +61,8 @@ struct Cache {
     user_keys: Option<Vec<PrivateKey>>,
     addresses: Option<Vec<Address>>,
     address_keys: HashMap<AddressId, Vec<PrivateKey>>,
+    /// email → active (non-compromised) public keys, for authorship verification.
+    public_keys: HashMap<String, Vec<PublicKey>>,
 }
 
 impl AccountClient {
@@ -130,6 +135,61 @@ impl AccountClient {
             .ok_or_else(|| {
                 ProtonError::invalid_operation(format!("no keys for address {address_id}"))
             })
+    }
+
+    /// Active public keys for an email address, used to verify authorship
+    /// signatures. Mirrors C# `AddressOperations.GetPublicKeysAsync`:
+    /// `core/v4/keys/all?InternalOnly=1&Email=…`, keeping only keys whose
+    /// `Flags` mark them not-compromised. Cached per email.
+    ///
+    /// Because verification is non-fatal, a resolution failure (unknown
+    /// address, external domain, transport error) is logged and yields an empty
+    /// key set rather than propagating — the caller then sees
+    /// [`crate::crypto::VerificationStatus::NoVerifier`].
+    pub async fn public_keys(&self, email: &str) -> Vec<PublicKey> {
+        {
+            let cache = self.inner.cache.lock().await;
+            if let Some(keys) = cache.public_keys.get(email) {
+                return keys.clone();
+            }
+        }
+
+        let path = format!(
+            "core/v4/keys/all?InternalOnly=1&Email={}",
+            encode_query_component(email)
+        );
+        let keys = match self
+            .inner
+            .http
+            .get::<AddressPublicKeyListResponse>(&path)
+            .await
+        {
+            Ok(response) => response
+                .address
+                .keys
+                .iter()
+                .filter(|entry| entry.is_not_compromised())
+                .filter_map(|entry| match PublicKey::from_armored(&entry.public_key) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        tracing::warn!(%email, error = %e, "failed to parse public key");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(%email, error = %e, "failed to resolve public keys; treating as unverified");
+                Vec::new()
+            }
+        };
+
+        self.inner
+            .cache
+            .lock()
+            .await
+            .public_keys
+            .insert(email.to_string(), keys.clone());
+        keys
     }
 
     /// Decrypted user (account) keys.
@@ -264,4 +324,19 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|e| ProtonError::invalid_operation(format!("invalid base64 salt: {e}")))
+}
+
+/// Percent-encode a value for use in a URL query component. Email addresses
+/// contain `@` (and may contain `+`), which must be escaped.
+fn encode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
