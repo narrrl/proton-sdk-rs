@@ -40,8 +40,7 @@ and does the OpenPGP crypto directly. The canonical reference is the upstream
 Not yet implemented: cross-volume move (needs `NewShareID` + re-signing),
 sharing, signature-verification *enforcement* (it is non-fatal metadata).
 
-Crypto paths have offline round-trip tests; the write/move paths still need live
-validation against a real account.
+Crypto paths have offline round-trip tests
 
 ## Workspace
 
