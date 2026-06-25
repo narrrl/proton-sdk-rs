@@ -579,4 +579,70 @@ mod tests {
     fn disabled_policy_has_no_retries() {
         assert_eq!(RetryPolicy::disabled().max_retries, 0);
     }
+
+    /// A telemetry sink that records every event for assertions.
+    struct Capture(std::sync::Mutex<Vec<crate::telemetry::TelemetryEvent>>);
+
+    impl Telemetry for Capture {
+        fn record(&self, event: &crate::telemetry::TelemetryEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_request_records_telemetry_event() {
+        use crate::telemetry::Outcome;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // One-shot loopback server: read the request, reply with the success
+        // envelope, then close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = br#"{"Code":1000}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let config = ProtonClientConfiguration::new("test@1.0")
+            .with_base_url(format!("http://{addr}/"))
+            .with_retry_policy(RetryPolicy::disabled());
+        let client = ApiHttpClient::new(
+            config,
+            SessionId::from("test-session"),
+            Tokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+            },
+        )
+        .unwrap();
+
+        let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        client.set_telemetry(capture.clone());
+
+        let _: ApiResponse = client.get("some/path").await.unwrap();
+        server.await.unwrap();
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one http_request event");
+        let event = &events[0];
+        assert_eq!(event.operation, "http_request");
+        assert_eq!(event.outcome, Outcome::Success);
+        assert!(event
+            .attributes
+            .iter()
+            .any(|(k, v)| *k == "method" && v == "GET"));
+        assert!(event
+            .attributes
+            .iter()
+            .any(|(k, v)| *k == "status" && v == "200"));
+    }
 }
