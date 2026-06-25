@@ -12,12 +12,14 @@
 
 pub mod account;
 pub mod api;
+pub mod cache;
 pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod http;
 pub mod ids;
 pub mod session;
+pub mod telemetry;
 
 pub use error::{ProtonApiError, ProtonError, Result};
 pub use session::ProtonApiSession;

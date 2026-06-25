@@ -21,6 +21,8 @@ base64.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
 bcrypt.workspace = true
 pgp.workspace = true
 tracing.workspace = true
@@ -28,3 +30,8 @@ num-bigint.workspace = true
 num-traits.workspace = true
 getrandom.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+# A one-shot loopback HTTP server backs the telemetry-instrumentation test;
+# the `net` feature isn't needed by the library itself.
+tokio = { workspace = true, features = ["net"] }
