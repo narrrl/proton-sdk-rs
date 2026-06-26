@@ -1188,8 +1188,14 @@ impl ProtonDriveClient {
         let request = MoveLinkRequest {
             parent_link_id: new_parent.link_id.clone(),
             passphrase: parts.passphrase,
-            // The rewrap preserves the plaintext, so the signature is unchanged.
-            passphrase_signature: link.passphrase_signature,
+            // The rewrap preserves the plaintext, so the existing detached
+            // signature stays valid and is not re-sent (C# `MoveSingleAsync`
+            // sends `PassphraseSignature = null` for non-anonymous nodes; only
+            // an anonymous move re-signs). Passing the link's own value back is
+            // wrong: the API returns it as an empty string for these nodes, and
+            // a serialized empty `NodePassphraseSignature` is rejected 400
+            // "should not be empty" — the batch path already hardcodes `None`.
+            passphrase_signature: None,
             name: parts.encrypted_name,
             name_signature_email: email,
             name_hash: parts.name_hash,

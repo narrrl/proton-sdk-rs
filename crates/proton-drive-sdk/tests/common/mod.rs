@@ -31,14 +31,27 @@ pub struct LiveClient {
     pub _session: ProtonApiSession,
 }
 
-/// Build an authenticated `ProtonDriveClient`, or `None` when credentials are
-/// not configured (skip, don't fail).
+/// Process-global authenticated client, built once and shared by every test in
+/// this binary. Proton anti-abuse throttles repeated SRP logins (and each login
+/// burns a TOTP window), so a fresh login per test trips
+/// `IncorrectLoginCredentials` after a handful. One login for the whole suite
+/// sidesteps both. `None` = credentials absent (skip cleanly).
+static SHARED: tokio::sync::OnceCell<Option<LiveClient>> = tokio::sync::OnceCell::const_new();
+
+/// The shared authenticated `ProtonDriveClient`, or `None` when credentials are
+/// not configured (skip, don't fail). Logs in on first call; reused thereafter.
 ///
 /// Call from a test like:
 /// ```ignore
 /// let Some(live) = common::live_client().await else { return };
+/// let client = &live.client;
 /// ```
-pub async fn live_client() -> Option<LiveClient> {
+pub async fn live_client() -> Option<&'static LiveClient> {
+    SHARED.get_or_init(build_live_client).await.as_ref()
+}
+
+/// Perform the one-time SRP + 2FA login and build the client.
+async fn build_live_client() -> Option<LiveClient> {
     let (username, password) = match read_dotenv() {
         Ok(creds) => creds,
         Err(e) => {
@@ -61,7 +74,7 @@ pub async fn live_client() -> Option<LiveClient> {
         .expect("SRP login failed");
 
     if session.is_waiting_for_second_factor() {
-        let code = totp_now(&totp_secret).expect("TOTP compute failed");
+        let code = totp_fresh(&totp_secret).expect("TOTP compute failed");
         session
             .apply_second_factor_code(&code)
             .await
@@ -128,10 +141,36 @@ fn read_totp_secret() -> Option<String> {
     None
 }
 
-/// RFC 6238 TOTP (SHA-1, 6 digits, 30s step) for the current time.
-fn totp_now(secret_b32: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Last TOTP window (30s counter) submitted by *any* login in this process.
+///
+/// Proton rejects a TOTP code re-submitted within its 30s validity window, so
+/// back-to-back logins (one per test) must each land on a distinct window.
+static LAST_TOTP_COUNTER: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// A TOTP code guaranteed not to reuse a window already consumed by an earlier
+/// login in this process. Blocks until the next 30s boundary when the current
+/// window was already used (so serial `--ignored` runs don't trip on code
+/// reuse). Uses a blocking sleep — fine for the single-threaded test harness.
+fn totp_fresh(secret_b32: &str) -> Result<String, Box<dyn std::error::Error>> {
+    loop {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let counter = now / 30;
+        {
+            let mut last = LAST_TOTP_COUNTER.lock().unwrap();
+            if counter > *last {
+                *last = counter;
+                return totp_at(secret_b32, counter);
+            }
+        }
+        let wait = 30 - (now % 30) + 1;
+        eprintln!("[2fa] TOTP window already used; waiting {wait}s for a fresh code");
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+    }
+}
+
+/// RFC 6238 TOTP (SHA-1, 6 digits, 30s step) at a specific 30s counter.
+fn totp_at(secret_b32: &str, counter: u64) -> Result<String, Box<dyn std::error::Error>> {
     let key = base32_decode(secret_b32)?;
-    let counter = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 30;
 
     let mut mac = Hmac::<Sha1>::new_from_slice(&key)?;
     mac.update(&counter.to_be_bytes());

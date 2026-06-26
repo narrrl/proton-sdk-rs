@@ -28,7 +28,7 @@ async fn upload_download_small_roundtrip() {
     let Some(live) = common::live_client().await else {
         return;
     };
-    let client = live.client;
+    let client = &live.client;
 
     let root = client
         .get_my_files_folder()
@@ -57,7 +57,7 @@ async fn upload_download_multiblock_roundtrip() {
     let Some(live) = common::live_client().await else {
         return;
     };
-    let client = live.client;
+    let client = &live.client;
 
     let root = client
         .get_my_files_folder()
@@ -103,7 +103,7 @@ async fn new_revision_roundtrip() {
     let Some(live) = common::live_client().await else {
         return;
     };
-    let client = live.client;
+    let client = &live.client;
 
     let root = client
         .get_my_files_folder()
