@@ -2667,6 +2667,15 @@ fn alternate_names(original: &str) -> impl Iterator<Item = String> + '_ {
 /// Fail if any per-link response in a batch aggregate carries a non-success
 /// code (the top-level envelope is `MultipleResponses`, so the real status is
 /// per link). `op` names the operation for the error message.
+/// The re-encrypted material a single node needs to move under a new parent,
+/// produced by `ProtonDriveClient::build_move_parts`.
+struct MoveParts {
+    passphrase: String,
+    encrypted_name: String,
+    name_hash: String,
+    original_hash: String,
+}
+
 fn check_aggregate(op: &str, response: AggregateLinksResponse) -> Result<()> {
     let failures: Vec<String> = response
         .responses
