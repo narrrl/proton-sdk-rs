@@ -24,3 +24,5 @@ rustc-ice-*.txt
 #.idea/
 todo.md
 sdk/
+
+.env
