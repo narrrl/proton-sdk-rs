@@ -130,13 +130,9 @@ impl AccountClient {
         self.addresses().await?;
 
         let cache = self.inner.cache.lock().await;
-        cache
-            .address_keys
-            .get(address_id)
-            .cloned()
-            .ok_or_else(|| {
-                ProtonError::invalid_operation(format!("no keys for address {address_id}"))
-            })
+        cache.address_keys.get(address_id).cloned().ok_or_else(|| {
+            ProtonError::invalid_operation(format!("no keys for address {address_id}"))
+        })
     }
 
     /// Active public keys for an email address, used to verify authorship
@@ -217,7 +213,9 @@ impl AccountClient {
             };
             match PrivateKey::from_armored(&key_dto.private_key, passphrase) {
                 Ok(key) => keys.push(key),
-                Err(e) => tracing::warn!(key_id = %key_dto.id, error = %e, "failed to unlock user key"),
+                Err(e) => {
+                    tracing::warn!(key_id = %key_dto.id, error = %e, "failed to unlock user key")
+                }
             }
         }
 
@@ -244,7 +242,9 @@ impl AccountClient {
         let response: KeySaltListResponse = self.inner.http.get("core/v4/keys/salts").await?;
         let mut passphrases = HashMap::new();
         for salt in &response.key_salts {
-            let Some(salt_b64) = &salt.value else { continue };
+            let Some(salt_b64) = &salt.value else {
+                continue;
+            };
             if salt_b64.is_empty() {
                 continue;
             }
@@ -308,10 +308,12 @@ impl AccountClient {
             }
         }
 
-        let primary_key_index = primary_key_index
-            .ok_or_else(|| ProtonError::invalid_operation(format!("address {} has no primary key", dto.id)))?;
-        let primary_key_id = primary_key_id
-            .ok_or_else(|| ProtonError::invalid_operation(format!("address {} has no primary key", dto.id)))?;
+        let primary_key_index = primary_key_index.ok_or_else(|| {
+            ProtonError::invalid_operation(format!("address {} has no primary key", dto.id))
+        })?;
+        let primary_key_id = primary_key_id.ok_or_else(|| {
+            ProtonError::invalid_operation(format!("address {} has no primary key", dto.id))
+        })?;
 
         let address = Address {
             id: dto.id.clone(),

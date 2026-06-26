@@ -96,7 +96,10 @@ impl VerificationKeyRing {
     /// Used for content-key and hash-key signatures, where C#
     /// `GetContentKeyAndHashKeyVerificationKeyRing` always includes the node
     /// key alongside any claimed-author keys.
-    pub fn from_private_and_public_keys(key: &super::PrivateKey, public_keys: &[PublicKey]) -> Self {
+    pub fn from_private_and_public_keys(
+        key: &super::PrivateKey,
+        public_keys: &[PublicKey],
+    ) -> Self {
         let mut keys = Vec::with_capacity(public_keys.len() + 1);
         keys.push(key.signed_public_key());
         keys.extend(public_keys.iter().map(|k| k.signed().clone()));
@@ -114,7 +117,11 @@ impl VerificationKeyRing {
 }
 
 /// Verify an armored detached signature over `data` against `ring`.
-pub fn verify_detached(armored_sig: &str, data: &[u8], ring: &VerificationKeyRing) -> VerificationStatus {
+pub fn verify_detached(
+    armored_sig: &str,
+    data: &[u8],
+    ring: &VerificationKeyRing,
+) -> VerificationStatus {
     let signature = match StandaloneSignature::from_string(armored_sig) {
         Ok((sig, _headers)) => sig,
         Err(_) => return VerificationStatus::Failed,
@@ -206,7 +213,10 @@ mod tests {
         let sig = signer.key.sign_detached(data).expect("sign");
 
         let ring = VerificationKeyRing::from_private(&other.key);
-        assert_eq!(verify_detached(&sig, data, &ring), VerificationStatus::Failed);
+        assert_eq!(
+            verify_detached(&sig, data, &ring),
+            VerificationStatus::Failed
+        );
     }
 
     #[test]

@@ -69,7 +69,11 @@ impl PrivateKey {
 
     /// Verify an armored detached signature over `data` against this key's
     /// public key. Returns `Ok(())` only on a good signature.
-    pub fn verify_detached_signature(&self, armored_sig: &str, data: &[u8]) -> Result<(), CryptoError> {
+    pub fn verify_detached_signature(
+        &self,
+        armored_sig: &str,
+        data: &[u8],
+    ) -> Result<(), CryptoError> {
         let (sig, _headers) = StandaloneSignature::from_string(armored_sig)
             .map_err(|e| CryptoError::Parse(format!("detached signature: {e}")))?;
         sig.verify(&self.key.signed_public_key(), data)
@@ -110,11 +114,13 @@ impl PrivateKey {
 }
 
 /// Decrypt an armored message, trying each key in `keys` until one succeeds.
-pub fn decrypt_armored_with_keys(armored: &str, keys: &[PrivateKey]) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt_armored_with_keys(
+    armored: &str,
+    keys: &[PrivateKey],
+) -> Result<Vec<u8>, CryptoError> {
     let owned: Vec<(&SignedSecretKey, Password)> =
         keys.iter().map(|k| (k.key(), k.password())).collect();
-    let refs: Vec<(&SignedSecretKey, &Password)> =
-        owned.iter().map(|(k, p)| (*k, p)).collect();
+    let refs: Vec<(&SignedSecretKey, &Password)> = owned.iter().map(|(k, p)| (*k, p)).collect();
     messages::decrypt_armored_any(armored, &refs)
 }
 

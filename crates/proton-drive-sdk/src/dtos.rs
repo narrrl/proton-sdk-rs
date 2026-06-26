@@ -507,7 +507,10 @@ pub struct MoveLinkRequest {
     pub parent_link_id: LinkId,
     #[serde(rename = "NodePassphrase")]
     pub passphrase: String,
-    #[serde(rename = "NodePassphraseSignature", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "NodePassphraseSignature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub passphrase_signature: Option<String>,
     #[serde(rename = "Name")]
     pub name: String,
@@ -550,7 +553,10 @@ pub struct MoveMultipleLinksItem {
     pub name_hash: String,
     #[serde(rename = "OriginalHash")]
     pub original_hash: String,
-    #[serde(rename = "NodePassphraseSignature", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "NodePassphraseSignature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub passphrase_signature: Option<String>,
 }
 

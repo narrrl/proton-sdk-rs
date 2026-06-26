@@ -43,10 +43,8 @@ mod photos;
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
 pub use events::{DriveEvent, DriveEventScopeId};
-pub use photos::{PhotoTag, PhotosTimelineItem, ProtonPhotosClient};
-pub use proton_sdk::cache::{
-    CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository,
-};
 pub use node::{Node, NodeKind, Thumbnail, ThumbnailType};
+pub use photos::{PhotoTag, PhotosTimelineItem, ProtonPhotosClient};
+pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
 
 pub use proton_sdk;

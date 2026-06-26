@@ -62,7 +62,9 @@ impl ContentKey {
     /// `PgpSessionKey.GenerateForAead()`.
     pub fn generate_aead() -> Self {
         let mut rng = rand::thread_rng();
-        let key = SymmetricKeyAlgorithm::AES256.new_session_key(&mut rng).to_vec();
+        let key = SymmetricKeyAlgorithm::AES256
+            .new_session_key(&mut rng)
+            .to_vec();
         ContentKey {
             session_key: PlainSessionKey::V6 { key },
         }
@@ -113,7 +115,11 @@ impl ContentKey {
         // session key, so we leave the builder unencrypted and seal the bytes
         // ourselves with our content key below.
         let mut builder = MessageBuilder::from_bytes(bytes::Bytes::new(), plaintext.to_vec());
-        builder.sign(&signer.key().primary_key, signer.password(), HashAlgorithm::Sha256);
+        builder.sign(
+            &signer.key().primary_key,
+            signer.password(),
+            HashAlgorithm::Sha256,
+        );
         let inner = builder
             .to_vec(&mut rng)
             .map_err(|e| CryptoError::Encrypt(format!("sign thumbnail: {e}")))?;
@@ -405,9 +411,7 @@ impl RecipientOp for ContentKeyPacketV6Op<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgp::composed::{
-        KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey,
-    };
+    use pgp::composed::{KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey};
     use pgp::crypto::sym::SymmetricKeyAlgorithm;
 
     /// Generate a passphrase-locked RSA key able to both sign and encrypt — a
@@ -471,14 +475,18 @@ mod tests {
         let node_key = PrivateKey::from_armored(&armored, b"pw").expect("parse node key");
 
         let content_key = ContentKey::generate();
-        let packet = content_key.to_packet(&node_key).expect("content key packet");
+        let packet = content_key
+            .to_packet(&node_key)
+            .expect("content key packet");
 
         let recovered = node_key
             .decrypt_content_key(&packet)
             .expect("decrypt content key");
 
         let plaintext = b"upload round trip block".to_vec();
-        let block = content_key.encrypt_block(&plaintext).expect("encrypt block");
+        let block = content_key
+            .encrypt_block(&plaintext)
+            .expect("encrypt block");
         let decrypted = recovered.decrypt_block(&block).expect("decrypt block");
 
         assert_eq!(decrypted, plaintext);
@@ -492,11 +500,15 @@ mod tests {
         let node = super::super::encrypt::generate_node_key().expect("generate node key");
         let content_key = ContentKey::generate();
 
-        let packet = content_key.to_packet(&node.key).expect("content key packet");
+        let packet = content_key
+            .to_packet(&node.key)
+            .expect("content key packet");
         let recovered = node.key.decrypt_content_key(&packet).expect("decrypt");
 
         let plaintext = b"x25519 block".to_vec();
-        let block = content_key.encrypt_block(&plaintext).expect("encrypt block");
+        let block = content_key
+            .encrypt_block(&plaintext)
+            .expect("encrypt block");
         assert_eq!(recovered.decrypt_block(&block).expect("decrypt"), plaintext);
     }
 
@@ -522,7 +534,9 @@ mod tests {
             Packet::SymEncryptedProtectedData(d) => d,
             other => panic!("expected SEIPD, got {:?}", other.tag()),
         };
-        let inner = seipd.decrypt(key, Some(sym_alg)).expect("decrypt thumbnail");
+        let inner = seipd
+            .decrypt(key, Some(sym_alg))
+            .expect("decrypt thumbnail");
 
         let mut inner_parser = PacketParser::new(Cursor::new(&inner));
         let first = inner_parser.next().expect("inner packet").expect("inner");
@@ -532,7 +546,10 @@ mod tests {
             first.tag()
         );
         // The literal data follows the one-pass signature.
-        let literal = inner_parser.next().expect("literal packet").expect("literal");
+        let literal = inner_parser
+            .next()
+            .expect("literal packet")
+            .expect("literal");
         match literal {
             Packet::LiteralData(data) => assert_eq!(data.data(), plaintext.as_slice()),
             other => panic!("expected literal data, got {:?}", other.tag()),
@@ -548,13 +565,17 @@ mod tests {
         let content_key = ContentKey::generate_aead();
         assert!(content_key.is_aead());
 
-        let packet = content_key.to_packet(&node.key).expect("content key packet");
+        let packet = content_key
+            .to_packet(&node.key)
+            .expect("content key packet");
         let recovered = node.key.decrypt_content_key(&packet).expect("decrypt");
         assert!(recovered.is_aead(), "recovered key should be AEAD");
 
         // A block larger than one AEAD chunk (128 KiB) exercises chunked GCM.
         let plaintext = vec![0xABu8; (1 << 17) + 1234];
-        let block = content_key.encrypt_block(&plaintext).expect("encrypt block");
+        let block = content_key
+            .encrypt_block(&plaintext)
+            .expect("encrypt block");
         assert_eq!(
             recovered.decrypt_block(&block).expect("decrypt block"),
             plaintext
@@ -577,7 +598,10 @@ mod tests {
             .encrypt_and_sign(&signer.key, &passphrase, false, false)
             .expect("encrypt passphrase to old parent");
         // The move keeps the detached NodePassphraseSignature, so sign separately.
-        let signature = signer.key.sign_detached(&passphrase).expect("sign passphrase");
+        let signature = signer
+            .key
+            .sign_detached(&passphrase)
+            .expect("sign passphrase");
 
         // The new parent cannot read the old-parent message yet.
         assert!(new_parent.key.decrypt_armored_message(&armored).is_err());
@@ -603,7 +627,9 @@ mod tests {
     fn rejects_non_pkesk_content_key_packet() {
         let mut rng = rand::thread_rng();
         let key = PrivateKey::from_armored(
-            &generate_node_key("pw").to_armored_string(None.into()).unwrap(),
+            &generate_node_key("pw")
+                .to_armored_string(None.into())
+                .unwrap(),
             b"pw",
         )
         .unwrap();

@@ -392,7 +392,10 @@ mod tests {
     async fn encrypted_round_trips_and_hides_plaintext() {
         let inner = InMemoryCacheRepository::shared();
         let cache = EncryptedCacheRepository::new(inner.clone(), b"hunter2-master-key".to_vec());
-        cache.set("share:1", "secret-value", &tags(&["t"])).await.unwrap();
+        cache
+            .set("share:1", "secret-value", &tags(&["t"]))
+            .await
+            .unwrap();
 
         // Stored ciphertext is not the plaintext.
         let stored = inner.get("share:1").await.unwrap().unwrap();
@@ -405,7 +408,10 @@ mod tests {
         );
         // Tags pass through to the inner store.
         let by_tag = cache.get_by_tags(&tags(&["t"])).await.unwrap();
-        assert_eq!(by_tag, vec![("share:1".to_string(), "secret-value".to_string())]);
+        assert_eq!(
+            by_tag,
+            vec![("share:1".to_string(), "secret-value".to_string())]
+        );
     }
 
     #[tokio::test]

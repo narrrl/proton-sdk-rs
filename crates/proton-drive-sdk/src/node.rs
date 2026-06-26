@@ -60,8 +60,9 @@ impl NodeVerification {
     /// `NotSigned` is treated as acceptable (Proton metadata is not always
     /// signed); only `NoVerifier`/`Failed` count against trust.
     pub fn is_fully_verified(&self) -> bool {
-        let ok =
-            |s: VerificationStatus| matches!(s, VerificationStatus::Ok | VerificationStatus::NotSigned);
+        let ok = |s: VerificationStatus| {
+            matches!(s, VerificationStatus::Ok | VerificationStatus::NotSigned)
+        };
         ok(self.name)
             && ok(self.passphrase)
             && self.content_key.map_or(true, ok)

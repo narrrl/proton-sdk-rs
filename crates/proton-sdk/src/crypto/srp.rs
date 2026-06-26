@@ -80,11 +80,7 @@ fn expand_hash(data: &[u8]) -> Vec<u8> {
 /// Hash the password for auth versions 3/4: `expandHash(bcrypt(pw, salt+"proton") || modulus)`.
 ///
 /// `salt` is the raw (decoded) login salt; `modulus` is the raw modulus bytes.
-fn hash_password_v3(
-    password: &[u8],
-    salt: &[u8],
-    modulus: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+fn hash_password_v3(password: &[u8], salt: &[u8], modulus: &[u8]) -> Result<Vec<u8>, CryptoError> {
     // Proton appends the literal "proton" to the 10-byte salt, yielding bcrypt's
     // required 16-byte salt.
     let mut salt_buf = [0u8; 16];
@@ -139,11 +135,15 @@ fn to_le_fixed(n: &BigUint, byte_len: usize) -> Result<Vec<u8>, CryptoError> {
 /// modulus signature has already been verified against Proton's key.
 fn check_params(bit_length: usize, n: &BigUint, b: &BigUint) -> Result<(), CryptoError> {
     if n.bits() as usize != bit_length {
-        return Err(CryptoError::Verification("SRP modulus has wrong size".into()));
+        return Err(CryptoError::Verification(
+            "SRP modulus has wrong size".into(),
+        ));
     }
     // 2 generates the whole group only when N ≡ 3 (mod 8).
     if (n % 8u32) != BigUint::from(3u32) {
-        return Err(CryptoError::Verification("SRP modulus is not 3 mod 8".into()));
+        return Err(CryptoError::Verification(
+            "SRP modulus is not 3 mod 8".into(),
+        ));
     }
     let n_minus_1 = n - 1u32;
     if *b <= BigUint::one() || *b >= n_minus_1 {
@@ -174,8 +174,7 @@ fn generate_ephemeral(
 
     loop {
         let mut buf = vec![0u8; byte_len];
-        getrandom::getrandom(&mut buf)
-            .map_err(|e| CryptoError::Decrypt(format!("rng: {e}")))?;
+        getrandom::getrandom(&mut buf).map_err(|e| CryptoError::Decrypt(format!("rng: {e}")))?;
         let secret = from_le(&buf) % n_minus_1;
         if secret <= lower_bound || secret >= *n_minus_1 {
             continue;
@@ -233,7 +232,9 @@ pub fn generate_proofs(
     k_input.extend_from_slice(&to_le_fixed(&n, byte_len)?);
     let k = from_le(&expand_hash(&k_input)) % &n;
     if k <= BigUint::one() || k >= n_minus_1 {
-        return Err(CryptoError::Verification("SRP multiplier out of bounds".into()));
+        return Err(CryptoError::Verification(
+            "SRP multiplier out of bounds".into(),
+        ));
     }
 
     let (secret, a_bytes, scrambling) =

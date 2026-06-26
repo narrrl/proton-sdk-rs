@@ -15,8 +15,8 @@ pub fn decrypt_armored(
     key: &SignedSecretKey,
     key_pw: &Password,
 ) -> Result<Vec<u8>, CryptoError> {
-    let (message, _headers) = Message::from_string(armored)
-        .map_err(|e| CryptoError::Parse(format!("message: {e}")))?;
+    let (message, _headers) =
+        Message::from_string(armored).map_err(|e| CryptoError::Parse(format!("message: {e}")))?;
 
     let decrypted = message
         .decrypt(key_pw, key)
@@ -31,8 +31,8 @@ pub fn decrypt_binary(
     key: &SignedSecretKey,
     key_pw: &Password,
 ) -> Result<Vec<u8>, CryptoError> {
-    let message = Message::from_bytes(ciphertext)
-        .map_err(|e| CryptoError::Parse(format!("message: {e}")))?;
+    let message =
+        Message::from_bytes(ciphertext).map_err(|e| CryptoError::Parse(format!("message: {e}")))?;
 
     let decrypted = message
         .decrypt(key_pw, key)

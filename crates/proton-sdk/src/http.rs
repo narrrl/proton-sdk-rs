@@ -111,7 +111,11 @@ impl ApiHttpClient {
     /// previous sink. Takes effect for every clone of this client, since they
     /// share state.
     pub fn set_telemetry(&self, telemetry: Arc<dyn Telemetry>) {
-        *self.inner.telemetry.lock().expect("telemetry mutex poisoned") = telemetry;
+        *self
+            .inner
+            .telemetry
+            .lock()
+            .expect("telemetry mutex poisoned") = telemetry;
     }
 
     /// Snapshot the current telemetry sink.
@@ -283,7 +287,8 @@ impl ApiHttpClient {
         }
 
         let access_token = self.refresh_access_token(&rejected_access_token).await?;
-        self.send_with_token(method, path, body, &access_token).await
+        self.send_with_token(method, path, body, &access_token)
+            .await
     }
 
     async fn send_with_token<B: Serialize>(
@@ -448,9 +453,12 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
         .as_ref()
         .map(|e| e.code)
         .unwrap_or(ResponseCode::Unknown);
-    let message = envelope
-        .and_then(|e| e.error_message)
-        .unwrap_or_else(|| status.canonical_reason().unwrap_or("unknown error").to_owned());
+    let message = envelope.and_then(|e| e.error_message).unwrap_or_else(|| {
+        status
+            .canonical_reason()
+            .unwrap_or("unknown error")
+            .to_owned()
+    });
 
     ProtonError::Api(ProtonApiError {
         code,
@@ -567,10 +575,16 @@ mod tests {
     #[test]
     fn retry_after_parses_seconds_only() {
         assert_eq!(parse_retry_after_secs("5"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_retry_after_secs("  12 "), Some(Duration::from_secs(12)));
+        assert_eq!(
+            parse_retry_after_secs("  12 "),
+            Some(Duration::from_secs(12))
+        );
         assert_eq!(parse_retry_after_secs("0"), Some(Duration::ZERO));
         // HTTP-date form is unsupported -> falls back to backoff.
-        assert_eq!(parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(
+            parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
         assert_eq!(parse_retry_after_secs(""), None);
     }
 

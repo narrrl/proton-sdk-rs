@@ -44,8 +44,9 @@ pub fn decrypt_link(parent_key: &PrivateKey, link: &LinkDto) -> Result<Decrypted
     let node_key = PrivateKey::from_armored(&link.key, &passphrase)?;
 
     let name_bytes = parent_key.decrypt_armored_message(&link.name)?;
-    let name = String::from_utf8(name_bytes)
-        .map_err(|e| ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}")))?;
+    let name = String::from_utf8(name_bytes).map_err(|e| {
+        ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}"))
+    })?;
 
     Ok(DecryptedLink { node_key, name })
 }
@@ -125,8 +126,9 @@ pub async fn decrypt_link_verified(
     // Name: an inline-signed message addressed to the parent key.
     let (name_bytes, name_status) =
         parent_key.decrypt_armored_verify(&link.name, &name_claim.ring(parent_key))?;
-    let name = String::from_utf8(name_bytes)
-        .map_err(|e| ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}")))?;
+    let name = String::from_utf8(name_bytes).map_err(|e| {
+        ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}"))
+    })?;
 
     let verification = NodeVerification {
         name: name_status,

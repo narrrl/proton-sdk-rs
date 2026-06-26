@@ -54,13 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = client.get_my_files_folder().await?;
     eprintln!(
         "[+] root: name={:?} kind={:?} uid={}",
-        root.name,
-        root.kind,
-        root.uid,
+        root.name, root.kind, root.uid,
     );
 
     eprintln!("[*] enumerating children ...");
-    let child_uids = client.enumerate_folder_children_node_uids(&root.uid).await?;
+    let child_uids = client
+        .enumerate_folder_children_node_uids(&root.uid)
+        .await?;
     let children = client.enumerate_nodes(&child_uids).await?;
     eprintln!("[+] {} children:", children.len());
     for c in &children {

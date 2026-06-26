@@ -9,6 +9,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::Bytes;
+use chrono::SubsecRound;
 use pgp::composed::{
     ArmorOptions, KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey,
     StandaloneSignature, SubkeyParamsBuilder,
@@ -17,7 +18,6 @@ use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
 use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion, Password, PublicKeyTrait};
-use chrono::SubsecRound;
 use rand::RngCore;
 
 use super::errors::CryptoError;
@@ -193,9 +193,10 @@ pub fn build_volume_creation_material(
     let share_passphrase = address_key.encrypt(&share.passphrase)?;
     let share_passphrase_signature = address_key.sign_detached(&share.passphrase)?;
 
-    let folder_name = share
-        .key
-        .encrypt_and_sign(address_key, root_folder_name.as_bytes(), true, false)?;
+    let folder_name =
+        share
+            .key
+            .encrypt_and_sign(address_key, root_folder_name.as_bytes(), true, false)?;
     let folder_passphrase = share.key.encrypt(&folder.passphrase)?;
     let folder_passphrase_signature = address_key.sign_detached(&folder.passphrase)?;
 
@@ -327,10 +328,7 @@ mod tests {
             .key
             .encrypt_and_sign(&signer.key, &plaintext, false, true)
             .expect("encrypt and sign");
-        let decrypted = node
-            .key
-            .decrypt_armored_message(&armored)
-            .expect("decrypt");
+        let decrypted = node.key.decrypt_armored_message(&armored).expect("decrypt");
         assert_eq!(decrypted, plaintext);
 
         // Encrypt-only (no signature) must also round-trip.

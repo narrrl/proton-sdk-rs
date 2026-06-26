@@ -194,14 +194,23 @@ mod tests {
         assert!(cache.main_volume_id().await.unwrap().is_none());
 
         cache.set_client_uid("client-xyz").await.unwrap();
-        cache.set_main_volume_id(&VolumeId::from("vol-1")).await.unwrap();
+        cache
+            .set_main_volume_id(&VolumeId::from("vol-1"))
+            .await
+            .unwrap();
         cache
             .set_my_files_share_id(&ShareId::from("mf-share"))
             .await
             .unwrap();
 
-        assert_eq!(cache.client_uid().await.unwrap().as_deref(), Some("client-xyz"));
-        assert_eq!(cache.main_volume_id().await.unwrap(), Some(VolumeId::from("vol-1")));
+        assert_eq!(
+            cache.client_uid().await.unwrap().as_deref(),
+            Some("client-xyz")
+        );
+        assert_eq!(
+            cache.main_volume_id().await.unwrap(),
+            Some(VolumeId::from("vol-1"))
+        );
         assert_eq!(
             cache.my_files_share_id().await.unwrap(),
             Some(ShareId::from("mf-share"))
@@ -211,7 +220,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_entry_is_evicted_as_miss() {
         let repo = InMemoryCacheRepository::shared();
-        repo.set(&node_key(&uid("v", "l")), "not json", &[]).await.unwrap();
+        repo.set(&node_key(&uid("v", "l")), "not json", &[])
+            .await
+            .unwrap();
         let cache = DriveEntityCache::new(repo.clone());
         assert!(cache.try_get_node(&uid("v", "l")).await.unwrap().is_none());
         // The bad entry was removed.

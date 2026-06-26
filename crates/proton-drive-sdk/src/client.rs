@@ -12,12 +12,12 @@ use tokio::sync::Mutex;
 use proton_sdk::account::AccountClient;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
-use proton_sdk::error::{ProtonError, Result};
-use proton_sdk::http::ApiHttpClient;
 use proton_sdk::crypto::{
     build_volume_creation_material, generate_node_hash_key, generate_node_key, verify_detached,
     ContentKey, VerificationKeyRing, VerificationStatus,
 };
+use proton_sdk::error::{ProtonError, Result};
+use proton_sdk::http::ApiHttpClient;
 use proton_sdk::ids::{AddressId, DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_sdk::session::ProtonApiSession;
 use proton_sdk::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
@@ -25,6 +25,7 @@ use proton_sdk::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
+use crate::cache::DriveEntityCache;
 use crate::crypto::{
     decrypt_content_key_verified, decrypt_extended_attributes_verified, decrypt_link,
     decrypt_link_verified, decrypt_share_key,
@@ -34,19 +35,18 @@ use crate::dtos::{
     BlockUploadPreparationResponse, BlockVerificationInputResponse, BlockVerifier,
     CommonExtendedAttributes, ExtendedAttributes, FileContentDigests, FileCreationRequest,
     FileCreationResponse, FolderChildrenResponse, FolderCreationRequest, FolderCreationResponse,
-    LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto, LinkType, MoveLinkRequest,
-    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
-    NodeNameAvailabilityRequest,
-    NodeNameAvailabilityResponse, RenameLinkRequest, RevisionCreationRequest,
+    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
+    LinkType, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
+    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
+    NodeNameAvailabilityResponse, PhotosAttributesDto, RenameLinkRequest, RevisionCreationRequest,
     RevisionCreationResponse, RevisionDto, RevisionResponse, RevisionUpdateRequest,
-    LatestVolumeEventResponse, PhotosAttributesDto, ThumbnailBlockListRequest,
-    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
-    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
+    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
+    TimelinePhotoListResponse, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
+    VolumeTrashResponse,
 };
-use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
-use crate::cache::DriveEntityCache;
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, Thumbnail, ThumbnailType};
+use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
 const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
@@ -223,7 +223,9 @@ impl ProtonDriveClient {
         let parent_key = self
             .resolve_parent_key(&uid.volume_id, &details.link)
             .await?;
-        let node = self.build_node(&uid.volume_id, &details, &parent_key).await?;
+        let node = self
+            .build_node(&uid.volume_id, &details, &parent_key)
+            .await?;
         timer.success();
         Ok(Some(node))
     }
@@ -326,8 +328,7 @@ impl ProtonDriveClient {
         let mut page = 0_usize;
 
         loop {
-            let path =
-                format!("volumes/{volume_id}/trash?pageSize={TRASH_PAGE_SIZE}&page={page}");
+            let path = format!("volumes/{volume_id}/trash?pageSize={TRASH_PAGE_SIZE}&page={page}");
             let response: VolumeTrashResponse = self.http.get(&path).await?;
 
             let mut count = 0_usize;
@@ -474,9 +475,9 @@ impl ProtonDriveClient {
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
             ProtonError::invalid_operation("file is missing its content key packet")
         })?;
-        let content_key_packet = BASE64
-            .decode(content_key_packet_b64.trim())
-            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
+            ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+        })?;
         let revision_id = file
             .active_revision
             .map(|r| r.id)
@@ -536,7 +537,8 @@ impl ProtonDriveClient {
         uid: &NodeUid,
         thumbnail_type: ThumbnailType,
     ) -> Result<Option<Vec<u8>>> {
-        self.download_thumbnail_ctx(uid, thumbnail_type, false).await
+        self.download_thumbnail_ctx(uid, thumbnail_type, false)
+            .await
     }
 
     /// As [`download_thumbnail`](Self::download_thumbnail), but routes node and
@@ -646,10 +648,7 @@ impl ProtonDriveClient {
                     }
                     Ok((_, None)) => {
                         let msg = format!("node {uid} has no thumbnail of the requested type");
-                        results.push(FileThumbnail::err(
-                            uid,
-                            ProtonError::invalid_operation(msg),
-                        ));
+                        results.push(FileThumbnail::err(uid, ProtonError::invalid_operation(msg)));
                     }
                     Err(e) => results.push(FileThumbnail::err(uid, e)),
                 }
@@ -695,9 +694,9 @@ impl ProtonDriveClient {
                         .get_storage_blob(&block.bare_url, &block.token)
                         .await
                     {
-                        Ok(ciphertext) => {
-                            content_key.decrypt_block(&ciphertext).map_err(ProtonError::from)
-                        }
+                        Ok(ciphertext) => content_key
+                            .decrypt_block(&ciphertext)
+                            .map_err(ProtonError::from),
                         Err(e) => Err(e),
                     };
                     results.push(match downloaded {
@@ -743,7 +742,11 @@ impl ProtonDriveClient {
         for_photos: bool,
     ) -> Result<(ContentKey, Option<String>)> {
         let details = self
-            .get_link_details_ctx(&uid.volume_id, std::slice::from_ref(&uid.link_id), for_photos)
+            .get_link_details_ctx(
+                &uid.volume_id,
+                std::slice::from_ref(&uid.link_id),
+                for_photos,
+            )
             .await?;
         let detail = details
             .links
@@ -758,9 +761,9 @@ impl ProtonDriveClient {
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
             ProtonError::invalid_operation("file is missing its content key packet")
         })?;
-        let content_key_packet = BASE64
-            .decode(content_key_packet_b64.trim())
-            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
+            ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+        })?;
         let revision_id = file
             .active_revision
             .map(|r| r.id)
@@ -920,7 +923,9 @@ impl ProtonDriveClient {
         let mut timer = self.telemetry.start("upload_photo");
         timer.attr("aead", aead);
         if !self.ensure_photos().await? {
-            return Err(ProtonError::invalid_operation("account has no photos volume"));
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
         }
         let parent_uid = self
             .cache
@@ -938,8 +943,13 @@ impl ProtonDriveClient {
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
         timer.attr("size", written.total_size);
         let photos_attributes = build_photos_attributes(&draft.parent_hash_key, &written, metadata);
-        self.seal_revision(&draft, &written, metadata.capture_time, Some(photos_attributes))
-            .await?;
+        self.seal_revision(
+            &draft,
+            &written,
+            metadata.capture_time,
+            Some(photos_attributes),
+        )
+        .await?;
 
         timer.success();
         Ok(file_uid)
@@ -971,7 +981,8 @@ impl ProtonDriveClient {
         let node = generate_node_key()?;
         let node_hash_key = generate_node_hash_key(&node.key)?;
 
-        let encrypted_name = parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
+        let encrypted_name =
+            parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
         let name_hash = hex::encode(hmac_sha256(&parent_hash_key, name.as_bytes()));
         let encrypted_passphrase = parent_key.encrypt(&node.passphrase)?;
         let passphrase_signature = signing_key.sign_detached(&node.passphrase)?;
@@ -992,7 +1003,10 @@ impl ProtonDriveClient {
                 let xattr_json = serde_json::to_vec(&xattr).map_err(|e| {
                     ProtonError::invalid_operation(format!("serialize folder xattr: {e}"))
                 })?;
-                Some(node.key.encrypt_and_sign(&signing_key, &xattr_json, false, true)?)
+                Some(
+                    node.key
+                        .encrypt_and_sign(&signing_key, &xattr_json, false, true)?,
+                )
             }
             None => None,
         };
@@ -1230,9 +1244,9 @@ impl ProtonDriveClient {
         for chunk in uids.chunks(MAX_BATCH_COUNT) {
             let mut items = Vec::with_capacity(chunk.len());
             for uid in chunk {
-                let link = links
-                    .get(&uid.link_id)
-                    .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} not found")))?;
+                let link = links.get(&uid.link_id).ok_or_else(|| {
+                    ProtonError::invalid_operation(format!("node {uid} not found"))
+                })?;
                 let parts = self
                     .build_move_parts(uid, link, &dest_parent_key, &dest_hash_key, &signing_key)
                     .await?;
@@ -1403,7 +1417,8 @@ impl ProtonDriveClient {
             ContentKey::generate()
         };
 
-        let encrypted_name = parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
+        let encrypted_name =
+            parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
         let name_hash = hex::encode(hmac_sha256(&parent_hash_key, name.as_bytes()));
         let encrypted_passphrase = parent_key.encrypt(&node.passphrase)?;
         let passphrase_signature = signing_key.sign_detached(&node.passphrase)?;
@@ -1455,22 +1470,21 @@ impl ProtonDriveClient {
         let details = self
             .get_link_details(&volume_id, std::slice::from_ref(&file_uid.link_id))
             .await?;
-        let detail = details
-            .links
-            .into_iter()
-            .next()
-            .ok_or_else(|| ProtonError::invalid_operation(format!("file {file_uid} not found")))?;
+        let detail =
+            details.links.into_iter().next().ok_or_else(|| {
+                ProtonError::invalid_operation(format!("file {file_uid} not found"))
+            })?;
         let link = detail.link;
-        let file = detail
-            .file
-            .ok_or_else(|| ProtonError::invalid_operation(format!("node {file_uid} is not a file")))?;
+        let file = detail.file.ok_or_else(|| {
+            ProtonError::invalid_operation(format!("node {file_uid} is not a file"))
+        })?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
             ProtonError::invalid_operation("file is missing its content key packet")
         })?;
-        let content_key_packet = BASE64
-            .decode(content_key_packet_b64.trim())
-            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
+            ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+        })?;
         let active_revision_id = file
             .active_revision
             .map(|r| r.id)
@@ -1488,7 +1502,10 @@ impl ProtonDriveClient {
             client_uid: Some(self.http.session_id().to_string()),
             intended_upload_size,
         };
-        let path = format!("v2/volumes/{volume_id}/files/{}/revisions", file_uid.link_id);
+        let path = format!(
+            "v2/volumes/{volume_id}/files/{}/revisions",
+            file_uid.link_id
+        );
         let created: RevisionCreationResponse = self.http.post(&path, &request).await?;
 
         Ok(RevisionDraft {
@@ -1674,7 +1691,9 @@ impl ProtonDriveClient {
         let xattr_json = serde_json::to_vec(&extended_attributes)
             .map_err(|e| ProtonError::invalid_operation(format!("serialize xattr: {e}")))?;
         let encrypted_xattr =
-            draft.node_key.encrypt_and_sign(&draft.signing_key, &xattr_json, false, true)?;
+            draft
+                .node_key
+                .encrypt_and_sign(&draft.signing_key, &xattr_json, false, true)?;
 
         let seal_request = RevisionUpdateRequest {
             manifest_signature,
@@ -1712,7 +1731,9 @@ impl ProtonDriveClient {
     /// photos share's `MembershipAddressId` is cached by [`ensure_photos`].
     async fn photos_membership_address(&self) -> Result<(AddressId, String, PrivateKey)> {
         if !self.ensure_photos().await? {
-            return Err(ProtonError::invalid_operation("account has no photos volume"));
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
         }
         let address_id = self
             .cache
@@ -1743,7 +1764,9 @@ impl ProtonDriveClient {
         let signing_key = keys
             .get(address.primary_key_index)
             .cloned()
-            .ok_or_else(|| ProtonError::invalid_operation("membership address has no primary key"))?;
+            .ok_or_else(|| {
+                ProtonError::invalid_operation("membership address has no primary key")
+            })?;
 
         Ok((address_id, address.email, signing_key))
     }
@@ -1754,7 +1777,8 @@ impl ProtonDriveClient {
         parent_uid: &NodeUid,
         parent_key: &PrivateKey,
     ) -> Result<Vec<u8>> {
-        self.parent_hash_key_ctx(parent_uid, parent_key, false).await
+        self.parent_hash_key_ctx(parent_uid, parent_key, false)
+            .await
     }
 
     /// As [`parent_hash_key`](Self::parent_hash_key), but routes the link-details
@@ -1796,7 +1820,9 @@ impl ProtonDriveClient {
 
         let packet = BASE64
             .decode(response.content_key_packet.trim())
-            .map_err(|e| ProtonError::invalid_operation(format!("decode verification packet: {e}")))?;
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("decode verification packet: {e}"))
+            })?;
         node_key.decrypt_content_key(&packet).map_err(|e| {
             ProtonError::invalid_operation(format!("verification content key mismatch: {e}"))
         })?;
@@ -1883,9 +1909,7 @@ impl ProtonDriveClient {
         let mut cache = self.cache.lock().await;
         cache.main_volume_id = Some(volume_id);
         cache.my_files_root = Some(root_uid.clone());
-        cache
-            .folder_keys
-            .insert(root_uid, decrypted_root.node_key);
+        cache.folder_keys.insert(root_uid, decrypted_root.node_key);
         cache.my_files_share = Some(ShareKey {
             share_id,
             address_id: response.share.address_id.clone(),
@@ -2156,9 +2180,9 @@ impl ProtonDriveClient {
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
             ProtonError::invalid_operation("photo is missing its content key packet")
         })?;
-        let content_key_packet = BASE64
-            .decode(content_key_packet_b64.trim())
-            .map_err(|e| ProtonError::invalid_operation(format!("decode content key packet: {e}")))?;
+        let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
+            ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+        })?;
         let revision_id = file
             .active_revision
             .map(|r| r.id)
@@ -2635,7 +2659,7 @@ fn to_drive_event(volume_id: &VolumeId, event: &VolumeEventDto) -> Result<DriveE
 
     // VolumeEventType: 0 Delete, 1 Create, 2 Update, 3 UpdateMetadata.
     match event.event_type {
-        1 | 2 | 3 => Ok(DriveEvent::NodeUpdated {
+        1..=3 => Ok(DriveEvent::NodeUpdated {
             id: event.id.clone(),
             node_uid,
             parent_node_uid,
@@ -2848,7 +2872,10 @@ mod tests {
         };
         let metadata = PhotoUploadMetadata {
             capture_time: Some(1_700_000_000),
-            main_photo_uid: Some(NodeUid::new(VolumeId::new("vol-1"), LinkId::new("main-link"))),
+            main_photo_uid: Some(NodeUid::new(
+                VolumeId::new("vol-1"),
+                LinkId::new("main-link"),
+            )),
             tags: vec![PhotoTag::Video, PhotoTag::Selfie],
         };
 
@@ -2860,7 +2887,10 @@ mod tests {
         assert_eq!(attrs.capture_time, 1_700_000_000);
         assert_eq!(attrs.main_photo_link_id, Some(LinkId::new("main-link")));
         // Tags carry their `PhotoTag` discriminants.
-        assert_eq!(attrs.tags, vec![PhotoTag::Video as i32, PhotoTag::Selfie as i32]);
+        assert_eq!(
+            attrs.tags,
+            vec![PhotoTag::Video as i32, PhotoTag::Selfie as i32]
+        );
     }
 
     #[test]

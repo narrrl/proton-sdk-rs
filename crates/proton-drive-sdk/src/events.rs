@@ -111,13 +111,7 @@ mod tests {
     #[test]
     fn id_covers_parity_variants() {
         let id = DriveEventId::new("evt-1");
-        assert_eq!(
-            DriveEvent::ScopeAccessLost { id: id.clone() }.id(),
-            &id
-        );
-        assert_eq!(
-            DriveEvent::SharedWithMeUpdated { id: id.clone() }.id(),
-            &id
-        );
+        assert_eq!(DriveEvent::ScopeAccessLost { id: id.clone() }.id(), &id);
+        assert_eq!(DriveEvent::SharedWithMeUpdated { id: id.clone() }.id(), &id);
     }
 }
