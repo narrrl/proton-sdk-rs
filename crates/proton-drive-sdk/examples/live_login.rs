@@ -17,7 +17,12 @@ use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::ProtonApiSession;
 use sha1::Sha1;
 
-const APP_VERSION: &str = "external-drive-rust@0.1.0-dev";
+// Must follow Proton's required shape (sdk/README.md "Operational requirements"):
+//   external-drive-{name}@{semver}-{channel}   channel ∈ {stable, beta, alpha}
+// A malformed channel (e.g. `-dev`) fails honest-identification and gets the
+// request blocked with a 422 "unusual activity" anti-abuse response.
+const APP_VERSION: &str = "external-drive-rust@0.1.0-alpha";
+const USER_AGENT: &str = "external-drive-rust/0.1.0";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let totp_secret = std::env::var("PROTON_TOTP_SECRET")
         .map_err(|_| "PROTON_TOTP_SECRET not set (base32 2FA secret)")?;
 
-    let config = ProtonClientConfiguration::new(APP_VERSION);
+    let config = ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT);
 
     eprintln!("[*] SRP login as {username} ...");
     let mut session = ProtonApiSession::begin(config, &username, password.as_bytes()).await?;
