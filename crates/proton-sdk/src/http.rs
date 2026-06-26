@@ -39,6 +39,12 @@ pub struct Tokens {
 #[derive(Clone)]
 pub struct ApiHttpClient {
     inner: Arc<Inner>,
+    /// Extra path segment prepended to every request path (after `base_url`,
+    /// before the per-call `path`). Mirrors C# `session.GetHttpClient(baseRoute)`
+    /// — the Drive client targets `…/drive/` while account/auth calls stay at the
+    /// root. Empty by default. Lives on the outer struct (not `Inner`) so clones
+    /// can carry different prefixes while sharing one token/telemetry store.
+    route_prefix: Arc<str>,
 }
 
 struct Inner {
@@ -77,7 +83,20 @@ impl ApiHttpClient {
                 tokens: Mutex::new(tokens),
                 telemetry: std::sync::Mutex::new(NoopTelemetry::shared()),
             }),
+            route_prefix: Arc::from(""),
         })
+    }
+
+    /// Derive a clone that prepends `route` to every request path, sharing this
+    /// client's token store, telemetry sink and connection pool. Mirrors C#
+    /// `session.GetHttpClient(baseRoute)`: the Drive client passes `"drive/"` so
+    /// its routes resolve under `…/drive/` while auth/account calls (and token
+    /// refresh) stay at the root. `route` should end in `/`.
+    pub fn with_base_route(&self, route: impl Into<Arc<str>>) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            route_prefix: route.into(),
+        }
     }
 
     /// Snapshot the current tokens (e.g. to persist for a later `resume`).
@@ -274,7 +293,12 @@ impl ApiHttpClient {
         body: Option<&B>,
         access_token: &str,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}{}", self.inner.base_url, path.trim_start_matches('/'));
+        let url = format!(
+            "{}{}{}",
+            self.inner.base_url,
+            self.route_prefix,
+            path.trim_start_matches('/')
+        );
         send_retrying(&self.inner.config.retry_policy, || {
             let mut request = self
                 .inner

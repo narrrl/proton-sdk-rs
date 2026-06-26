@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use crate::crypto::{self, PrivateKey, PublicKey};
 use crate::error::{ProtonError, Result};
 use crate::http::ApiHttpClient;
-use crate::ids::AddressId;
+use crate::ids::{AddressId, AddressKeyId};
 use crate::session::ProtonApiSession;
 
 use dtos::{
@@ -37,6 +37,8 @@ pub struct Address {
     pub status: i32,
     /// Index, within the decrypted key list, of the primary key.
     pub primary_key_index: usize,
+    /// Id of the address's primary key (the `AddressKeyID` for write requests).
+    pub primary_key_id: AddressKeyId,
 }
 
 /// Resolves account keys needed to decrypt Drive metadata.
@@ -263,6 +265,7 @@ impl AccountClient {
 
         let mut keys = Vec::new();
         let mut primary_key_index = None;
+        let mut primary_key_id = None;
 
         for key_dto in &dto.keys {
             if !key_dto.is_active() {
@@ -295,6 +298,7 @@ impl AccountClient {
                 Ok(key) => {
                     if key_dto.is_primary() && primary_key_index.is_none() {
                         primary_key_index = Some(keys.len());
+                        primary_key_id = Some(key_dto.id.clone());
                     }
                     keys.push(key);
                 }
@@ -306,6 +310,8 @@ impl AccountClient {
 
         let primary_key_index = primary_key_index
             .ok_or_else(|| ProtonError::invalid_operation(format!("address {} has no primary key", dto.id)))?;
+        let primary_key_id = primary_key_id
+            .ok_or_else(|| ProtonError::invalid_operation(format!("address {} has no primary key", dto.id)))?;
 
         let address = Address {
             id: dto.id.clone(),
@@ -313,6 +319,7 @@ impl AccountClient {
             order: dto.order,
             status: dto.status,
             primary_key_index,
+            primary_key_id,
         };
 
         Ok((address, keys))

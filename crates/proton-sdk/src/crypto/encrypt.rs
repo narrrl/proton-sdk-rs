@@ -146,6 +146,76 @@ pub fn generate_node_hash_key(node_key: &PrivateKey) -> Result<String, CryptoErr
     encrypt_and_sign(node_key.key(), Some(node_key), &bytes, false, false)
 }
 
+/// The encrypted/locked material for a new volume's root share + root folder.
+///
+/// Mirrors the output of C# `VolumeOperations.GetCreationRequest`: a fresh root
+/// share key and root folder key (each Ed25519 + X25519, locked with a random
+/// passphrase), plus the passphrases/name/hash-key encrypted into the request
+/// shape the `volumes` endpoint expects.
+pub struct VolumeCreationMaterial {
+    /// Locked root share key (armored secret key) — `ShareKey`.
+    pub share_key_armored: String,
+    /// Share passphrase encrypted (encrypt-only) to the address key — `SharePassphrase`.
+    pub share_passphrase: String,
+    /// Detached signature over the share passphrase by the address key.
+    pub share_passphrase_signature: String,
+    /// Root folder name encrypted + inline-signed to the share key — `FolderName`.
+    pub folder_name: String,
+    /// Locked root folder key (armored secret key) — `FolderKey`.
+    pub folder_key_armored: String,
+    /// Folder passphrase encrypted (encrypt-only) to the share key — `FolderPassphrase`.
+    pub folder_passphrase: String,
+    /// Detached signature over the folder passphrase by the address key.
+    pub folder_passphrase_signature: String,
+    /// Folder hash key encrypted + inline-signed to the folder key — `FolderHashKey`.
+    pub folder_hash_key: String,
+}
+
+/// Build the crypto material for creating a volume's root share and folder.
+///
+/// Mirrors C# `VolumeOperations.GetCreationRequest`:
+/// - root share key + folder key are generated and locked with random passphrases;
+/// - the **share** passphrase is encrypted (encrypt-only) to `address_key` with a
+///   detached signature by the address key (it is the address key that unwraps it);
+/// - the **folder** passphrase is encrypted (encrypt-only) to the share key with a
+///   detached signature by the address key;
+/// - the folder **name** (`"root"`) is encrypted + inline-signed to the share key;
+/// - the folder **hash key** (32 random bytes) is encrypted + inline-signed to the
+///   folder key. All inline/detached signatures are made by `address_key`.
+pub fn build_volume_creation_material(
+    address_key: &PrivateKey,
+    root_folder_name: &str,
+) -> Result<VolumeCreationMaterial, CryptoError> {
+    let share = generate_node_key()?;
+    let folder = generate_node_key()?;
+
+    let share_passphrase = address_key.encrypt(&share.passphrase)?;
+    let share_passphrase_signature = address_key.sign_detached(&share.passphrase)?;
+
+    let folder_name = share
+        .key
+        .encrypt_and_sign(address_key, root_folder_name.as_bytes(), true, false)?;
+    let folder_passphrase = share.key.encrypt(&folder.passphrase)?;
+    let folder_passphrase_signature = address_key.sign_detached(&folder.passphrase)?;
+
+    let mut hash_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut hash_key);
+    let folder_hash_key = folder
+        .key
+        .encrypt_and_sign(address_key, &hash_key, false, false)?;
+
+    Ok(VolumeCreationMaterial {
+        share_key_armored: share.locked_armored,
+        share_passphrase,
+        share_passphrase_signature,
+        folder_name,
+        folder_key_armored: folder.locked_armored,
+        folder_passphrase,
+        folder_passphrase_signature,
+        folder_hash_key,
+    })
+}
+
 /// Encrypt `data` to `recipient`, optionally inline-signing with `signer`, and
 /// return the armored PGP message. Mirrors C# `PgpEncrypter.EncryptAndSign`
 /// (and the encrypt-only path when `signer` is `None`).
@@ -258,6 +328,51 @@ mod tests {
             .key
             .verify_detached_signature(&sig, data)
             .expect("verify detached signature");
+    }
+
+    #[test]
+    fn volume_creation_material_round_trips() {
+        // Stand-in for the account's primary address key.
+        let address_key = generate_node_key().expect("generate address key");
+
+        let material =
+            build_volume_creation_material(&address_key.key, "root").expect("build material");
+
+        // The share passphrase is encrypted to the address key and unlocks the
+        // root share key; its detached signature verifies against the address key.
+        let share_pp = address_key
+            .key
+            .decrypt_armored_message(&material.share_passphrase)
+            .expect("decrypt share passphrase");
+        address_key
+            .key
+            .verify_detached_signature(&material.share_passphrase_signature, &share_pp)
+            .expect("verify share passphrase signature");
+        let share_key = PrivateKey::from_armored(&material.share_key_armored, &share_pp)
+            .expect("unlock share key");
+
+        // The folder passphrase is encrypted to the share key and unlocks the
+        // root folder key; its detached signature verifies against the address key.
+        let folder_pp = share_key
+            .decrypt_armored_message(&material.folder_passphrase)
+            .expect("decrypt folder passphrase");
+        address_key
+            .key
+            .verify_detached_signature(&material.folder_passphrase_signature, &folder_pp)
+            .expect("verify folder passphrase signature");
+        let folder_key = PrivateKey::from_armored(&material.folder_key_armored, &folder_pp)
+            .expect("unlock folder key");
+
+        // The folder name is encrypted to the share key; the hash key to the folder key.
+        let name = share_key
+            .decrypt_armored_message(&material.folder_name)
+            .expect("decrypt folder name");
+        assert_eq!(name, b"root");
+
+        let hash_key = folder_key
+            .decrypt_armored_message(&material.folder_hash_key)
+            .expect("decrypt folder hash key");
+        assert_eq!(hash_key.len(), 32);
     }
 
     #[test]

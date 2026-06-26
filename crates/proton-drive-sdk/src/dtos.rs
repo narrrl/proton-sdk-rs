@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use proton_sdk::ids::{AddressId, DriveEventId, LinkId, ShareId, VolumeId};
+use proton_sdk::ids::{AddressId, AddressKeyId, DriveEventId, LinkId, ShareId, VolumeId};
 
 /// `GET v2/shares/my-files`
 #[derive(Debug, Deserialize)]
@@ -427,6 +427,33 @@ pub struct FolderCreationRequest {
     /// Folder create uses `SignatureEmail` (file create uses `SignatureAddress`).
     #[serde(rename = "SignatureEmail")]
     pub signature_email: String,
+}
+
+/// `POST volumes` request body — create a new volume with its root share and
+/// root folder. Mirrors C# `VolumeCreationRequest`. All PGP fields are armored
+/// strings produced by [`proton_sdk::crypto::build_volume_creation_material`].
+#[derive(Debug, Serialize)]
+pub struct VolumeCreationRequest {
+    #[serde(rename = "AddressID")]
+    pub address_id: AddressId,
+    #[serde(rename = "AddressKeyID")]
+    pub address_key_id: AddressKeyId,
+    #[serde(rename = "ShareKey")]
+    pub share_key: String,
+    #[serde(rename = "SharePassphrase")]
+    pub share_passphrase: String,
+    #[serde(rename = "SharePassphraseSignature")]
+    pub share_passphrase_signature: String,
+    #[serde(rename = "FolderName")]
+    pub folder_name: String,
+    #[serde(rename = "FolderKey")]
+    pub folder_key: String,
+    #[serde(rename = "FolderPassphrase")]
+    pub folder_passphrase: String,
+    #[serde(rename = "FolderPassphraseSignature")]
+    pub folder_passphrase_signature: String,
+    #[serde(rename = "FolderHashKey")]
+    pub folder_hash_key: String,
 }
 
 /// `POST v2/volumes/{vid}/folders` response.

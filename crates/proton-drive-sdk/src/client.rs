@@ -15,8 +15,8 @@ use proton_sdk::crypto::PrivateKey;
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
 use proton_sdk::crypto::{
-    generate_node_hash_key, generate_node_key, verify_detached, ContentKey, VerificationKeyRing,
-    VerificationStatus,
+    build_volume_creation_material, generate_node_hash_key, generate_node_key, verify_detached,
+    ContentKey, VerificationKeyRing, VerificationStatus,
 };
 use proton_sdk::ids::{AddressId, DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_sdk::session::ProtonApiSession;
@@ -40,7 +40,7 @@ use crate::dtos::{
     RevisionCreationResponse, RevisionDto, RevisionResponse, RevisionUpdateRequest,
     LatestVolumeEventResponse, PhotosAttributesDto, ThumbnailBlockListRequest,
     ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
-    VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
+    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
 use crate::cache::DriveEntityCache;
@@ -165,7 +165,7 @@ impl ProtonDriveClient {
         entity_repository: Arc<dyn CacheRepository>,
     ) -> Self {
         Self {
-            http: session.http().clone(),
+            http: session.http().with_base_route("drive/"),
             account: AccountClient::new(session, mailbox_password),
             cache: Arc::new(Mutex::new(DriveCache::default())),
             entities: DriveEntityCache::new(entity_repository),
@@ -1541,7 +1541,17 @@ impl ProtonDriveClient {
             return Ok(());
         }
 
-        let response: MyFilesShareResponse = self.http.get("v2/shares/my-files").await?;
+        // Mirrors C# `NodeOperations.GetOrCreateMyFilesFolderAsync`: a brand-new
+        // account has no My Files volume yet, so the share lookup fails. Create
+        // the volume, then re-read it through the normal path to populate caches.
+        let response: MyFilesShareResponse = match self.http.get("v2/shares/my-files").await {
+            Ok(response) => response,
+            Err(e) if is_my_files_missing(&e) => {
+                self.create_volume().await?;
+                self.http.get("v2/shares/my-files").await?
+            }
+            Err(e) => return Err(e),
+        };
         let volume_id = response.volume.id.clone();
         let share_id = response.share.id.clone();
 
@@ -1563,6 +1573,42 @@ impl ProtonDriveClient {
             address_id: response.share.address_id.clone(),
             key: share_key,
         });
+        Ok(())
+    }
+
+    /// Create the account's main volume (root share + root folder).
+    ///
+    /// Mirrors C# `VolumeOperations.CreateVolumeAsync`: build the root share and
+    /// folder crypto material against the default address's primary key and
+    /// `POST volumes`. The server-side state is then read back by the caller
+    /// ([`ensure_my_files`](Self::ensure_my_files)) via the normal share lookup,
+    /// so no local cache priming is needed here.
+    async fn create_volume(&self) -> Result<()> {
+        let mut timer = self.telemetry.start("create_volume");
+
+        let address = self.account.default_address().await?;
+        let address_keys = self.account.address_private_keys(&address.id).await?;
+        let address_key = address_keys
+            .get(address.primary_key_index)
+            .ok_or_else(|| ProtonError::invalid_operation("default address has no primary key"))?;
+
+        let material = build_volume_creation_material(address_key, "root")?;
+
+        let request = VolumeCreationRequest {
+            address_id: address.id.clone(),
+            address_key_id: address.primary_key_id.clone(),
+            share_key: material.share_key_armored,
+            share_passphrase: material.share_passphrase,
+            share_passphrase_signature: material.share_passphrase_signature,
+            folder_name: material.folder_name,
+            folder_key: material.folder_key_armored,
+            folder_passphrase: material.folder_passphrase,
+            folder_passphrase_signature: material.folder_passphrase_signature,
+            folder_hash_key: material.folder_hash_key,
+        };
+
+        let _: proton_sdk::api::ApiResponse = self.http.post("volumes", &request).await?;
+        timer.success();
         Ok(())
     }
 
@@ -2209,6 +2255,18 @@ fn read_full_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
 
 /// Group node uids by volume, preserving order, so each volume's links are
 /// batched into a single request family (C# groups by `VolumeId`).
+/// Whether a `v2/shares/my-files` error means the account has no My Files volume
+/// yet (and so one must be created). C# catches [`ResponseCode::DoesNotExist`];
+/// in practice a fresh account's lookup also surfaces as a bare HTTP 404, so
+/// both are treated as "missing".
+fn is_my_files_missing(error: &ProtonError) -> bool {
+    matches!(
+        error,
+        ProtonError::Api(e)
+            if e.code == proton_sdk::api::ResponseCode::DoesNotExist || e.http_status == 404
+    )
+}
+
 fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
     let mut groups: Vec<(VolumeId, Vec<LinkId>)> = Vec::new();
     for uid in uids {
