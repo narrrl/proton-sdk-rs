@@ -15,8 +15,9 @@ use pgp::composed::{
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{SignatureConfig, SignatureType};
-use pgp::types::{CompressionAlgorithm, KeyVersion, Password, PublicKeyTrait};
+use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion, Password, PublicKeyTrait};
+use chrono::SubsecRound;
 use rand::RngCore;
 
 use super::errors::CryptoError;
@@ -244,8 +245,27 @@ pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, 
     let key = &signer.key().primary_key;
     let pw = signer.password();
 
-    let config = SignatureConfig::from_key(&mut rng, key, SignatureType::Binary)
+    let mut config = SignatureConfig::from_key(&mut rng, key, SignatureType::Binary)
         .map_err(|e| CryptoError::Encrypt(format!("signature config: {e}")))?;
+
+    // `from_key` leaves the subpacket lists empty, which produces a signature with
+    // a zero creation time and a zero (missing) issuer key id. GopenPGP — what the
+    // Proton server verifies with — rejects such signatures ("Invalid manifest
+    // signature"). Mirror rPGP's own MessageBuilder: stamp the issuer fingerprint +
+    // creation time in the hashed subpackets and the issuer key id in the unhashed.
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint()))
+            .map_err(|e| CryptoError::Encrypt(format!("issuer fingerprint subpacket: {e}")))?,
+        Subpacket::regular(SubpacketData::SignatureCreationTime(
+            chrono::Utc::now().trunc_subsecs(0),
+        ))
+        .map_err(|e| CryptoError::Encrypt(format!("creation-time subpacket: {e}")))?,
+    ];
+    if key.version() <= KeyVersion::V4 {
+        config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(key.key_id()))
+            .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?];
+    }
+
     let signature = config
         .sign(key, &pw, data)
         .map_err(|e| CryptoError::Encrypt(format!("detached sign: {e}")))?;
@@ -328,6 +348,22 @@ mod tests {
             .key
             .verify_detached_signature(&sig, data)
             .expect("verify detached signature");
+
+        // Regression: the detached signature must carry a non-zero creation time
+        // and an issuer key id. `SignatureConfig::from_key` leaves both empty,
+        // which rPGP self-verify tolerates but GopenPGP (the Proton server)
+        // rejects with "Invalid manifest signature". rPGP self-verify above is not
+        // enough to catch that — assert the subpackets explicitly.
+        use pgp::composed::Deserializable as _;
+        let (parsed, _) = StandaloneSignature::from_string(&sig).expect("parse detached sig");
+        assert!(
+            parsed.signature.created().is_some(),
+            "detached signature missing creation time"
+        );
+        assert!(
+            !parsed.signature.issuer().is_empty(),
+            "detached signature missing issuer key id"
+        );
     }
 
     #[test]
