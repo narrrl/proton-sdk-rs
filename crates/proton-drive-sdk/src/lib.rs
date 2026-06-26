@@ -24,7 +24,8 @@
 //!
 //! let drive = ProtonDriveClient::new(&session, b"mailbox-password".to_vec());
 //! let root = drive.get_my_files_folder().await?;
-//! for child in drive.enumerate_folder_children(&root.uid).await? {
+//! let child_uids = drive.enumerate_folder_children_node_uids(&root.uid).await?;
+//! for child in drive.enumerate_nodes(&child_uids).await? {
 //!     println!("{} ({:?})", child.name, child.kind);
 //! }
 //! # Ok(())

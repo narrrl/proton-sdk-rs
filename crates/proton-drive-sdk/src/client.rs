@@ -227,12 +227,21 @@ impl ProtonDriveClient {
         Ok(Some(node))
     }
 
-    /// Enumerate the (non-trashed) children of a folder.
-    pub async fn enumerate_folder_children(&self, folder_uid: &NodeUid) -> Result<Vec<Node>> {
-        let mut timer = self.telemetry.start("enumerate_folder_children");
-        let folder_key = self.folder_node_key(folder_uid).await?;
+    /// Enumerate the [`NodeUid`]s of a folder's (non-trashed) children.
+    ///
+    /// Mirrors C# `FolderOperations.EnumerateChildrenAsync` (renamed to
+    /// `EnumerateFolderChildrenNodeUidsAsync` on the client): enumeration now
+    /// only lists uids — it does not fetch the folder key, link details, or
+    /// decrypt anything. Callers materialize the nodes they care about via
+    /// [`enumerate_nodes`](Self::enumerate_nodes), avoiding per-child decryption
+    /// of the whole listing.
+    pub async fn enumerate_folder_children_node_uids(
+        &self,
+        folder_uid: &NodeUid,
+    ) -> Result<Vec<NodeUid>> {
+        let mut timer = self.telemetry.start("enumerate_folder_children_node_uids");
 
-        let mut nodes = Vec::new();
+        let mut uids = Vec::new();
         let mut anchor: Option<LinkId> = None;
 
         loop {
@@ -249,20 +258,8 @@ impl ProtonDriveClient {
                 break;
             }
 
-            let details = self
-                .get_link_details(&folder_uid.volume_id, &page.link_ids)
-                .await?;
-
-            for child in &details.links {
-                match self
-                    .build_node(&folder_uid.volume_id, child, &folder_key)
-                    .await
-                {
-                    Ok(node) => nodes.push(node),
-                    Err(e) => {
-                        tracing::warn!(link_id = %child.link.id, error = %e, "skipping undecryptable child");
-                    }
-                }
+            for link_id in page.link_ids {
+                uids.push(NodeUid::new(folder_uid.volume_id.clone(), link_id));
             }
 
             if !page.more_results_exist {
@@ -274,9 +271,9 @@ impl ProtonDriveClient {
             }
         }
 
-        timer.attr("node_count", nodes.len());
+        timer.attr("node_count", uids.len());
         timer.success();
-        Ok(nodes)
+        Ok(uids)
     }
 
     /// Fetch decrypted metadata for many nodes in one pass.
@@ -314,17 +311,17 @@ impl ProtonDriveClient {
         Ok(nodes)
     }
 
-    /// Enumerate the trashed nodes of the main volume.
+    /// Enumerate the [`NodeUid`]s of the main volume's trashed nodes.
     ///
-    /// Mirrors C# `VolumeOperations.EnumerateTrashAsync`: page the trash listing
-    /// (`GET volumes/{vid}/trash`), which groups trashed links by share, then
-    /// decrypt each group's links against their resolved parent keys. As with
-    /// other enumeration paths, a node that fails to decrypt is logged and
-    /// skipped rather than aborting the listing.
-    pub async fn enumerate_trash(&self) -> Result<Vec<Node>> {
+    /// Mirrors C# `VolumeOperations.EnumerateTrashAsync` (renamed to
+    /// `EnumerateTrashNodeUidsAsync` on the client): page the trash listing
+    /// (`GET volumes/{vid}/trash`), which groups trashed links by share, and
+    /// emit a [`NodeUid`] per link. Enumeration no longer fetches share keys or
+    /// decrypts — callers materialize via [`enumerate_nodes`](Self::enumerate_nodes).
+    pub async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
         let volume_id = self.main_volume_id().await?;
 
-        let mut nodes = Vec::new();
+        let mut uids = Vec::new();
         let mut page = 0_usize;
 
         loop {
@@ -334,25 +331,9 @@ impl ProtonDriveClient {
 
             let mut count = 0_usize;
             for group in &response.trash_by_share {
-                count += group.link_ids.len();
-                for chunk in group.link_ids.chunks(MAX_BATCH_COUNT) {
-                    let details = self.get_link_details(&volume_id, chunk).await?;
-                    for detail in &details.links {
-                        let parent_key =
-                            match self.resolve_parent_key(&volume_id, &detail.link).await {
-                                Ok(key) => key,
-                                Err(e) => {
-                                    tracing::warn!(link_id = %detail.link.id, error = %e, "skipping trashed node: parent key unavailable");
-                                    continue;
-                                }
-                            };
-                        match self.build_node(&volume_id, detail, &parent_key).await {
-                            Ok(node) => nodes.push(node),
-                            Err(e) => {
-                                tracing::warn!(link_id = %detail.link.id, error = %e, "skipping undecryptable trashed node");
-                            }
-                        }
-                    }
+                for link_id in &group.link_ids {
+                    count += 1;
+                    uids.push(NodeUid::new(volume_id.clone(), link_id.clone()));
                 }
             }
 
@@ -363,7 +344,7 @@ impl ProtonDriveClient {
             page += 1;
         }
 
-        Ok(nodes)
+        Ok(uids)
     }
 
     /// The main volume id, resolved via My Files.
