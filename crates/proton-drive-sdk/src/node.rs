@@ -95,6 +95,12 @@ impl Node {
     pub fn is_file(&self) -> bool {
         matches!(self.kind, NodeKind::File { .. })
     }
+
+    /// The event scope of this node's tree, keyed by its volume.
+    /// C# `Node.TreeEventScopeId => new(Uid.VolumeId)`.
+    pub fn tree_event_scope_id(&self) -> crate::DriveEventScopeId {
+        crate::DriveEventScopeId::new(self.uid.volume_id.clone())
+    }
 }
 
 /// The kind of a thumbnail. Mirrors C# `Proton.Drive.Sdk.Nodes.ThumbnailType`.
@@ -135,6 +141,35 @@ impl Thumbnail {
         Self {
             thumbnail_type,
             content,
+        }
+    }
+}
+
+/// The result of enumerating one file's thumbnail. Mirrors C#
+/// `Proton.Drive.Sdk.Nodes.FileThumbnail(NodeUid, Result<bytes, error>)`: a
+/// per-file outcome so a batch enumeration can report partial failures (node
+/// missing, not a file, no thumbnail of the requested type, block download
+/// error) without aborting the whole batch.
+#[derive(Debug)]
+pub struct FileThumbnail {
+    /// The file the thumbnail belongs to.
+    pub file_uid: NodeUid,
+    /// The decrypted thumbnail bytes, or the error encountered for this file.
+    pub result: proton_sdk::error::Result<Vec<u8>>,
+}
+
+impl FileThumbnail {
+    pub fn ok(file_uid: NodeUid, bytes: Vec<u8>) -> Self {
+        Self {
+            file_uid,
+            result: Ok(bytes),
+        }
+    }
+
+    pub fn err(file_uid: NodeUid, error: proton_sdk::error::ProtonError) -> Self {
+        Self {
+            file_uid,
+            result: Err(error),
         }
     }
 }

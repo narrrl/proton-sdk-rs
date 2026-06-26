@@ -19,7 +19,7 @@ use proton_sdk::ids::NodeUid;
 use proton_sdk::session::ProtonApiSession;
 
 use crate::client::ProtonDriveClient;
-use crate::node::{Node, Thumbnail};
+use crate::node::{FileThumbnail, Node, Thumbnail, ThumbnailType};
 
 /// One photos-timeline entry: a photo node and its capture time (epoch
 /// seconds). C# `PhotosTimelineItem(NodeUid Uid, DateTime CaptureTime)`.
@@ -177,6 +177,32 @@ impl ProtonPhotosClient {
                 &metadata,
                 aead,
             )
+            .await
+    }
+
+    /// Download and decrypt a single photo's thumbnail of the given type, or
+    /// `None` when the photo has none. C# `ProtonPhotosClient` single-thumbnail
+    /// access (routes through the photos endpoints).
+    pub async fn download_thumbnail(
+        &self,
+        uid: &NodeUid,
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>> {
+        self.drive
+            .download_thumbnail_ctx(uid, thumbnail_type, true)
+            .await
+    }
+
+    /// Batch-download the thumbnails of `uids` of the given type.
+    /// C# `ProtonPhotosClient.EnumerateThumbnailsAsync` (`forPhotos: true`):
+    /// per-photo failures are reported in the returned [`FileThumbnail`]s.
+    pub async fn enumerate_thumbnails(
+        &self,
+        uids: &[NodeUid],
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Vec<FileThumbnail>> {
+        self.drive
+            .enumerate_thumbnails_ctx(uids, thumbnail_type, true)
             .await
     }
 

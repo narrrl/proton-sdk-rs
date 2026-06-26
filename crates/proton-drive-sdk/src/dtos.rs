@@ -427,6 +427,11 @@ pub struct FolderCreationRequest {
     /// Folder create uses `SignatureEmail` (file create uses `SignatureAddress`).
     #[serde(rename = "SignatureEmail")]
     pub signature_email: String,
+    /// Encrypted+signed `ExtendedAttributes` JSON (modification time). C#
+    /// `FolderCreationRequest.ExtendedAttributes`. Omitted when no modification
+    /// time was supplied.
+    #[serde(rename = "XAttr", skip_serializing_if = "Option::is_none")]
+    pub extended_attributes: Option<String>,
 }
 
 /// `POST volumes` request body — create a new volume with its root share and
@@ -512,6 +517,41 @@ pub struct MoveLinkRequest {
     pub name_hash: String,
     #[serde(rename = "OriginalHash")]
     pub original_hash: String,
+}
+
+/// `PUT volumes/{vid}/links/move-multiple` — batch move of several nodes under a
+/// single destination parent. Mirrors C# `MoveMultipleLinksRequest`. Same-volume
+/// only (the C# batch path throws for cross-volume too). `SignatureEmail` is the
+/// anonymous-move passphrase signer and is omitted when not set.
+#[derive(Debug, Serialize)]
+pub struct MoveMultipleLinksRequest {
+    #[serde(rename = "ParentLinkID")]
+    pub parent_link_id: LinkId,
+    #[serde(rename = "Links")]
+    pub links: Vec<MoveMultipleLinksItem>,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+    #[serde(rename = "SignatureEmail", skip_serializing_if = "Option::is_none")]
+    pub signature_email: Option<String>,
+}
+
+/// One entry of a [`MoveMultipleLinksRequest`]. Mirrors C# `MoveMultipleLinksItem`:
+/// per-node rewrapped passphrase + re-encrypted/signed name + new/original name
+/// hashes under the destination/source hash keys.
+#[derive(Debug, Serialize)]
+pub struct MoveMultipleLinksItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "OriginalHash")]
+    pub original_hash: String,
+    #[serde(rename = "NodePassphraseSignature", skip_serializing_if = "Option::is_none")]
+    pub passphrase_signature: Option<String>,
 }
 
 /// `POST v2/volumes/{vid}/links/{folderId}/checkAvailableHashes` request: ask
@@ -730,14 +770,22 @@ pub struct ExtendedAttributes {
     pub common: CommonExtendedAttributes,
 }
 
+/// All fields are optional, mirroring C# `CommonExtendedAttributes` (every
+/// property is nullable): a file-upload seal sets size/block-sizes/digests and
+/// optionally a modification time, while a folder create sets only the
+/// modification time. Unset fields are omitted from the JSON.
 #[derive(Debug, Serialize)]
 pub struct CommonExtendedAttributes {
-    #[serde(rename = "Size")]
-    pub size: i64,
-    #[serde(rename = "BlockSizes")]
-    pub block_sizes: Vec<i32>,
-    #[serde(rename = "Digests")]
-    pub digests: FileContentDigests,
+    #[serde(rename = "Size", skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// ISO-8601 UTC modification timestamp (C# `CommonExtendedAttributes
+    /// .ModificationTime`, written via `Iso8601DateTimeResultJsonConverter`).
+    #[serde(rename = "ModificationTime", skip_serializing_if = "Option::is_none")]
+    pub modification_time: Option<String>,
+    #[serde(rename = "BlockSizes", skip_serializing_if = "Option::is_none")]
+    pub block_sizes: Option<Vec<i32>>,
+    #[serde(rename = "Digests", skip_serializing_if = "Option::is_none")]
+    pub digests: Option<FileContentDigests>,
 }
 
 #[derive(Debug, Serialize)]
