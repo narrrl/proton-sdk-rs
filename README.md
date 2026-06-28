@@ -40,7 +40,11 @@ and does the OpenPGP crypto directly. The canonical reference is the upstream
 Not yet implemented: cross-volume move (needs `NewShareID` + re-signing),
 sharing, signature-verification *enforcement* (it is non-fatal metadata).
 
-Crypto paths have offline round-trip tests
+All crypto paths have offline round-trip tests, and the read/write surface
+(upload/download round-trips, AEAD + streaming + thumbnails, enumeration,
+folder/node ops, move, and the event feed) is covered by a **live integration
+test suite** validated against a real Proton account — see
+`crates/proton-drive-sdk/tests/live_*.rs`.
 
 ## Workspace
 
@@ -109,6 +113,21 @@ PROTON_TOTP_SECRET=... cargo run -p proton-drive-sdk --example live_login
 cargo build   # 0 warnings / 0 errors
 cargo test    # offline crypto + derivation round-trip tests
 ```
+
+The `crates/proton-drive-sdk/tests/live_*.rs` suite runs the read/write surface
+against a real account. These tests are `#[ignore]`d by default (they need
+credentials) and each cleans up after itself. With `.env` (`username` /
+`password`) and `PROTON_TOTP_SECRET` set:
+
+```bash
+# all live tests, single-threaded (shared test account)
+PROTON_TOTP_SECRET=... cargo test -p proton-drive-sdk --test 'live_*' \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Note: AEAD upload (SEIPDv2) is **server-gated** behind the
+`DriveCryptoEncryptBlocksWithPgpAead` feature flag; that test no-ops when the
+flag is off for the account.
 
 ## License
 

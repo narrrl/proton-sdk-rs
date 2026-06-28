@@ -4,10 +4,14 @@ members = ["crates/proton-sdk", "crates/proton-drive-sdk"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-repository = "https://github.com/ProtonDriveApps/sdk"
-rust-version = "1.80"
+repository = "https://github.com/narrrl/proton-sdk-rs"
+homepage = "https://github.com/narrrl/proton-sdk-rs"
+rust-version = "1.96"
+authors = ["Nils Pukropp <contact@narl.io>"]
+keywords = ["proton", "drive", "openpgp", "encryption", "sdk"]
+categories = ["api-bindings", "cryptography", "filesystem"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
