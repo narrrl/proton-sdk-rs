@@ -2,7 +2,7 @@
 //! `enumerate_events`) against a real Proton account.
 //!
 //! Skipped by default. Run against the test account with:
-//!   cargo test -p proton-drive-sdk --test live_events -- --ignored --nocapture --test-threads=1
+//!   cargo test -p proton-drive-rs --test live_events -- --ignored --nocapture --test-threads=1
 //!
 //! Each test cleans up after itself (trash + delete-from-trash) so the account
 //! stays reusable across runs.
@@ -16,11 +16,11 @@ mod common;
 
 use std::time::Duration;
 
-use proton_drive_sdk::{DriveEvent, DriveEventScopeId};
+use proton_drive_rs::{DriveEvent, DriveEventScopeId};
 use proton_sdk::ids::{DriveEventId, NodeUid};
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
-async fn cleanup(client: &proton_drive_sdk::ProtonDriveClient, uids: &[NodeUid]) {
+async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
     if let Err(e) = client.trash_nodes(uids).await {
         eprintln!("[cleanup] trash failed: {e}");
         return;
@@ -40,7 +40,7 @@ const POLL_DELAY: Duration = Duration::from_secs(2);
 /// cumulative (everything after the cursor), so we can re-poll the same cursor
 /// without losing earlier events. Returns `None` if nothing matched in time.
 async fn poll_for(
-    client: &proton_drive_sdk::ProtonDriveClient,
+    client: &proton_drive_rs::ProtonDriveClient,
     scope: &DriveEventScopeId,
     cursor: &DriveEventId,
     mut predicate: impl FnMut(&DriveEvent) -> bool,
@@ -300,7 +300,7 @@ async fn permanent_delete_surfaces_node_deleted() {
 
 /// Seed the feed and return the cursor to enumerate from next.
 async fn seed(
-    client: &proton_drive_sdk::ProtonDriveClient,
+    client: &proton_drive_rs::ProtonDriveClient,
     scope: &DriveEventScopeId,
 ) -> DriveEventId {
     let seeded = client

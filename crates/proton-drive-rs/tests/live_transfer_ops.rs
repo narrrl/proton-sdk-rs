@@ -3,7 +3,7 @@
 //! Proton account.
 //!
 //! Skipped by default. Run against the test account with:
-//!   cargo test -p proton-drive-sdk --test live_transfer_ops -- --ignored --nocapture --test-threads=1
+//!   cargo test -p proton-drive-rs --test live_transfer_ops -- --ignored --nocapture --test-threads=1
 //!
 //! Each test cleans up after itself (trash + delete-from-trash) so the account
 //! stays reusable across runs.
@@ -12,11 +12,11 @@ mod common;
 
 use std::io::Cursor;
 
-use proton_drive_sdk::{NodeKind, Thumbnail, ThumbnailType};
+use proton_drive_rs::{NodeKind, Thumbnail, ThumbnailType};
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
-async fn cleanup(client: &proton_drive_sdk::ProtonDriveClient, uids: &[NodeUid]) {
+async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
     if let Err(e) = client.trash_nodes(uids).await {
         eprintln!("[cleanup] trash failed: {e}");
         return;

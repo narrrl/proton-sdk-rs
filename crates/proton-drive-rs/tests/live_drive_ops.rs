@@ -2,19 +2,19 @@
 //! verification against a real Proton account.
 //!
 //! Skipped by default. Run against the test account with:
-//!   cargo test -p proton-drive-sdk --test live_drive_ops -- --ignored --nocapture
+//!   cargo test -p proton-drive-rs --test live_drive_ops -- --ignored --nocapture
 //!
 //! Each test cleans up after itself (trash + delete-from-trash) so the account
 //! stays reusable across runs.
 
 mod common;
 
-use proton_drive_sdk::proton_sdk::crypto::VerificationStatus;
-use proton_drive_sdk::{Node, NodeKind};
+use proton_drive_rs::proton_sdk::crypto::VerificationStatus;
+use proton_drive_rs::{Node, NodeKind};
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
-async fn cleanup(client: &proton_drive_sdk::ProtonDriveClient, uids: &[NodeUid]) {
+async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
     if let Err(e) = client.trash_nodes(uids).await {
         eprintln!("[cleanup] trash failed: {e}");
         return;
@@ -25,7 +25,7 @@ async fn cleanup(client: &proton_drive_sdk::ProtonDriveClient, uids: &[NodeUid])
 }
 
 /// Fetch a node that must exist, panicking with context otherwise.
-async fn get(client: &proton_drive_sdk::ProtonDriveClient, uid: &NodeUid, what: &str) -> Node {
+async fn get(client: &proton_drive_rs::ProtonDriveClient, uid: &NodeUid, what: &str) -> Node {
     client
         .get_node(uid)
         .await

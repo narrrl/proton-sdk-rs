@@ -1,7 +1,7 @@
 //! Live integration: upload → download → byte-equality round-trips.
 //!
 //! Skipped by default. Run against the test account with:
-//!   PROTON_TOTP_SECRET=... cargo test -p proton-drive-sdk --test live_upload_download -- --ignored --nocapture
+//!   PROTON_TOTP_SECRET=... cargo test -p proton-drive-rs --test live_upload_download -- --ignored --nocapture
 //!
 //! Each test cleans up after itself (trash + delete-from-trash) so the account
 //! stays reusable across runs.
@@ -11,7 +11,7 @@ mod common;
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
-async fn cleanup(client: &proton_drive_sdk::ProtonDriveClient, uids: &[NodeUid]) {
+async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
     if let Err(e) = client.trash_nodes(uids).await {
         eprintln!("[cleanup] trash failed: {e}");
         return;

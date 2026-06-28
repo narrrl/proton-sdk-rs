@@ -1,5 +1,5 @@
 [package]
-name = "proton-drive-sdk"
+name = "proton-drive-rs"
 description = "High-level Proton Drive client for Rust"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
-documentation = "https://docs.rs/proton-drive-sdk"
+documentation = "https://docs.rs/proton-drive-rs"
 
 [dependencies]
 proton-sdk = { path = "../proton-sdk", version = "0.1.0" }

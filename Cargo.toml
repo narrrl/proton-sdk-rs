@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proton-sdk", "crates/proton-drive-sdk"]
+members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
 version = "0.1.0"

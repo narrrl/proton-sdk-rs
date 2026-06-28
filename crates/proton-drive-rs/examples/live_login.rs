@@ -3,7 +3,7 @@
 //! Reads credentials from `.env` (repo root): `username=`, `password=`.
 //! The TOTP secret comes from the `PROTON_TOTP_SECRET` env var (base32).
 //!
-//! Run: `PROTON_TOTP_SECRET=... cargo run -p proton-drive-sdk --example live_login`
+//! Run: `PROTON_TOTP_SECRET=... cargo run -p proton-drive-rs --example live_login`
 //!
 //! Flow: SRP `begin` → `apply_second_factor_code` (computed TOTP) → construct
 //! `ProtonDriveClient` with the data password → `get_my_files_folder` →
@@ -12,7 +12,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
-use proton_drive_sdk::ProtonDriveClient;
+use proton_drive_rs::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::ProtonApiSession;
 use sha1::Sha1;

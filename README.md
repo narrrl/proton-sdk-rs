@@ -44,14 +44,14 @@ All crypto paths have offline round-trip tests, and the read/write surface
 (upload/download round-trips, AEAD + streaming + thumbnails, enumeration,
 folder/node ops, move, and the event feed) is covered by a **live integration
 test suite** validated against a real Proton account — see
-`crates/proton-drive-sdk/tests/live_*.rs`.
+`crates/proton-drive-rs/tests/live_*.rs`.
 
 ## Workspace
 
 | Crate | Purpose |
 | --- | --- |
 | `crates/proton-sdk` | Core account/session/crypto (`Proton.Sdk` analogue) |
-| `crates/proton-drive-sdk` | High-level Drive client (`Proton.Drive.Sdk` analogue) |
+| `crates/proton-drive-rs` | High-level Drive client (`Proton.Drive.Sdk` analogue) |
 
 OpenPGP is provided by the [`pgp`](https://crates.io/crates/pgp) crate (rPGP 0.16).
 
@@ -76,7 +76,7 @@ SRP login (with 2FA), then read the my-files root:
 ```rust,no_run
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::ProtonApiSession;
-use proton_drive_sdk::ProtonDriveClient;
+use proton_drive_rs::ProtonDriveClient;
 
 async fn run() -> proton_sdk::error::Result<()> {
     let config = ProtonClientConfiguration::new("external-drive-myapp@0.1.0-alpha");
@@ -99,12 +99,12 @@ async fn run() -> proton_sdk::error::Result<()> {
 Already have tokens? Use `ProtonApiSession::resume(config, ResumeParameters {..})`
 instead of `begin`.
 
-A live smoke test lives in `crates/proton-drive-sdk/examples/live_login.rs`
+A live smoke test lives in `crates/proton-drive-rs/examples/live_login.rs`
 (reads `username` / `password` from a repo-root `.env`, TOTP from
 `PROTON_TOTP_SECRET`):
 
 ```bash
-PROTON_TOTP_SECRET=... cargo run -p proton-drive-sdk --example live_login
+PROTON_TOTP_SECRET=... cargo run -p proton-drive-rs --example live_login
 ```
 
 ## Build & test
@@ -114,14 +114,14 @@ cargo build   # 0 warnings / 0 errors
 cargo test    # offline crypto + derivation round-trip tests
 ```
 
-The `crates/proton-drive-sdk/tests/live_*.rs` suite runs the read/write surface
+The `crates/proton-drive-rs/tests/live_*.rs` suite runs the read/write surface
 against a real account. These tests are `#[ignore]`d by default (they need
 credentials) and each cleans up after itself. With `.env` (`username` /
 `password`) and `PROTON_TOTP_SECRET` set:
 
 ```bash
 # all live tests, single-threaded (shared test account)
-PROTON_TOTP_SECRET=... cargo test -p proton-drive-sdk --test 'live_*' \
+PROTON_TOTP_SECRET=... cargo test -p proton-drive-rs --test 'live_*' \
   -- --ignored --nocapture --test-threads=1
 ```
 

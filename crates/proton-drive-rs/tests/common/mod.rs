@@ -14,7 +14,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
-use proton_drive_sdk::ProtonDriveClient;
+use proton_drive_rs::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};

@@ -8,7 +8,7 @@
 //! # async fn run() -> proton_sdk::error::Result<()> {
 //! use proton_sdk::config::ProtonClientConfiguration;
 //! use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
-//! use proton_drive_sdk::ProtonDriveClient;
+//! use proton_drive_rs::ProtonDriveClient;
 //!
 //! let config = ProtonClientConfiguration::new("external-drive-myapp@0.1.0-alpha");
 //! let session = ProtonApiSession::resume(config, ResumeParameters {
