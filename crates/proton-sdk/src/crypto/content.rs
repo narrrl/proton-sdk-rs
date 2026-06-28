@@ -207,6 +207,61 @@ impl ContentKey {
     /// directly, locate the SEIPD (tolerating a leading PKESK, e.g. a full
     /// round-trip message), and decrypt it with the supplied session key.
     pub fn decrypt_block(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let inner = self.decrypt_seipd(ciphertext)?;
+
+        // A content block's payload is a single literal-data packet.
+        let mut inner_parser = PacketParser::new(Cursor::new(&inner));
+        let literal = inner_parser
+            .next()
+            .ok_or_else(|| CryptoError::Parse("block payload is empty".into()))?
+            .map_err(|e| CryptoError::Parse(format!("block payload packet: {e}")))?;
+        match literal {
+            Packet::LiteralData(data) => Ok(data.data().to_vec()),
+            other => Err(CryptoError::Parse(format!(
+                "block payload is not literal data: {:?}",
+                other.tag()
+            ))),
+        }
+    }
+
+    /// Decrypt an inline-signed thumbnail block under this content key.
+    ///
+    /// Unlike a content block, a thumbnail payload is encrypt-**and-inline-sign**
+    /// (`encrypt_thumbnail`): the SEIPD payload is a signed message
+    /// (`OnePassSignature`, `LiteralData`, `Signature`), so the literal data is
+    /// not the first packet. The signature is metadata; we scan past the
+    /// one-pass-signature / signature packets and return the literal bytes.
+    /// Mirrors C# `FileOperations` reading the thumbnail through a decrypt+verify
+    /// stream and keeping the plaintext regardless of verification outcome.
+    pub fn decrypt_thumbnail(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let inner = self.decrypt_seipd(ciphertext)?;
+
+        let parser = PacketParser::new(Cursor::new(&inner));
+        for packet in parser {
+            let packet =
+                packet.map_err(|e| CryptoError::Parse(format!("thumbnail payload packet: {e}")))?;
+            match packet {
+                Packet::LiteralData(data) => return Ok(data.data().to_vec()),
+                // Inline-signature framing around the literal data.
+                Packet::OnePassSignature(_) | Packet::Signature(_) => continue,
+                other => {
+                    return Err(CryptoError::Parse(format!(
+                        "unexpected thumbnail payload packet: {:?}",
+                        other.tag()
+                    )))
+                }
+            }
+        }
+        Err(CryptoError::Parse(
+            "thumbnail payload had no literal data".into(),
+        ))
+    }
+
+    /// Locate the SEIPD packet (tolerating a leading content-key PKESK) and
+    /// decrypt it under this content key, returning the serialized inner payload.
+    /// rPGP's `Message` parser rejects a message that *starts* with a SEIPD
+    /// packet, so we parse packets directly.
+    fn decrypt_seipd(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let (sym_alg, key) = self.session_parts()?;
 
         let mut parser = PacketParser::new(Cursor::new(ciphertext));
@@ -228,23 +283,9 @@ impl ContentKey {
             }
         };
 
-        let inner = seipd
+        seipd
             .decrypt(key, Some(sym_alg))
-            .map_err(|e| CryptoError::Decrypt(format!("block: {e}")))?;
-
-        // The decrypted payload is a serialized literal-data packet.
-        let mut inner_parser = PacketParser::new(Cursor::new(&inner));
-        let literal = inner_parser
-            .next()
-            .ok_or_else(|| CryptoError::Parse("block payload is empty".into()))?
-            .map_err(|e| CryptoError::Parse(format!("block payload packet: {e}")))?;
-        match literal {
-            Packet::LiteralData(data) => Ok(data.data().to_vec()),
-            other => Err(CryptoError::Parse(format!(
-                "block payload is not literal data: {:?}",
-                other.tag()
-            ))),
-        }
+            .map_err(|e| CryptoError::Decrypt(format!("block: {e}")))
     }
 }
 
@@ -557,11 +598,37 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_thumbnail_reads_inline_signed_payload() {
+        // The download path must read an inline-signed thumbnail back to its
+        // plaintext: `decrypt_block` rejects the leading one-pass-signature, so
+        // `decrypt_thumbnail` scans past the signature framing. Covers both
+        // content-key modes (legacy SEIPDv1 + AEAD SEIPDv2).
+        for content_key in [ContentKey::generate(), ContentKey::generate_aead()] {
+            let signer = super::super::encrypt::generate_node_key().expect("generate signer");
+            let plaintext = b"thumbnail image bytes for download".to_vec();
+            let block = content_key
+                .encrypt_thumbnail(&signer.key, &plaintext)
+                .expect("encrypt thumbnail");
+            assert_eq!(
+                content_key.decrypt_thumbnail(&block).expect("decrypt"),
+                plaintext
+            );
+            // A content block reader must still reject the signed payload.
+            assert!(content_key.decrypt_block(&block).is_err());
+        }
+    }
+
+    #[test]
     fn aead_content_key_round_trip_through_x25519_node_key() {
         // AEAD upload path: generate an AEAD content key (V6 session key), seal
         // it to the node key as a v6 PKESK, recover it, and round-trip a SEIPDv2
         // block. The recovered key must still report as AEAD.
-        let node = super::super::encrypt::generate_node_key().expect("generate node key");
+        //
+        // The node key must be **v6** here (C# `PgpProfile.ProtonAead`): a v6
+        // PKESK addressed to a v4 key round-trips in rPGP but the Proton server
+        // rejects the draft (the recipient fingerprint can't match a v4 key), so
+        // use `generate_node_key_aead` to mirror the real upload path.
+        let node = super::super::encrypt::generate_node_key_aead().expect("generate node key");
         let content_key = ContentKey::generate_aead();
         assert!(content_key.is_aead());
 

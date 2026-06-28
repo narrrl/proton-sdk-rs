@@ -17,8 +17,8 @@ mod verify;
 pub use content::ContentKey;
 pub use derive::derive_key_passphrase;
 pub use encrypt::{
-    build_volume_creation_material, generate_node_hash_key, generate_node_key, GeneratedNodeKey,
-    VolumeCreationMaterial,
+    build_volume_creation_material, generate_node_hash_key, generate_node_key,
+    generate_node_key_aead, GeneratedNodeKey, VolumeCreationMaterial,
 };
 pub use errors::CryptoError;
 pub use keys::{decrypt_armored_with_keys, PrivateKey};

@@ -46,7 +46,10 @@ async fn folder_create_rename_trash_restore() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
 
     // create
     let name = format!("folder-ops-{}", common::unique_suffix());
@@ -55,7 +58,7 @@ async fn folder_create_rename_trash_restore() {
         .await
         .expect("create_folder");
 
-    let node = get(&client, &uid, "after create").await;
+    let node = get(client, &uid, "after create").await;
     assert!(matches!(node.kind, NodeKind::Folder), "must be a folder");
     assert_eq!(node.name, name, "name must round-trip");
     assert_eq!(
@@ -70,12 +73,15 @@ async fn folder_create_rename_trash_restore() {
         .rename_node(&uid, &renamed, None)
         .await
         .expect("rename_node");
-    let node = get(&client, &uid, "after rename").await;
+    let node = get(client, &uid, "after rename").await;
     assert_eq!(node.name, renamed, "rename must take effect");
 
     // trash
-    client.trash_nodes(&[uid.clone()]).await.expect("trash");
-    let node = get(&client, &uid, "after trash").await;
+    client
+        .trash_nodes(std::slice::from_ref(&uid))
+        .await
+        .expect("trash");
+    let node = get(client, &uid, "after trash").await;
     assert!(node.trashed, "node must report trashed");
     let trash = client
         .enumerate_trash_node_uids()
@@ -84,12 +90,15 @@ async fn folder_create_rename_trash_restore() {
     assert!(trash.contains(&uid), "trash listing must include the node");
 
     // restore
-    client.restore_nodes(&[uid.clone()]).await.expect("restore");
-    let node = get(&client, &uid, "after restore").await;
+    client
+        .restore_nodes(std::slice::from_ref(&uid))
+        .await
+        .expect("restore");
+    let node = get(client, &uid, "after restore").await;
     assert!(!node.trashed, "node must no longer be trashed");
 
     // delete (final)
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }
 
 /// empty_trash removes a trashed node from the trash listing.
@@ -101,7 +110,10 @@ async fn folder_empty_trash() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
 
     let name = format!("empty-trash-{}", common::unique_suffix());
     let uid = client
@@ -109,7 +121,10 @@ async fn folder_empty_trash() {
         .await
         .expect("create_folder");
 
-    client.trash_nodes(&[uid.clone()]).await.expect("trash");
+    client
+        .trash_nodes(std::slice::from_ref(&uid))
+        .await
+        .expect("trash");
     assert!(
         client
             .enumerate_trash_node_uids()
@@ -144,7 +159,10 @@ async fn move_node_single() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
     let suffix = common::unique_suffix();
 
     let a = client
@@ -162,7 +180,7 @@ async fn move_node_single() {
 
     // Precondition: child parented to A.
     assert_eq!(
-        get(&client, &child, "before move").await.parent_uid.as_ref(),
+        get(client, &child, "before move").await.parent_uid.as_ref(),
         Some(&a),
         "child must start under A"
     );
@@ -170,12 +188,12 @@ async fn move_node_single() {
     client.move_node(&child, &b).await.expect("move_node");
 
     assert_eq!(
-        get(&client, &child, "after move").await.parent_uid.as_ref(),
+        get(client, &child, "after move").await.parent_uid.as_ref(),
         Some(&b),
         "child must be reparented to B"
     );
 
-    cleanup(&client, &[child, a, b]).await;
+    cleanup(client, &[child, a, b]).await;
 }
 
 /// Batch move: two children relocate to a destination folder in one call.
@@ -187,7 +205,10 @@ async fn move_nodes_batch() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
     let suffix = common::unique_suffix();
 
     let dst = client
@@ -209,17 +230,17 @@ async fn move_nodes_batch() {
         .expect("move_nodes");
 
     assert_eq!(
-        get(&client, &c1, "c1 after move").await.parent_uid.as_ref(),
+        get(client, &c1, "c1 after move").await.parent_uid.as_ref(),
         Some(&dst),
         "c1 must be under dst"
     );
     assert_eq!(
-        get(&client, &c2, "c2 after move").await.parent_uid.as_ref(),
+        get(client, &c2, "c2 after move").await.parent_uid.as_ref(),
         Some(&dst),
         "c2 must be under dst"
     );
 
-    cleanup(&client, &[c1, c2, dst]).await;
+    cleanup(client, &[c1, c2, dst]).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +258,10 @@ async fn verification_file_fully_verified() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
 
     let name = format!("verify-{}.txt", common::unique_suffix());
     let payload = b"verification probe payload".to_vec();
@@ -246,7 +270,7 @@ async fn verification_file_fully_verified() {
         .await
         .expect("upload_file");
 
-    let node = get(&client, &uid, "uploaded file").await;
+    let node = get(client, &uid, "uploaded file").await;
     let v = node.verification;
 
     // Name is inline-signed to the parent by our address key; an `Ok` here
@@ -271,7 +295,7 @@ async fn verification_file_fully_verified() {
         "no signature may be NoVerifier/Failed: {v:?}"
     );
 
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }
 
 /// A created folder must verify cleanly (name + passphrase signed; no
@@ -284,7 +308,10 @@ async fn verification_folder_fully_verified() {
     };
     let client = &live.client;
 
-    let root = client.get_my_files_folder().await.expect("get my-files root");
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
 
     let name = format!("verify-folder-{}", common::unique_suffix());
     let uid = client
@@ -292,7 +319,7 @@ async fn verification_folder_fully_verified() {
         .await
         .expect("create_folder");
 
-    let node = get(&client, &uid, "created folder").await;
+    let node = get(client, &uid, "created folder").await;
     let v = node.verification;
     assert_eq!(v.name, VerificationStatus::Ok, "folder name must verify");
     assert_eq!(
@@ -302,5 +329,5 @@ async fn verification_folder_fully_verified() {
     );
     assert!(v.is_fully_verified(), "folder must fully verify: {v:?}");
 
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }

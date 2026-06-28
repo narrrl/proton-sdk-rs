@@ -46,7 +46,7 @@ async fn upload_download_small_roundtrip() {
     let got = client.download_file(&uid).await.expect("download_file");
     assert_eq!(got, payload, "downloaded bytes must match uploaded");
 
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }
 
 /// Multi-block streaming upload (> 4 MiB) exercising `upload_file_from` and the
@@ -92,7 +92,7 @@ async fn upload_download_multiblock_roundtrip() {
     assert_eq!(got.len(), payload.len(), "size mismatch");
     assert_eq!(got, payload, "multi-block bytes must match");
 
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }
 
 /// New revision over an existing file: upload v1, replace with v2, download must
@@ -127,5 +127,5 @@ async fn new_revision_roundtrip() {
     let got = client.download_file(&uid).await.expect("download");
     assert_eq!(got, v2, "active revision must be v2");
 
-    cleanup(&client, &[uid]).await;
+    cleanup(client, &[uid]).await;
 }

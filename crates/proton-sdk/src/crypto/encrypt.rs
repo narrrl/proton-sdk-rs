@@ -83,13 +83,30 @@ pub struct GeneratedNodeKey {
 /// (`PgpPrivateKey.Generate("Drive key", "no-reply@proton.me", Default)` then
 /// `key.Lock(passphrase)`).
 pub fn generate_node_key() -> Result<GeneratedNodeKey, CryptoError> {
+    generate_node_key_versioned(KeyVersion::V4)
+}
+
+/// Generate a node key for an AEAD file (C# `PgpProfile.ProtonAead`).
+///
+/// An AEAD upload seals its content key as a **v6** PKESK, so the node key it is
+/// addressed to must itself be a v6 key — otherwise the server rejects the draft
+/// with 422 "Could not verify the nodeKey was used for encrypting
+/// contentKeyPacket" (the v6 PKESK recipient fingerprint can't match a v4 key).
+/// The legacy (non-AEAD) path stays on v4 via [`generate_node_key`].
+pub fn generate_node_key_aead() -> Result<GeneratedNodeKey, CryptoError> {
+    generate_node_key_versioned(KeyVersion::V6)
+}
+
+/// Generate a node key (Ed25519 primary + X25519 encryption subkey) at the given
+/// OpenPGP key version. v4 for legacy files/folders, v6 for AEAD files.
+fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, CryptoError> {
     let mut rng = rand::thread_rng();
     let passphrase = generate_passphrase();
     let pw_string = String::from_utf8(passphrase.clone())
         .map_err(|e| CryptoError::Encrypt(format!("passphrase is not ascii: {e}")))?;
 
     let subkey = SubkeyParamsBuilder::default()
-        .version(KeyVersion::V4)
+        .version(version)
         .key_type(KeyType::X25519)
         .can_encrypt(true)
         .passphrase(Some(pw_string.clone()))
@@ -97,7 +114,7 @@ pub fn generate_node_key() -> Result<GeneratedNodeKey, CryptoError> {
         .map_err(|e| CryptoError::Encrypt(format!("node subkey params: {e}")))?;
 
     let params = SecretKeyParamsBuilder::default()
-        .version(KeyVersion::V4)
+        .version(version)
         .key_type(KeyType::Ed25519)
         .can_certify(true)
         .can_sign(true)

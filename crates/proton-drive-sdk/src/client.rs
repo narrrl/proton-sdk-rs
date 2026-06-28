@@ -13,8 +13,8 @@ use proton_sdk::account::AccountClient;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
-    build_volume_creation_material, generate_node_hash_key, generate_node_key, verify_detached,
-    ContentKey, VerificationKeyRing, VerificationStatus,
+    build_volume_creation_material, generate_node_hash_key, generate_node_key,
+    generate_node_key_aead, verify_detached, ContentKey, VerificationKeyRing, VerificationStatus,
 };
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
@@ -584,7 +584,7 @@ impl ProtonDriveClient {
             .http
             .get_storage_blob(&block.bare_url, &block.token)
             .await?;
-        let plaintext = content_key.decrypt_block(&ciphertext)?;
+        let plaintext = content_key.decrypt_thumbnail(&ciphertext)?;
         Ok(Some(plaintext))
     }
 
@@ -695,7 +695,7 @@ impl ProtonDriveClient {
                         .await
                     {
                         Ok(ciphertext) => content_key
-                            .decrypt_block(&ciphertext)
+                            .decrypt_thumbnail(&ciphertext)
                             .map_err(ProtonError::from),
                         Err(e) => Err(e),
                     };
@@ -1416,11 +1416,12 @@ impl ProtonDriveClient {
         };
 
         // Generate the node key + content key and the file-creation secrets.
-        let node = generate_node_key()?;
-        let content_key = if aead {
-            ContentKey::generate_aead()
+        // An AEAD file uses a v6 node key (C# `PgpProfile.ProtonAead`) so its v6
+        // content-key PKESK is addressed to a matching v6 recipient.
+        let (node, content_key) = if aead {
+            (generate_node_key_aead()?, ContentKey::generate_aead())
         } else {
-            ContentKey::generate()
+            (generate_node_key()?, ContentKey::generate())
         };
 
         let encrypted_name =
