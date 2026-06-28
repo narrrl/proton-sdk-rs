@@ -13,10 +13,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use proton_drive_sdk::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
-use proton_sdk::session::ProtonApiSession;
+use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 
 // Must follow Proton's required shape (sdk/README.md "Operational requirements").
@@ -51,6 +52,12 @@ pub async fn live_client() -> Option<&'static LiveClient> {
 }
 
 /// Perform the one-time SRP + 2FA login and build the client.
+///
+/// To avoid burning a TOTP window (and tripping Proton anti-abuse) on every run,
+/// a successful login is persisted to a gitignored cache file. On the next run we
+/// [`ProtonApiSession::resume`] from that file instead of doing SRP+2FA again; the
+/// stored refresh token auto-refreshes via the http client's 401 path, so no TOTP
+/// is needed. A missing/dead cache falls back to a fresh login.
 async fn build_live_client() -> Option<LiveClient> {
     let (username, password) = match read_dotenv() {
         Ok(creds) => creds,
@@ -59,6 +66,33 @@ async fn build_live_client() -> Option<LiveClient> {
             return None;
         }
     };
+
+    let config = ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT);
+
+    // Fast path: resume a cached session (no TOTP). Validate with one cheap
+    // authenticated call so a dead/revoked session falls through to a fresh login.
+    if let Some(stored) = load_cached_session() {
+        let session = ProtonApiSession::resume(config.clone(), stored.into_params())
+            .expect("resume cached session");
+        match session
+            .http()
+            .get::<serde_json::Value>("core/v4/users")
+            .await
+        {
+            Ok(_) => {
+                eprintln!("[auth] resumed cached session (no TOTP)");
+                // Refresh may have rotated the tokens; re-persist the current set.
+                save_session(&session).await;
+                let client = ProtonDriveClient::new(&session, password.into_bytes());
+                return Some(LiveClient {
+                    client,
+                    _session: session,
+                });
+            }
+            Err(e) => eprintln!("[auth] cached session invalid ({e}); logging in fresh"),
+        }
+    }
+
     let totp_secret = match read_totp_secret() {
         Some(s) => s,
         None => {
@@ -66,8 +100,6 @@ async fn build_live_client() -> Option<LiveClient> {
             return None;
         }
     };
-
-    let config = ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT);
 
     let mut session = ProtonApiSession::begin(config, &username, password.as_bytes())
         .await
@@ -81,11 +113,80 @@ async fn build_live_client() -> Option<LiveClient> {
             .expect("2FA submission failed");
     }
 
+    save_session(&session).await;
     let client = ProtonDriveClient::new(&session, password.into_bytes());
     Some(LiveClient {
         client,
         _session: session,
     })
+}
+
+/// Persisted session credentials. Mirrors [`ResumeParameters`], serialized to a
+/// gitignored cache file so reruns can skip SRP+2FA.
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    session_id: String,
+    username: String,
+    user_id: String,
+    access_token: String,
+    refresh_token: String,
+    scopes: Vec<String>,
+    /// `1` = single, `2` = dual (matches Proton's wire value).
+    password_mode: u8,
+}
+
+impl StoredSession {
+    fn into_params(self) -> ResumeParameters {
+        ResumeParameters {
+            session_id: self.session_id.into(),
+            username: self.username,
+            user_id: self.user_id.into(),
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            scopes: self.scopes,
+            is_waiting_for_second_factor_code: false,
+            password_mode: match self.password_mode {
+                1 => PasswordMode::Single,
+                _ => PasswordMode::Dual,
+            },
+        }
+    }
+}
+
+/// Repo-root path of the gitignored session cache.
+fn session_cache_path() -> String {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../.proton_session.json").to_owned()
+}
+
+/// Load the cached session, or `None` if absent/unparseable.
+fn load_cached_session() -> Option<StoredSession> {
+    let text = std::fs::read_to_string(session_cache_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Persist the session's current tokens to the cache file (best-effort).
+async fn save_session(session: &ProtonApiSession) {
+    let tokens = session.current_tokens().await;
+    let stored = StoredSession {
+        session_id: session.session_id().as_str().to_owned(),
+        username: session.username().to_owned(),
+        user_id: session.user_id().as_str().to_owned(),
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        scopes: session.scopes().to_vec(),
+        password_mode: match session.password_mode() {
+            PasswordMode::Single => 1,
+            PasswordMode::Dual => 2,
+        },
+    };
+    match serde_json::to_string_pretty(&stored) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(session_cache_path(), json) {
+                eprintln!("[auth] could not write session cache: {e}");
+            }
+        }
+        Err(e) => eprintln!("[auth] could not serialize session: {e}"),
+    }
 }
 
 /// Minimal `.env` reader: `key=value` lines, trims whitespace, ignores `#`.

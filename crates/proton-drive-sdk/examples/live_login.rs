@@ -11,7 +11,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use proton_drive_sdk::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::ProtonApiSession;

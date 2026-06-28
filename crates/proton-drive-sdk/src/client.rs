@@ -22,7 +22,7 @@ use proton_sdk::ids::{AddressId, DriveEventId, LinkId, NodeUid, ShareId, VolumeI
 use proton_sdk::session::ProtonApiSession;
 use proton_sdk::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 use crate::cache::DriveEntityCache;

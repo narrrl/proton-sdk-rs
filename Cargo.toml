@@ -15,7 +15,7 @@ categories = ["api-bindings", "cryptography", "filesystem"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"
@@ -25,18 +25,19 @@ futures = "0.3"
 bytes = "1"
 base64 = "0.22"
 hex = "0.4"
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
 aes-gcm = "0.10"
-hkdf = "0.12"
-bcrypt = "0.17"
-pgp = "0.16"
+hkdf = "0.13"
+bcrypt = "0.19"
+pgp = "0.20"
 # Match the chrono line rPGP pulls in; used to stamp detached-signature subpackets.
 chrono = "0.4"
 tracing = "0.1"
 num-bigint = "0.4"
 num-traits = "0.2"
 getrandom = "0.2"
-# rPGP re-exports rand_core 0.6 traits; match its 0.8 line for keygen/encryption RNG.
+# rPGP (pgp 0.20) still depends on rand 0.8 and passes its CryptoRng/Rng traits
+# across its public API, so the RNG we hand to keygen/encryption must be rand 0.8.
 rand = "0.8"

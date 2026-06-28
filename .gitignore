@@ -26,3 +26,6 @@ todo.md
 sdk/
 
 .env
+
+# Cached live-test session (resume instead of re-running SRP+2FA)
+.proton_session.json

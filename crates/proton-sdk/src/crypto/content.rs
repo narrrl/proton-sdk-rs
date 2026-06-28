@@ -9,7 +9,7 @@
 use std::io::Cursor;
 
 use pgp::armor::Dearmor;
-use pgp::composed::{MessageBuilder, PlainSessionKey};
+use pgp::composed::{MessageBuilder, PlainSessionKey, RawSessionKey};
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
@@ -17,7 +17,7 @@ use pgp::packet::{
     LiteralData, Packet, PacketParser, PacketTrait, PublicKeyEncryptedSessionKey,
     SymEncryptedProtectedData,
 };
-use pgp::types::{EskType, PkeskVersion, PublicKeyTrait};
+use pgp::types::{DecryptionKey, EncryptionKey, EskType, PkeskVersion, Seipdv1ReadMode};
 
 use super::encrypt::{recipient_encryption_key, RecipientOp};
 use super::errors::CryptoError;
@@ -49,7 +49,7 @@ impl ContentKey {
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
         let sym_alg = SymmetricKeyAlgorithm::AES256;
-        let key = sym_alg.new_session_key(&mut rng).to_vec();
+        let key = sym_alg.new_session_key(&mut rng);
         ContentKey {
             session_key: PlainSessionKey::V3_4 { sym_alg, key },
         }
@@ -62,9 +62,7 @@ impl ContentKey {
     /// `PgpSessionKey.GenerateForAead()`.
     pub fn generate_aead() -> Self {
         let mut rng = rand::thread_rng();
-        let key = SymmetricKeyAlgorithm::AES256
-            .new_session_key(&mut rng)
-            .to_vec();
+        let key = SymmetricKeyAlgorithm::AES256.new_session_key(&mut rng);
         ContentKey {
             session_key: PlainSessionKey::V6 { key },
         }
@@ -191,8 +189,8 @@ impl ContentKey {
     /// official clients, which hardcode it for v6 session keys.
     fn session_parts(&self) -> Result<(SymmetricKeyAlgorithm, &[u8]), CryptoError> {
         match &self.session_key {
-            PlainSessionKey::V3_4 { sym_alg, key } => Ok((*sym_alg, key)),
-            PlainSessionKey::V6 { key } => Ok((SymmetricKeyAlgorithm::AES256, key)),
+            PlainSessionKey::V3_4 { sym_alg, key } => Ok((*sym_alg, key.as_ref())),
+            PlainSessionKey::V6 { key } => Ok((SymmetricKeyAlgorithm::AES256, key.as_ref())),
             _ => Err(CryptoError::Encrypt(
                 "content key is not a V3/V4 or V6 session key".into(),
             )),
@@ -284,7 +282,7 @@ impl ContentKey {
         };
 
         seipd
-            .decrypt(key, Some(sym_alg))
+            .decrypt(key, Some(sym_alg), Seipdv1ReadMode::default())
             .map_err(|e| CryptoError::Decrypt(format!("block: {e}")))
     }
 }
@@ -322,13 +320,16 @@ impl PrivateKey {
         let pw = self.password();
         let key = self.key();
 
+        // pgp 0.20: `DecryptionKey::decrypt` is implemented on the packet secret
+        // (sub)keys (`SecretKey` / `SecretSubkey`), not on `SignedSecretKey`, so
+        // reach through `primary_key` and each subkey's `.key`.
         let mut last_err: CryptoError;
-        match key.decrypt_session_key(&pw, values, esk_type) {
+        match key.primary_key.decrypt(&pw, values, esk_type) {
             Ok(Ok(session_key)) => return Ok(ContentKey { session_key }),
             Ok(Err(e)) | Err(e) => last_err = CryptoError::Decrypt(format!("content key: {e}")),
         }
         for subkey in &key.secret_subkeys {
-            match subkey.decrypt_session_key(&pw, values, esk_type) {
+            match subkey.key.decrypt(&pw, values, esk_type) {
                 Ok(Ok(session_key)) => return Ok(ContentKey { session_key }),
                 Ok(Err(e)) | Err(e) => {
                     last_err = CryptoError::Decrypt(format!("content key (subkey): {e}"))
@@ -428,9 +429,15 @@ struct ContentKeyPacketOp<'a> {
 impl RecipientOp for ContentKeyPacketOp<'_> {
     type Out = PublicKeyEncryptedSessionKey;
 
-    fn run(self, pubkey: &impl PublicKeyTrait) -> pgp::errors::Result<Self::Out> {
+    fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<Self::Out> {
         let mut rng = rand::thread_rng();
-        PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, self.key, self.sym_alg, pubkey)
+        let session_key = RawSessionKey::from(self.key);
+        PublicKeyEncryptedSessionKey::from_session_key_v3(
+            &mut rng,
+            &session_key,
+            self.sym_alg,
+            pubkey,
+        )
     }
 }
 
@@ -443,16 +450,19 @@ struct ContentKeyPacketV6Op<'a> {
 impl RecipientOp for ContentKeyPacketV6Op<'_> {
     type Out = PublicKeyEncryptedSessionKey;
 
-    fn run(self, pubkey: &impl PublicKeyTrait) -> pgp::errors::Result<Self::Out> {
+    fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<Self::Out> {
         let mut rng = rand::thread_rng();
-        PublicKeyEncryptedSessionKey::from_session_key_v6(&mut rng, self.key, pubkey)
+        let session_key = RawSessionKey::from(self.key);
+        PublicKeyEncryptedSessionKey::from_session_key_v6(&mut rng, &session_key, pubkey)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgp::composed::{KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey};
+    use pgp::composed::{
+        EncryptionCaps, KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey,
+    };
     use pgp::crypto::sym::SymmetricKeyAlgorithm;
 
     /// Generate a passphrase-locked RSA key able to both sign and encrypt — a
@@ -463,16 +473,12 @@ mod tests {
             .key_type(KeyType::Rsa(2048))
             .can_sign(true)
             .can_certify(true)
-            .can_encrypt(true)
+            .can_encrypt(EncryptionCaps::All)
             .primary_user_id("node <node@proton.test>".into())
             .passphrase(Some(passphrase.to_owned()))
             .build()
             .expect("key params");
-        params
-            .generate(&mut rng)
-            .expect("generate")
-            .sign(&mut rng, &passphrase.into())
-            .expect("sign")
+        params.generate(&mut rng).expect("generate")
     }
 
     #[test]
@@ -576,7 +582,7 @@ mod tests {
             other => panic!("expected SEIPD, got {:?}", other.tag()),
         };
         let inner = seipd
-            .decrypt(key, Some(sym_alg))
+            .decrypt(key, Some(sym_alg), Seipdv1ReadMode::default())
             .expect("decrypt thumbnail");
 
         let mut inner_parser = PacketParser::new(Cursor::new(&inner));

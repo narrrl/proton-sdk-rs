@@ -4,7 +4,7 @@
 //! distinct pre-unlock step, so a [`PrivateKey`] simply pairs a parsed
 //! [`SignedSecretKey`] with the passphrase that unlocks it.
 
-use pgp::composed::{Deserializable, SignedSecretKey, StandaloneSignature};
+use pgp::composed::{Deserializable, SignedSecretKey, DetachedSignature};
 use pgp::types::Password;
 
 use super::errors::CryptoError;
@@ -64,7 +64,7 @@ impl PrivateKey {
 
     /// The public half of this key, for use as an anonymous-fallback verifier.
     pub(crate) fn signed_public_key(&self) -> pgp::composed::SignedPublicKey {
-        self.key.signed_public_key()
+        self.key.to_public_key()
     }
 
     /// Verify an armored detached signature over `data` against this key's
@@ -74,9 +74,9 @@ impl PrivateKey {
         armored_sig: &str,
         data: &[u8],
     ) -> Result<(), CryptoError> {
-        let (sig, _headers) = StandaloneSignature::from_string(armored_sig)
+        let (sig, _headers) = DetachedSignature::from_string(armored_sig)
             .map_err(|e| CryptoError::Parse(format!("detached signature: {e}")))?;
-        sig.verify(&self.key.signed_public_key(), data)
+        sig.verify(&self.key.to_public_key(), data)
             .map_err(|e| CryptoError::Verification(e.to_string()))
     }
 

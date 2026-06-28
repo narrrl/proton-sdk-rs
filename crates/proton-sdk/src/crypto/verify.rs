@@ -9,10 +9,10 @@
 //! throwing.
 
 use pgp::composed::{
-    Deserializable, Message, SignedPublicKey, SignedSecretKey, StandaloneSignature,
+    Deserializable, Message, SignedPublicKey, SignedSecretKey, DetachedSignature,
     VerificationResult,
 };
-use pgp::types::{Password, PublicKeyTrait};
+use pgp::types::{Password, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::errors::CryptoError;
@@ -111,8 +111,8 @@ impl VerificationKeyRing {
         self.keys.is_empty()
     }
 
-    fn dyn_refs(&self) -> Vec<&dyn PublicKeyTrait> {
-        self.keys.iter().map(|k| k as &dyn PublicKeyTrait).collect()
+    fn dyn_refs(&self) -> Vec<&dyn VerifyingKey> {
+        self.keys.iter().map(|k| k as &dyn VerifyingKey).collect()
     }
 }
 
@@ -122,7 +122,7 @@ pub fn verify_detached(
     data: &[u8],
     ring: &VerificationKeyRing,
 ) -> VerificationStatus {
-    let signature = match StandaloneSignature::from_string(armored_sig) {
+    let signature = match DetachedSignature::from_string(armored_sig) {
         Ok((sig, _headers)) => sig,
         Err(_) => return VerificationStatus::Failed,
     };

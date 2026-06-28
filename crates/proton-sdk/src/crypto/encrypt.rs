@@ -9,15 +9,14 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::Bytes;
-use chrono::SubsecRound;
 use pgp::composed::{
-    ArmorOptions, KeyType, MessageBuilder, SecretKeyParamsBuilder, SignedSecretKey,
-    StandaloneSignature, SubkeyParamsBuilder,
+    ArmorOptions, DetachedSignature, EncryptionCaps, KeyType, MessageBuilder,
+    SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion, Password, PublicKeyTrait};
+use pgp::types::{CompressionAlgorithm, EncryptionKey, KeyDetails, KeyVersion};
 use rand::RngCore;
 
 use super::errors::CryptoError;
@@ -34,7 +33,7 @@ pub(crate) trait RecipientOp {
     /// The value produced by the operation.
     type Out;
     /// Run the operation against the selected public key.
-    fn run(self, pubkey: &impl PublicKeyTrait) -> pgp::errors::Result<Self::Out>;
+    fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<Self::Out>;
 }
 
 /// Run `op` against the encryption-capable public key of `key`.
@@ -47,14 +46,14 @@ pub(crate) fn recipient_encryption_key<Op: RecipientOp>(
     op: Op,
 ) -> Result<Op::Out, CryptoError> {
     let primary = key.primary_key.public_key();
-    if primary.is_encryption_key() {
+    if primary.algorithm().can_encrypt() {
         return op
             .run(primary)
             .map_err(|e| CryptoError::Encrypt(format!("encrypt to primary key: {e}")));
     }
     for sub in &key.secret_subkeys {
         let pubsub = sub.public_key();
-        if pubsub.is_encryption_key() {
+        if pubsub.algorithm().can_encrypt() {
             return op
                 .run(&pubsub)
                 .map_err(|e| CryptoError::Encrypt(format!("encrypt to subkey: {e}")));
@@ -108,7 +107,7 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
     let subkey = SubkeyParamsBuilder::default()
         .version(version)
         .key_type(KeyType::X25519)
-        .can_encrypt(true)
+        .can_encrypt(EncryptionCaps::All)
         .passphrase(Some(pw_string.clone()))
         .build()
         .map_err(|e| CryptoError::Encrypt(format!("node subkey params: {e}")))?;
@@ -124,12 +123,11 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
         .build()
         .map_err(|e| CryptoError::Encrypt(format!("node key params: {e}")))?;
 
-    let secret = params
+    // In pgp 0.20 `generate` already returns a `SignedSecretKey`, locked with the
+    // passphrase set on the params (no separate sign/lock step as in 0.16).
+    let signed = params
         .generate(&mut rng)
         .map_err(|e| CryptoError::Encrypt(format!("generate node key: {e}")))?;
-    let signed = secret
-        .sign(&mut rng, &Password::from(passphrase.as_slice()))
-        .map_err(|e| CryptoError::Encrypt(format!("sign node key: {e}")))?;
     let locked_armored = signed
         .to_armored_string(None.into())
         .map_err(|e| CryptoError::Encrypt(format!("armor node key: {e}")))?;
@@ -275,20 +273,23 @@ pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, 
         Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint()))
             .map_err(|e| CryptoError::Encrypt(format!("issuer fingerprint subpacket: {e}")))?,
         Subpacket::regular(SubpacketData::SignatureCreationTime(
-            chrono::Utc::now().trunc_subsecs(0),
+            pgp::types::Timestamp::now(),
         ))
         .map_err(|e| CryptoError::Encrypt(format!("creation-time subpacket: {e}")))?,
     ];
     if key.version() <= KeyVersion::V4 {
-        config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(key.key_id()))
-            .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?];
+        config.unhashed_subpackets =
+            vec![
+                Subpacket::regular(SubpacketData::IssuerKeyId(key.legacy_key_id()))
+                    .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?,
+            ];
     }
 
     let signature = config
         .sign(key, &pw, data)
         .map_err(|e| CryptoError::Encrypt(format!("detached sign: {e}")))?;
 
-    StandaloneSignature::new(signature)
+    DetachedSignature::new(signature)
         .to_armored_string(ArmorOptions::default())
         .map_err(|e| CryptoError::Encrypt(format!("armor signature: {e}")))
 }
@@ -304,7 +305,7 @@ struct EncryptSignOp<'a> {
 impl RecipientOp for EncryptSignOp<'_> {
     type Out = String;
 
-    fn run(self, pubkey: &impl PublicKeyTrait) -> pgp::errors::Result<String> {
+    fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<String> {
         let mut rng = rand::thread_rng();
         let mut builder = MessageBuilder::from_bytes(Bytes::new(), self.data)
             .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
@@ -370,13 +371,13 @@ mod tests {
         // rejects with "Invalid manifest signature". rPGP self-verify above is not
         // enough to catch that — assert the subpackets explicitly.
         use pgp::composed::Deserializable as _;
-        let (parsed, _) = StandaloneSignature::from_string(&sig).expect("parse detached sig");
+        let (parsed, _) = DetachedSignature::from_string(&sig).expect("parse detached sig");
         assert!(
             parsed.signature.created().is_some(),
             "detached signature missing creation time"
         );
         assert!(
-            !parsed.signature.issuer().is_empty(),
+            !parsed.signature.issuer_key_id().is_empty(),
             "detached signature missing issuer key id"
         );
     }
