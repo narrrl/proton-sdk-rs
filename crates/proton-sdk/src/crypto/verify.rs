@@ -9,7 +9,7 @@
 //! throwing.
 
 use pgp::composed::{
-    Deserializable, Message, SignedPublicKey, SignedSecretKey, DetachedSignature,
+    Deserializable, DetachedSignature, Message, SignedPublicKey, SignedSecretKey,
     VerificationResult,
 };
 use pgp::types::{Password, VerifyingKey};

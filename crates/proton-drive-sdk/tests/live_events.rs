@@ -184,9 +184,12 @@ async fn node_creation_surfaces_node_updated() {
         .await
         .expect("create folder");
 
-    let found = poll_for(client, &scope, &cursor, |e| {
-        matches!(e, DriveEvent::NodeUpdated { node_uid, .. } if *node_uid == folder)
-    })
+    let found = poll_for(
+        client,
+        &scope,
+        &cursor,
+        |e| matches!(e, DriveEvent::NodeUpdated { node_uid, .. } if *node_uid == folder),
+    )
     .await;
 
     match found {
@@ -282,9 +285,12 @@ async fn permanent_delete_surfaces_node_deleted() {
         .await
         .expect("delete folder");
 
-    let found = poll_for(client, &scope, &cursor, |e| {
-        matches!(e, DriveEvent::NodeDeleted { node_uid, .. } if *node_uid == folder)
-    })
+    let found = poll_for(
+        client,
+        &scope,
+        &cursor,
+        |e| matches!(e, DriveEvent::NodeDeleted { node_uid, .. } if *node_uid == folder),
+    )
     .await;
     assert!(
         found.is_some(),

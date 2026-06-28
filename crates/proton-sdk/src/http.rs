@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use rand::Rng;
 use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::api::{ApiResponse, ResponseCode};
-use crate::config::{ProtonClientConfiguration, RetryPolicy, API_CONTENT_TYPE};
+use crate::config::{API_CONTENT_TYPE, ProtonClientConfiguration, RetryPolicy};
 use crate::error::{ProtonApiError, ProtonError, Result};
 use crate::ids::SessionId;
 use crate::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
@@ -674,13 +674,17 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.operation, "http_request");
         assert_eq!(event.outcome, Outcome::Success);
-        assert!(event
-            .attributes
-            .iter()
-            .any(|(k, v)| *k == "method" && v == "GET"));
-        assert!(event
-            .attributes
-            .iter()
-            .any(|(k, v)| *k == "status" && v == "200"));
+        assert!(
+            event
+                .attributes
+                .iter()
+                .any(|(k, v)| *k == "method" && v == "GET")
+        );
+        assert!(
+            event
+                .attributes
+                .iter()
+                .any(|(k, v)| *k == "status" && v == "200")
+        );
     }
 }

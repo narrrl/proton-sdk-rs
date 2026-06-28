@@ -65,8 +65,8 @@ impl NodeVerification {
         };
         ok(self.name)
             && ok(self.passphrase)
-            && self.content_key.map_or(true, ok)
-            && self.extended_attributes.map_or(true, ok)
+            && self.content_key.is_none_or(ok)
+            && self.extended_attributes.is_none_or(ok)
     }
 }
 

@@ -6,8 +6,8 @@
 //! deferred, matching the official SDK's stance that login flows live outside
 //! the core Drive scope.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProtonClientConfiguration;

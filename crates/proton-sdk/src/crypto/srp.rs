@@ -11,8 +11,8 @@
 //! message; we verify the signature against Proton's embedded SRP modulus key
 //! before trusting it.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use num_bigint::BigUint;
 use num_traits::One;
 use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};

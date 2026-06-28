@@ -6,8 +6,8 @@
 
 use proton_sdk::account::AccountClient;
 use proton_sdk::crypto::{
-    decrypt_armored_with_keys, verify_detached, ContentKey, PrivateKey, PublicKey,
-    VerificationKeyRing, VerificationStatus,
+    ContentKey, PrivateKey, PublicKey, VerificationKeyRing, VerificationStatus,
+    decrypt_armored_with_keys, verify_detached,
 };
 use proton_sdk::error::{ProtonError, Result};
 

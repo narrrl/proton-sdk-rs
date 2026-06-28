@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -13,8 +13,8 @@ use proton_sdk::account::AccountClient;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
-    build_volume_creation_material, generate_node_hash_key, generate_node_key,
-    generate_node_key_aead, verify_detached, ContentKey, VerificationKeyRing, VerificationStatus,
+    ContentKey, VerificationKeyRing, VerificationStatus, build_volume_creation_material,
+    generate_node_hash_key, generate_node_key, generate_node_key_aead, verify_detached,
 };
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
@@ -2430,26 +2430,26 @@ impl ProtonDriveClient {
                 // leaves the claimed metadata absent rather than failing the node.
                 let mut claimed_size = None;
                 let mut claimed_modification_time = None;
-                if let Some(rev) = file.active_revision.as_ref() {
-                    if let Some(xattr) = rev.extended_attributes.as_deref() {
-                        match decrypt_extended_attributes_verified(
-                            &self.account,
-                            &decrypted.node_key,
-                            rev.signature_email.as_deref(),
-                            xattr,
-                        )
-                        .await
-                        {
-                            Ok((attrs, status)) => {
-                                verification.extended_attributes = Some(status);
-                                if let Some(common) = attrs.common {
-                                    claimed_size = common.size;
-                                    claimed_modification_time = common.modification_time;
-                                }
+                if let Some(rev) = file.active_revision.as_ref()
+                    && let Some(xattr) = rev.extended_attributes.as_deref()
+                {
+                    match decrypt_extended_attributes_verified(
+                        &self.account,
+                        &decrypted.node_key,
+                        rev.signature_email.as_deref(),
+                        xattr,
+                    )
+                    .await
+                    {
+                        Ok((attrs, status)) => {
+                            verification.extended_attributes = Some(status);
+                            if let Some(common) = attrs.common {
+                                claimed_size = common.size;
+                                claimed_modification_time = common.modification_time;
                             }
-                            Err(e) => {
-                                tracing::warn!(link_id = %link.id, error = %e, "failed to decrypt extended attributes");
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(link_id = %link.id, error = %e, "failed to decrypt extended attributes");
                         }
                     }
                 }
@@ -2520,10 +2520,10 @@ impl ProtonDriveClient {
         uid: &NodeUid,
         link: &LinkDto,
     ) -> Result<Option<String>> {
-        if let Some(info) = self.entities.try_get_node(uid).await? {
-            if !info.name_hash_digest.is_empty() {
-                return Ok(Some(info.name_hash_digest));
-            }
+        if let Some(info) = self.entities.try_get_node(uid).await?
+            && !info.name_hash_digest.is_empty()
+        {
+            return Ok(Some(info.name_hash_digest));
         }
         Ok(link.name_hash.clone())
     }
@@ -2768,7 +2768,7 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{alternate_names, epoch_to_iso8601, to_drive_event, DriveEvent};
+    use super::{DriveEvent, alternate_names, epoch_to_iso8601, to_drive_event};
     use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
     use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
 
@@ -2866,7 +2866,7 @@ mod tests {
 
     #[test]
     fn photos_attributes_content_hash_and_tags() {
-        use super::{build_photos_attributes, hmac_sha256, BlockWriteResult};
+        use super::{BlockWriteResult, build_photos_attributes, hmac_sha256};
         use crate::photos::{PhotoTag, PhotoUploadMetadata};
         use proton_sdk::ids::NodeUid;
 
@@ -2902,7 +2902,7 @@ mod tests {
 
     #[test]
     fn photos_attributes_default_capture_time_and_empty_tags() {
-        use super::{build_photos_attributes, BlockWriteResult};
+        use super::{BlockWriteResult, build_photos_attributes};
         use crate::photos::PhotoUploadMetadata;
 
         let written = BlockWriteResult {

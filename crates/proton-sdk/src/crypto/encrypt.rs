@@ -6,8 +6,8 @@
 //! signing key with a separate encryption subkey, so recipient selection must
 //! pick the encryption-capable (sub)key.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use pgp::composed::{
     ArmorOptions, DetachedSignature, EncryptionCaps, KeyType, MessageBuilder,
@@ -278,11 +278,10 @@ pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, 
         .map_err(|e| CryptoError::Encrypt(format!("creation-time subpacket: {e}")))?,
     ];
     if key.version() <= KeyVersion::V4 {
-        config.unhashed_subpackets =
-            vec![
-                Subpacket::regular(SubpacketData::IssuerKeyId(key.legacy_key_id()))
-                    .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?,
-            ];
+        config.unhashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::IssuerKeyId(key.legacy_key_id()))
+                .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?,
+        ];
     }
 
     let signature = config

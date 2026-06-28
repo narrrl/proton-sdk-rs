@@ -17,13 +17,13 @@ mod verify;
 pub use content::ContentKey;
 pub use derive::derive_key_passphrase;
 pub use encrypt::{
-    build_volume_creation_material, generate_node_hash_key, generate_node_key,
-    generate_node_key_aead, GeneratedNodeKey, VolumeCreationMaterial,
+    GeneratedNodeKey, VolumeCreationMaterial, build_volume_creation_material,
+    generate_node_hash_key, generate_node_key, generate_node_key_aead,
 };
 pub use errors::CryptoError;
-pub use keys::{decrypt_armored_with_keys, PrivateKey};
-pub use srp::{generate_proofs, SrpProofs, DEFAULT_BIT_LENGTH};
-pub use verify::{verify_detached, PublicKey, VerificationKeyRing, VerificationStatus};
+pub use keys::{PrivateKey, decrypt_armored_with_keys};
+pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, generate_proofs};
+pub use verify::{PublicKey, VerificationKeyRing, VerificationStatus, verify_detached};
 
 /// Result alias for crypto operations.
 pub type CryptoResult<T> = std::result::Result<T, CryptoError>;

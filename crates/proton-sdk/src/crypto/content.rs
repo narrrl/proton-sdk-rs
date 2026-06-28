@@ -19,7 +19,7 @@ use pgp::packet::{
 };
 use pgp::types::{DecryptionKey, EncryptionKey, EskType, PkeskVersion, Seipdv1ReadMode};
 
-use super::encrypt::{recipient_encryption_key, RecipientOp};
+use super::encrypt::{RecipientOp, recipient_encryption_key};
 use super::errors::CryptoError;
 use super::keys::PrivateKey;
 
@@ -246,7 +246,7 @@ impl ContentKey {
                     return Err(CryptoError::Parse(format!(
                         "unexpected thumbnail payload packet: {:?}",
                         other.tag()
-                    )))
+                    )));
                 }
             }
         }
@@ -276,7 +276,7 @@ impl ContentKey {
                     return Err(CryptoError::Parse(format!(
                         "unexpected block packet: {:?}",
                         other.tag()
-                    )))
+                    )));
                 }
             }
         };

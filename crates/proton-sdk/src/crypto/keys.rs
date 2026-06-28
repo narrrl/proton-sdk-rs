@@ -4,7 +4,7 @@
 //! distinct pre-unlock step, so a [`PrivateKey`] simply pairs a parsed
 //! [`SignedSecretKey`] with the passphrase that unlocks it.
 
-use pgp::composed::{Deserializable, SignedSecretKey, DetachedSignature};
+use pgp::composed::{Deserializable, DetachedSignature, SignedSecretKey};
 use pgp::types::Password;
 
 use super::errors::CryptoError;
