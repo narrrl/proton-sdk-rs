@@ -524,6 +524,146 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// Download and decrypt only the plaintext byte range `[offset, offset + length)`
+    /// of a file's active revision.
+    ///
+    /// Each content block decrypts independently under the revision's content
+    /// key ([`ContentKey::decrypt_block`]), so an on-demand reader can fetch
+    /// just the blocks that overlap the requested range instead of the whole
+    /// file — the basis for a FUSE/placeholder mount that hydrates on access.
+    ///
+    /// Block plaintext sizes come from the revision's extended attributes
+    /// (`Common.BlockSizes`); absent that, blocks are assumed to be
+    /// [`DEFAULT_BLOCK_SIZE`] with a possibly-shorter final block inferred from
+    /// the recorded total size. The range is clamped to the file's length, so a
+    /// read at or past EOF yields fewer bytes (or none).
+    ///
+    /// Unlike [`download_file_to`](Self::download_file_to), a partial read
+    /// cannot recompute the full content manifest, so manifest-signature
+    /// verification is skipped.
+    pub async fn download_range(
+        &self,
+        uid: &NodeUid,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let mut timer = self.telemetry.start("download_range");
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let detail = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("file {uid} not found")))?;
+        let link = detail.link;
+        let file = detail
+            .file
+            .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
+
+        let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
+            ProtonError::invalid_operation("file is missing its content key packet")
+        })?;
+        let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
+            ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+        })?;
+        let revision_id = file
+            .active_revision
+            .map(|r| r.id)
+            .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?;
+
+        let parent_key = self.resolve_parent_key(&uid.volume_id, &link).await?;
+        let node_key = decrypt_link(&parent_key, &link)?.node_key;
+        let content_key = node_key.decrypt_content_key(&content_key_packet)?;
+
+        let (revision, blocks) = self
+            .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
+            .await?;
+        timer.attr("block_count", blocks.len());
+
+        let block_sizes = self
+            .resolve_block_sizes(&node_key, &revision, blocks.len())
+            .await;
+        let file_size: u64 = block_sizes.iter().sum();
+
+        if length == 0 || offset >= file_size {
+            timer.success();
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(length).min(file_size);
+
+        // Walk blocks in order, fetching and decrypting only those whose
+        // plaintext span overlaps `[offset, end)`.
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        let mut block_start: u64 = 0;
+        for (block, &bsize) in blocks.iter().zip(block_sizes.iter()) {
+            let block_end = block_start + bsize;
+            if block_end <= offset {
+                block_start = block_end;
+                continue;
+            }
+            if block_start >= end {
+                break;
+            }
+            let ciphertext = self
+                .http
+                .get_storage_blob(&block.bare_url, &block.token)
+                .await?;
+            let plaintext = content_key.decrypt_block(&ciphertext)?;
+            let from = offset.saturating_sub(block_start) as usize;
+            let to = ((end - block_start) as usize).min(plaintext.len());
+            if from < to {
+                out.extend_from_slice(&plaintext[from..to]);
+            }
+            block_start = block_end;
+        }
+
+        timer.success();
+        Ok(out)
+    }
+
+    /// Plaintext size of each content block, in block order.
+    ///
+    /// Prefers `Common.BlockSizes` from the revision's extended attributes (the
+    /// authoritative value written by the uploading client). When that is
+    /// absent, malformed, or the wrong length, assumes every block is
+    /// [`DEFAULT_BLOCK_SIZE`] with a final short block sized from `Common.Size`,
+    /// falling back to all-full blocks when even the total size is unknown.
+    async fn resolve_block_sizes(
+        &self,
+        node_key: &PrivateKey,
+        revision: &RevisionDto,
+        block_count: usize,
+    ) -> Vec<u64> {
+        let common = match &revision.extended_attributes {
+            Some(xattr) => decrypt_extended_attributes_verified(
+                &self.account,
+                node_key,
+                revision.signature_email.as_deref(),
+                xattr,
+            )
+            .await
+            .ok()
+            .and_then(|(attrs, _status)| attrs.common),
+            None => None,
+        };
+
+        if let Some(sizes) = common.as_ref().and_then(|c| c.block_sizes.as_ref())
+            && sizes.len() == block_count
+        {
+            return sizes.iter().map(|&n| n.max(0) as u64).collect();
+        }
+
+        let block = DEFAULT_BLOCK_SIZE as u64;
+        if let Some(total) = common.and_then(|c| c.size).filter(|&n| n >= 0) {
+            let total = total as u64;
+            return (0..block_count)
+                .map(|i| total.saturating_sub(block * i as u64).min(block))
+                .collect();
+        }
+        vec![block; block_count]
+    }
+
     /// Download and decrypt a file's thumbnail of the given type, if it has one.
     ///
     /// Mirrors C# `FileOperations.EnumerateThumbnailsAsync` (single-file): pick
