@@ -14,7 +14,7 @@ readme = "../../README.md"
 documentation = "https://docs.rs/proton-drive-rs"
 
 [dependencies]
-proton-sdk = { path = "../proton-sdk", version = "0.1.2" }
+proton-sdk = { path = "../proton-sdk", version = "0.1.3" }
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
