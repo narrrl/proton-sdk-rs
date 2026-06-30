@@ -24,4 +24,3 @@ pub mod telemetry;
 
 pub use error::{ProtonApiError, ProtonError, Result};
 pub use session::ProtonApiSession;
-
