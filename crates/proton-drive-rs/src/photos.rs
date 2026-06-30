@@ -157,6 +157,7 @@ impl ProtonPhotosClient {
     /// `reader` / `intended_size` / `thumbnails` / `aead` semantics; the seal
     /// additionally records the photo metadata (capture time, content hash,
     /// tags).
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_photo_from<R: Read + Send>(
         &self,
         name: &str,

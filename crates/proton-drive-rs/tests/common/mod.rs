@@ -219,8 +219,9 @@ fn read_dotenv() -> Result<(String, String), Box<dyn std::error::Error>> {
 /// `PROTON_TOTP_SECRET=` line in `.env`.
 fn read_totp_secret() -> Option<String> {
     if let Ok(s) = std::env::var("PROTON_TOTP_SECRET") {
-        if !s.trim().is_empty() {
-            return Some(s.trim().to_owned());
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
         }
     }
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
@@ -231,10 +232,11 @@ fn read_totp_secret() -> Option<String> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == "PROTON_TOTP_SECRET" {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_owned());
+            let key = k.trim();
+            if key == "PROTON_TOTP_SECRET" {
+                let val = v.trim();
+                if !val.is_empty() {
+                    return Some(val.to_owned());
                 }
             }
         }

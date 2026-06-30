@@ -971,6 +971,7 @@ impl ProtonDriveClient {
     ///
     /// `reader` is a blocking [`Read`]; reads happen between block uploads, so a
     /// slow reader stalls the upload but never buffers more than one block.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_file_from<R: Read + Send>(
         &self,
         parent_uid: &NodeUid,
@@ -1048,6 +1049,7 @@ impl ProtonDriveClient {
     /// photos share's membership address), and the seal adds a `Photo` attribute
     /// block. Errors when the account has no photos volume. Live validation
     /// pending.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn upload_photo_from<R: Read + Send>(
         &self,
         name: &str,
