@@ -542,12 +542,7 @@ impl ProtonDriveClient {
     /// Unlike [`download_file_to`](Self::download_file_to), a partial read
     /// cannot recompute the full content manifest, so manifest-signature
     /// verification is skipped.
-    pub async fn download_range(
-        &self,
-        uid: &NodeUid,
-        offset: u64,
-        length: u64,
-    ) -> Result<Vec<u8>> {
+    pub async fn download_range(&self, uid: &NodeUid, offset: u64, length: u64) -> Result<Vec<u8>> {
         let mut timer = self.telemetry.start("download_range");
         let details = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))

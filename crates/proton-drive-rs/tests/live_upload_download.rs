@@ -161,14 +161,14 @@ async fn download_range_single_block() {
     let total = size as u64;
     // (offset, length, expected slice end clamped to size)
     let cases: &[(u64, u64)] = &[
-        (0, 100),            // head
-        (1000, 5000),       // interior
-        (size as u64 - 10, 10), // exact tail
+        (0, 100),                 // head
+        (1000, 5000),             // interior
+        (size as u64 - 10, 10),   // exact tail
         (size as u64 - 10, 1000), // past EOF → clamps to tail
-        (0, total),         // whole file via range
-        (total, 100),       // offset == size → empty
-        (total + 50, 100),  // offset past EOF → empty
-        (1000, 0),          // zero length → empty
+        (0, total),               // whole file via range
+        (total, 100),             // offset == size → empty
+        (total + 50, 100),        // offset past EOF → empty
+        (1000, 0),                // zero length → empty
     ];
 
     for &(off, len) in cases {
@@ -180,7 +180,8 @@ async fn download_range_single_block() {
         let to = ((off + len) as usize).min(size);
         let want = &payload[from..to];
         assert_eq!(
-            got, want,
+            got,
+            want,
             "range(off={off}, len={len}) mismatch: got {} bytes, want {}",
             got.len(),
             want.len()
@@ -231,14 +232,14 @@ async fn download_range_multi_block() {
 
     let total = size as u64;
     let cases: &[(u64, u64)] = &[
-        (0, 256),                  // start of block 1
-        (block - 128, 256),        // straddles block 1 → block 2
-        (block, 4096),             // exact start of block 2
-        (2 * block - 1, 2),        // straddles block 2 → block 3 (final short block)
-        (2 * block + 1000, 50_000),// interior of final short block
-        (total - 100, 500),        // tail, length past EOF → clamps
-        (block - 10, block + 20),  // spans a full block plus both neighbors
-        (0, total),                // whole file
+        (0, 256),                   // start of block 1
+        (block - 128, 256),         // straddles block 1 → block 2
+        (block, 4096),              // exact start of block 2
+        (2 * block - 1, 2),         // straddles block 2 → block 3 (final short block)
+        (2 * block + 1000, 50_000), // interior of final short block
+        (total - 100, 500),         // tail, length past EOF → clamps
+        (block - 10, block + 20),   // spans a full block plus both neighbors
+        (0, total),                 // whole file
     ];
 
     for &(off, len) in cases {

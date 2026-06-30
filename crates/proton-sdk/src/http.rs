@@ -277,13 +277,13 @@ impl ApiHttpClient {
     ) -> Result<reqwest::Response> {
         // Don't bother refreshing for terminal account states.
         let bytes = response.bytes().await?;
-        if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes) {
-            if matches!(
+        if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes)
+            && matches!(
                 envelope.code,
                 ResponseCode::AccountDeleted | ResponseCode::AccountDisabled
-            ) {
-                return Err(api_error(StatusCode::UNAUTHORIZED, &bytes));
-            }
+            )
+        {
+            return Err(api_error(StatusCode::UNAUTHORIZED, &bytes));
         }
 
         let access_token = self.refresh_access_token(&rejected_access_token).await?;
