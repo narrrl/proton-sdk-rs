@@ -470,6 +470,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
+            .or(detail.photo)
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -559,6 +560,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
+            .or(detail.photo)
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -896,6 +898,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
+            .or(detail.photo)
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -2322,6 +2325,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
+            .or(detail.photo)
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -2532,7 +2536,7 @@ impl ProtonDriveClient {
                 NodeKind::Folder
             }
             LinkType::File => {
-                let file = details.file.as_ref().ok_or_else(|| {
+                let file = details.file_properties().ok_or_else(|| {
                     ProtonError::invalid_operation("file node missing file properties")
                 })?;
 

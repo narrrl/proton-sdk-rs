@@ -100,6 +100,19 @@ pub struct LinkDetailsDto {
     pub folder: Option<FolderDto>,
     #[serde(rename = "File")]
     pub file: Option<FileDto>,
+    /// Photos-volume `/links` returns file properties under `Photo` (a superset
+    /// of `File`) rather than `File`. Deserialized as [`FileDto`]; the extra
+    /// photo fields are ignored. C# `linkDetailsDto.File ?? linkDetailsDto.Photo`.
+    #[serde(rename = "Photo")]
+    pub photo: Option<FileDto>,
+}
+
+impl LinkDetailsDto {
+    /// File properties for a file/photo node, preferring `File` and falling back
+    /// to the photos-volume `Photo` block.
+    pub fn file_properties(&self) -> Option<&FileDto> {
+        self.file.as_ref().or(self.photo.as_ref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
