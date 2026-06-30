@@ -1,5 +1,13 @@
 # proton-sdk-rs
 
+[![CI](https://github.com/narrrl/proton-sdk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/narrrl/proton-sdk-rs/actions/workflows/ci.yml)
+[![Crates.io (proton-sdk)](https://img.shields.io/crates/v/proton-sdk.svg?label=proton-sdk)](https://crates.io/crates/proton-sdk)
+[![Crates.io (proton-drive-rs)](https://img.shields.io/crates/v/proton-drive-rs.svg?label=proton-drive-rs)](https://crates.io/crates/proton-drive-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust: 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://github.com/narrrl/proton-sdk-rs)
+[![Dependency Status](https://deps.rs/repo/github/narrrl/proton-sdk-rs/status.svg)](https://deps.rs/repo/github/narrrl/proton-sdk-rs)
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/narrrl/proton-sdk-rs)
+
 A pure-Rust reimplementation of the [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk).
 
 This repository contains two primary crates that replicate the functionality of the official Proton SDKs (available locally in the [sdk/](file:///home/narl/dev/private/proton-sdk-rs/sdk) submodule). Rather than relying on FFI bindings to the official C# NativeAOT core, `proton-sdk-rs` is a **pure-Rust** implementation. It communicates directly with the Proton Drive API over HTTP and performs all OpenPGP cryptographic operations natively using the [`pgp` (rPGP)](https://crates.io/crates/pgp) crate.
@@ -21,10 +29,10 @@ This SDK is the core engine powering the following real-world projects:
 
 The workspace is divided into two crates, mirroring the separation of concerns in the upstream C# codebase:
 
-| Crate | Analogue | Description | Key Modules / Entrypoint |
-| --- | --- | --- | --- |
-| **[crates/proton-sdk](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-sdk)** | `Proton.Sdk` | Foundational account, session, HTTP client, and OpenPGP cryptography. | [`ProtonApiSession`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-sdk/src/session.rs) |
-| **[crates/proton-drive-rs](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs)** | `Proton.Drive.Sdk` | High-level Drive & Photos client operations, folders/links management, uploads/downloads, events, caching. | [`ProtonDriveClient`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs/src/client.rs), [`ProtonPhotosClient`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs/src/photos.rs) |
+| Crate | Version | Docs | Analogue | Description | Key Modules / Entrypoint |
+| --- | --- | --- | --- | --- | --- |
+| [**`crates/proton-sdk`**](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-sdk) | [![crates.io](https://img.shields.io/crates/v/proton-sdk.svg)](https://crates.io/crates/proton-sdk) | [![docs.rs](https://img.shields.io/docsrs/proton-sdk)](https://docs.rs/proton-sdk) | `Proton.Sdk` | Foundational account, session, HTTP client, and OpenPGP cryptography. | [`ProtonApiSession`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-sdk/src/session.rs) |
+| [**`crates/proton-drive-rs`**](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs) | [![crates.io](https://img.shields.io/crates/v/proton-drive-rs.svg)](https://crates.io/crates/proton-drive-rs) | [![docs.rs](https://img.shields.io/docsrs/proton-drive-rs)](https://docs.rs/proton-drive-rs) | `Proton.Drive.Sdk` | High-level Drive & Photos client operations, folders/links management, uploads/downloads, events, caching. | [`ProtonDriveClient`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs/src/client.rs), [`ProtonPhotosClient`](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-drive-rs/src/photos.rs) |
 
 OpenPGP features are powered by rPGP (version `0.20`), and HTTP requests are built on `reqwest`.
 

@@ -9,6 +9,7 @@
 //! Login/SRP is provided behind [`session::ProtonApiSession::begin`] but read
 //! workflows can be driven entirely through
 //! [`session::ProtonApiSession::resume`] with pre-obtained tokens.
+#![forbid(unsafe_code)]
 
 pub mod account;
 pub mod api;
@@ -23,3 +24,4 @@ pub mod telemetry;
 
 pub use error::{ProtonApiError, ProtonError, Result};
 pub use session::ProtonApiSession;
+

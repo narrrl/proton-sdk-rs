@@ -31,6 +31,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![forbid(unsafe_code)]
 
 mod cache;
 mod client;
