@@ -6,8 +6,8 @@ gitignored, so this file is the only durable record of what we last reviewed.
 
 - **Upstream**: https://github.com/ProtonDriveApps/sdk
 - **Reconciled subtree**: `client/cs/sdk/src`
-- **Pinned**: `36430318919c30fac42ec8577036a6d6e9de916f`
-- **Date**: 2026-06-26
+- **Pinned**: `f2496161c2f704b72511aa1b804961285993850c`
+- **Date**: 2026-07-10
 
 ## Workflow
 
@@ -23,3 +23,4 @@ gitignored, so this file is the only durable record of what we last reviewed.
 |------|-----------|--------|-------|
 | 2026-06-25 | initial pin `fb4173ab` | — | baseline; delta reviewed, 0 behavioral changes outstanding |
 | 2026-06-26 | `fb4173ab` → `36430318` | `36430318` | ported: enumeration returns `NodeUid`s (`enumerate_folder_children_node_uids` / `enumerate_trash_node_uids`), caller materializes via `enumerate_nodes`. noise dropped: BOM/deps/kt-enum-order/cs-account-refactor |
+| 2026-07-10 | `36430318` → `f2496161` | `9a1c39b3` | ported: validation check in `Thumbnail::new` returning `Result` instead of panicking. noise dropped: projects reorg / C# Account client move to incubating. deferred: device support (`32a8eed0`). |

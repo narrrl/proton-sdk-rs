@@ -138,11 +138,21 @@ pub struct Thumbnail {
 
 impl Thumbnail {
     /// Create a thumbnail from rendered image bytes.
-    pub fn new(thumbnail_type: ThumbnailType, content: Vec<u8>) -> Self {
-        Self {
+    ///
+    /// Returns an error if the `content` is empty.
+    pub fn new(
+        thumbnail_type: ThumbnailType,
+        content: Vec<u8>,
+    ) -> Result<Self, proton_sdk::error::ProtonError> {
+        if content.is_empty() {
+            return Err(proton_sdk::error::ProtonError::invalid_operation(
+                "Thumbnail content must not be empty.",
+            ));
+        }
+        Ok(Self {
             thumbnail_type,
             content,
-        }
+        })
     }
 }
 

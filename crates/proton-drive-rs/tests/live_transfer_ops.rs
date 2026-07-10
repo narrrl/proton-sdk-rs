@@ -260,8 +260,8 @@ async fn thumbnails_upload_and_fetch() {
     let thumb_small: Vec<u8> = (0..4096).map(|i| (i * 13 + 1) as u8).collect();
     let thumb_preview: Vec<u8> = (0..8192).map(|i| (i * 17 + 3) as u8).collect();
     let thumbnails = vec![
-        Thumbnail::new(ThumbnailType::Thumbnail, thumb_small.clone()),
-        Thumbnail::new(ThumbnailType::Preview, thumb_preview.clone()),
+        Thumbnail::new(ThumbnailType::Thumbnail, thumb_small.clone()).unwrap(),
+        Thumbnail::new(ThumbnailType::Preview, thumb_preview.clone()).unwrap(),
     ];
 
     let payload = b"file body for thumbnail upload".to_vec();
