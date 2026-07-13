@@ -94,8 +94,17 @@ pub(super) struct KeySaltListResponse {
     pub key_salts: Vec<KeySalt>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct KeySalt {
+/// A per-key bcrypt salt from `core/v4/keys/salts`.
+///
+/// `core/v4/keys/salts` requires the `locked` scope, which only a
+/// password-authenticated access token carries — a token obtained through
+/// `auth/v4/refresh` does not, and the endpoint then answers 403 (code 9101).
+/// Salts change only when the user changes their password, so callers that
+/// resume a session from persisted tokens should persist the salts alongside
+/// them and hand them back via
+/// [`AccountClient::with_key_salts`](super::AccountClient::with_key_salts).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct KeySalt {
     #[serde(rename = "ID")]
     pub key_id: String,
     /// Base64-encoded 16-byte salt; `null` for keys without a salt.

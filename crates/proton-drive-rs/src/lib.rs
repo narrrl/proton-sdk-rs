@@ -46,6 +46,7 @@ pub use client::ProtonDriveClient;
 pub use events::{DriveEvent, DriveEventScopeId};
 pub use node::{Node, NodeKind, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
+pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
 
 pub use proton_sdk;

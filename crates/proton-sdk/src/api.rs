@@ -51,6 +51,10 @@ pub enum ResponseCode {
     OutdatedApp = 5003,
     Offline = 7001,
     IncorrectLoginCredentials = 8002,
+    /// The access token lacks a scope the endpoint requires. Notably
+    /// `core/v4/keys/salts` requires `locked`, which only a
+    /// password-authenticated token carries — not one from `auth/v4/refresh`.
+    InsufficientScope = 9101,
     AccountDeleted = 10_002,
     AccountDisabled = 10_003,
     InvalidRefreshToken = 10_013,
@@ -89,6 +93,7 @@ impl ResponseCode {
             5003 => Self::OutdatedApp,
             7001 => Self::Offline,
             8002 => Self::IncorrectLoginCredentials,
+            9101 => Self::InsufficientScope,
             10_002 => Self::AccountDeleted,
             10_003 => Self::AccountDisabled,
             10_013 => Self::InvalidRefreshToken,

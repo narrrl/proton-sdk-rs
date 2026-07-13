@@ -28,6 +28,8 @@ use dtos::{
     UserResponse,
 };
 
+pub use dtos::KeySalt;
+
 /// Public view of an email address attached to the account.
 #[derive(Debug, Clone)]
 pub struct Address {
@@ -58,6 +60,9 @@ struct Inner {
 
 #[derive(Default)]
 struct Cache {
+    /// Raw key salts, either fetched from `core/v4/keys/salts` or seeded by the
+    /// caller (see [`AccountClient::with_key_salts`]).
+    key_salts: Option<Vec<KeySalt>>,
     /// key id → passphrase derived from the mailbox password and key salts.
     key_passphrases: Option<HashMap<String, Vec<u8>>>,
     user_keys: Option<Vec<PrivateKey>>,
@@ -76,6 +81,49 @@ impl AccountClient {
                 cache: Mutex::new(Cache::default()),
             }),
         }
+    }
+
+    /// Build a client with the account's key salts already known, so the key
+    /// chain unlocks without calling `core/v4/keys/salts`.
+    ///
+    /// That endpoint requires the `locked` scope, which only a
+    /// password-authenticated access token carries: a session resumed from
+    /// persisted tokens (or one whose token has since gone through
+    /// `auth/v4/refresh`) gets a 403 there. Capture the salts with
+    /// [`key_salts`](Self::key_salts) right after login, persist them next to
+    /// the session tokens, and seed them here on resume.
+    pub fn with_key_salts(
+        session: &ProtonApiSession,
+        mailbox_password: impl Into<Vec<u8>>,
+        key_salts: Vec<KeySalt>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                http: session.http().clone(),
+                mailbox_password: mailbox_password.into(),
+                cache: Mutex::new(Cache {
+                    key_salts: Some(key_salts),
+                    ..Cache::default()
+                }),
+            }),
+        }
+    }
+
+    /// The account's key salts, fetched (and cached) unless already seeded.
+    ///
+    /// Requires the `locked` scope — call it on a freshly password-authenticated
+    /// session; see [`with_key_salts`](Self::with_key_salts).
+    pub async fn key_salts(&self) -> Result<Vec<KeySalt>> {
+        {
+            let cache = self.inner.cache.lock().await;
+            if let Some(salts) = &cache.key_salts {
+                return Ok(salts.clone());
+            }
+        }
+
+        let response: KeySaltListResponse = self.inner.http.get("core/v4/keys/salts").await?;
+        self.inner.cache.lock().await.key_salts = Some(response.key_salts.clone());
+        Ok(response.key_salts)
     }
 
     /// All addresses on the account, ordered by their `Order` field.
@@ -239,9 +287,9 @@ impl AccountClient {
             }
         }
 
-        let response: KeySaltListResponse = self.inner.http.get("core/v4/keys/salts").await?;
+        let salts = self.key_salts().await?;
         let mut passphrases = HashMap::new();
-        for salt in &response.key_salts {
+        for salt in &salts {
             let Some(salt_b64) = &salt.value else {
                 continue;
             };

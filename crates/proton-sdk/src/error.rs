@@ -54,4 +54,10 @@ impl ProtonApiError {
     pub fn is_invalid_refresh_token(&self) -> bool {
         matches!(self.code, ResponseCode::InvalidRefreshToken)
     }
+
+    /// The token lacks a scope the endpoint requires — no amount of refreshing
+    /// fixes it; the user must authenticate with their password again.
+    pub fn is_insufficient_scope(&self) -> bool {
+        matches!(self.code, ResponseCode::InsufficientScope)
+    }
 }

@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use proton_sdk::account::AccountClient;
+use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
@@ -172,6 +172,34 @@ impl ProtonDriveClient {
             entities: DriveEntityCache::new(entity_repository),
             telemetry: NoopTelemetry::shared(),
         }
+    }
+
+    /// Build a Drive client whose key chain unlocks from already-known key
+    /// salts, so no `core/v4/keys/salts` call is made.
+    ///
+    /// That endpoint needs the `locked` scope, which a token from
+    /// `auth/v4/refresh` does not carry — a daemon that resumes a persisted
+    /// session would otherwise fail every start with a 403 once its original
+    /// login token has been refreshed. Capture the salts right after login via
+    /// [`account`](Self::account) + [`AccountClient::key_salts`], persist them
+    /// with the session, and pass them here on resume.
+    pub fn with_key_salts(
+        session: &ProtonApiSession,
+        mailbox_password: impl Into<Vec<u8>>,
+        key_salts: Vec<KeySalt>,
+    ) -> Self {
+        Self {
+            http: session.http().with_base_route("drive/"),
+            account: AccountClient::with_key_salts(session, mailbox_password, key_salts),
+            cache: Arc::new(Mutex::new(DriveCache::default())),
+            entities: DriveEntityCache::new(InMemoryCacheRepository::shared()),
+            telemetry: NoopTelemetry::shared(),
+        }
+    }
+
+    /// The account client backing this Drive client's key chain.
+    pub fn account(&self) -> &AccountClient {
+        &self.account
     }
 
     /// Attach a telemetry observer to receive a
