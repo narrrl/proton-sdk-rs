@@ -47,6 +47,9 @@ pub struct ApiHttpClient {
     route_prefix: Arc<str>,
 }
 
+/// Callback invoked after a successful token refresh.
+type TokensRefreshedCallback = Arc<dyn Fn(Tokens) + Send + Sync>;
+
 struct Inner {
     http: reqwest::Client,
     base_url: String,
@@ -59,6 +62,7 @@ struct Inner {
     /// a no-op. `std::sync::Mutex` (not tokio's) — held only for the cheap
     /// clone/replace, never across an await.
     telemetry: std::sync::Mutex<Arc<dyn Telemetry>>,
+    on_tokens_refreshed: std::sync::Mutex<Option<TokensRefreshedCallback>>,
 }
 
 impl ApiHttpClient {
@@ -82,6 +86,7 @@ impl ApiHttpClient {
                 session_id,
                 tokens: Mutex::new(tokens),
                 telemetry: std::sync::Mutex::new(NoopTelemetry::shared()),
+                on_tokens_refreshed: std::sync::Mutex::new(None),
             }),
             route_prefix: Arc::from(""),
         })
@@ -116,6 +121,16 @@ impl ApiHttpClient {
             .telemetry
             .lock()
             .expect("telemetry mutex poisoned") = telemetry;
+    }
+
+    /// Set a callback to be invoked whenever the session's tokens are refreshed.
+    /// Replaces any previous callback. Takes effect for every clone of this client.
+    pub fn set_on_tokens_refreshed(&self, callback: impl Fn(Tokens) + Send + Sync + 'static) {
+        *self
+            .inner
+            .on_tokens_refreshed
+            .lock()
+            .expect("on_tokens_refreshed mutex poisoned") = Some(Arc::new(callback));
     }
 
     /// Snapshot the current telemetry sink.
@@ -340,6 +355,17 @@ impl ApiHttpClient {
 
         let refreshed = self.request_refresh(&guard.refresh_token).await?;
         *guard = refreshed.clone();
+
+        // Notify callback
+        if let Some(ref cb) = *self
+            .inner
+            .on_tokens_refreshed
+            .lock()
+            .expect("on_tokens_refreshed mutex poisoned")
+        {
+            cb(refreshed.clone());
+        }
+
         Ok(refreshed.access_token)
     }
 
