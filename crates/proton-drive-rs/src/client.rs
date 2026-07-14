@@ -18,7 +18,10 @@ use proton_sdk::crypto::{
 };
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
-use proton_sdk::ids::{AddressId, DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
+use proton_sdk::ids::{
+    AddressId, AddressKeyId, DeviceUid, DriveEventId, LinkId, NodeUid, ShareId, ShareMembershipId,
+    VolumeId,
+};
 use proton_sdk::session::ProtonApiSession;
 use proton_sdk::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 
@@ -30,22 +33,26 @@ use crate::crypto::{
     decrypt_content_key_verified, decrypt_extended_attributes_verified, decrypt_link,
     decrypt_link_verified, decrypt_share_key,
 };
+use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
     AggregateLinksResponse, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
     BlockUploadPreparationResponse, BlockVerificationInputResponse, BlockVerifier,
-    CommonExtendedAttributes, ExtendedAttributes, FileContentDigests, FileCreationRequest,
-    FileCreationResponse, FolderChildrenResponse, FolderCreationRequest, FolderCreationResponse,
-    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
-    LinkType, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
-    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
-    NodeNameAvailabilityResponse, PhotosAttributesDto, RenameLinkRequest, RevisionCreationRequest,
-    RevisionCreationResponse, RevisionDto, RevisionResponse, RevisionUpdateRequest,
+    CommonExtendedAttributes, DeviceCreationDeviceDto, DeviceCreationLinkDto,
+    DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse,
+    DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes, FileContentDigests,
+    FileCreationRequest, FileCreationResponse, FolderChildrenResponse, FolderCreationRequest,
+    FolderCreationResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
+    LinkDetailsResponse, LinkDto, LinkType, MoveLinkRequest, MoveMultipleLinksItem,
+    MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
+    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
+    RenameLinkRequest, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
+    RevisionResponse, RevisionUpdateRequest, ShareResponse, ShareTargetType, SharedWithMeResponse,
     ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
     TimelinePhotoListResponse, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
     VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
-use crate::node::{FileThumbnail, Node, NodeKind, Thumbnail, ThumbnailType};
+use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
@@ -1555,7 +1562,293 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// The nodes other users share with us, as [`NodeUid`]s.
+    ///
+    /// Mirrors C# `SharingOperations.EnumerateSharedWithMeNodeUidsAsync`: page
+    /// `GET v2/sharedwithme` on its `AnchorID` cursor and keep only the target
+    /// types the Drive client owns (folder / file / vendor) — albums and photos
+    /// belong to the Photos client. Materialize the uids with
+    /// [`enumerate_nodes`](Self::enumerate_nodes).
+    pub async fn enumerate_shared_with_me_node_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self.telemetry.start("enumerate_shared_with_me_node_uids");
+        let mut uids = Vec::new();
+        let mut anchor: Option<String> = None;
+
+        loop {
+            let path = match &anchor {
+                Some(anchor_id) => format!("v2/sharedwithme?AnchorID={anchor_id}"),
+                None => "v2/sharedwithme".to_string(),
+            };
+            let page: SharedWithMeResponse = self.http.get(&path).await?;
+
+            for link in &page.links {
+                let is_drive_item = ShareTargetType::from_raw(link.share_target_type)
+                    .is_some_and(ShareTargetType::is_drive_item);
+                if is_drive_item {
+                    uids.push(NodeUid::new(link.volume_id.clone(), link.link_id.clone()));
+                }
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+
+        timer.success();
+        Ok(uids)
+    }
+
+    /// Leave a node someone shared with us, giving up access to it.
+    ///
+    /// Mirrors C# `SharingOperations.LeaveSharedNodeAsync`: read the node's link
+    /// details, take our membership in the sharer's share, and delete it
+    /// (`DELETE v2/shares/{sid}/members/{mid}`). Errors when the node is not
+    /// shared with us — there is nothing to leave (C# throws `ValidationException`).
+    pub async fn leave_shared_node(&self, uid: &NodeUid) -> Result<()> {
+        let mut timer = self.telemetry.start("leave_shared_node");
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let membership = details
+            .links
+            .into_iter()
+            .find(|detail| detail.link.id == uid.link_id)
+            .and_then(|detail| detail.membership)
+            .ok_or_else(|| {
+                ProtonError::invalid_operation("you can leave only an item that is shared with you")
+            })?;
+
+        self.remove_share_member(&membership.share_id, &membership.membership_id)
+            .await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// The account's registered devices, with their root-folder names decrypted.
+    ///
+    /// Mirrors C# `DeviceOperations.EnumerateDevicesAsync` (`GET devices` then
+    /// resolve each root folder's name). A device's root folder lives in its own
+    /// share, so the name is decrypted with that share's key rather than the My
+    /// Files one; a per-device name failure is carried in [`Device::name`] rather
+    /// than failing the enumeration. Each resolved root-folder key is cached, so
+    /// enumerating a device's children works straight afterwards.
+    pub async fn enumerate_devices(&self) -> Result<Vec<Device>> {
+        let mut timer = self.telemetry.start("enumerate_devices");
+        let metadata = self.device_metadata().await?;
+
+        let mut devices = Vec::with_capacity(metadata.len());
+        for device in metadata {
+            let name = self.device_root_folder_name(&device).await;
+            devices.push(device.into_device(name));
+        }
+
+        timer.success();
+        Ok(devices)
+    }
+
+    /// Register a new device with its own share and root folder.
+    ///
+    /// Mirrors C# `DeviceOperations.CreateDeviceAsync` / `DeviceCrypto`: generate
+    /// a share key and a root-folder key, wrap the share passphrase to the My
+    /// Files membership address key, the folder passphrase to the share key, and
+    /// the folder name + hash key to the share/folder keys, then `POST devices`.
+    /// The crypto material is exactly a volume's root share + root folder, so it
+    /// is built by the same `build_volume_creation_material` — with the device
+    /// name in place of the root folder name. Live validation pending.
+    pub async fn create_device(&self, name: &str, device_type: DeviceType) -> Result<Device> {
+        let mut timer = self.telemetry.start("create_device");
+        let root = self.get_my_files_folder().await?;
+        let volume_id = root.uid.volume_id.clone();
+
+        let (address_id, _email, address_key) = self.membership_address().await?;
+        let address_key_id = self.address_primary_key_id(&address_id).await?;
+
+        let material = build_volume_creation_material(&address_key, name)?;
+
+        let request = DeviceCreationRequest {
+            device: DeviceCreationDeviceDto {
+                device_type: device_type.as_i32(),
+                sync_state: 0,
+            },
+            share: DeviceCreationShareDto {
+                address_id,
+                address_key_id,
+                key: material.share_key_armored,
+                passphrase: material.share_passphrase,
+                passphrase_signature: material.share_passphrase_signature,
+            },
+            link: DeviceCreationLinkDto {
+                name: material.folder_name,
+                key: material.folder_key_armored,
+                passphrase: material.folder_passphrase,
+                passphrase_signature: material.folder_passphrase_signature,
+                node_hash_key: material.folder_hash_key,
+            },
+        };
+
+        let created: DeviceCreationResponse = self.http.post("devices", &request).await?;
+
+        timer.success();
+        Ok(Device {
+            uid: created.device.id,
+            device_type,
+            name: Ok(name.to_string()),
+            root_folder_uid: NodeUid::new(volume_id, created.device.root_link_id),
+            creation_time: now_epoch_seconds(),
+            last_sync_time: None,
+            share_id: created.device.share_id,
+        })
+    }
+
+    /// Rename a device, i.e. rename its root folder.
+    ///
+    /// Mirrors C# `DeviceOperations.RenameDeviceAsync`. A root node has no parent
+    /// and no siblings, so — unlike [`rename_node`](Self::rename_node) — the name
+    /// is encrypted to the device's *share* key and carries no name hash. Devices
+    /// registered before the name moved onto the root folder also keep a copy on
+    /// the share; that copy is cleared first (best-effort, as in C#).
+    pub async fn rename_device(&self, device_uid: &DeviceUid, name: &str) -> Result<Device> {
+        let mut timer = self.telemetry.start("rename_device");
+        let device = self.device_metadata_by_uid(device_uid).await?;
+
+        if device.has_deprecated_name {
+            let request = DeviceUpdateRequest {
+                share: DeviceUpdateShareDto {
+                    name: String::new(),
+                },
+            };
+            let path = format!("devices/{device_uid}");
+            let removed: Result<proton_sdk::api::ApiResponse> =
+                self.http.put(&path, &request).await;
+            if let Err(e) = removed {
+                tracing::warn!(device_uid = %device_uid, error = %e, "failed to remove deprecated device name");
+            }
+        }
+
+        let (share_key, membership_address_id) = self.share_key_by_id(&device.share_id).await?;
+        let (_address_id, email, signing_key) = self
+            .resolve_membership_address(membership_address_id)
+            .await?;
+
+        let encrypted_name =
+            share_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
+        let request = RenameLinkRequest {
+            name: encrypted_name,
+            name_hash: String::new(),
+            name_signature_email: email,
+            media_type: None,
+            original_hash: String::new(),
+        };
+        let path = format!(
+            "v2/volumes/{}/links/{}/rename",
+            device.root_folder_uid.volume_id, device.root_folder_uid.link_id
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+
+        timer.success();
+        Ok(device.into_device(Ok(name.to_string())))
+    }
+
+    /// Delete a device and its root folder (`DELETE devices/{uid}`).
+    /// Mirrors C# `DeviceOperations.DeleteDeviceAsync`.
+    pub async fn delete_device(&self, device_uid: &DeviceUid) -> Result<()> {
+        let mut timer = self.telemetry.start("delete_device");
+        let path = format!("devices/{device_uid}");
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        timer.success();
+        Ok(())
+    }
+
     // ---- internals ---------------------------------------------------------
+
+    /// `DELETE v2/shares/{sid}/members/{mid}` — drop a membership from a share.
+    /// C# `SharesApiClient.RemoveMemberAsync`.
+    async fn remove_share_member(
+        &self,
+        share_id: &ShareId,
+        membership_id: &ShareMembershipId,
+    ) -> Result<()> {
+        let path = format!("v2/shares/{share_id}/members/{membership_id}");
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
+    }
+
+    /// All registered devices, without their (decrypted) names.
+    /// C# `DeviceOperations.GetDeviceMetadataAsync`.
+    async fn device_metadata(&self) -> Result<Vec<DeviceMetadata>> {
+        let response: DeviceListResponse = self.http.get("devices").await?;
+
+        let mut devices = Vec::with_capacity(response.devices.len());
+        for item in response.devices {
+            devices.push(DeviceMetadata {
+                uid: item.device.id,
+                device_type: DeviceType::from_raw(item.device.device_type)?,
+                root_folder_uid: NodeUid::new(item.device.volume_id, item.share.root_link_id),
+                creation_time: item.device.creation_time,
+                last_sync_time: item.device.last_sync_time,
+                has_deprecated_name: item.share.name.is_some_and(|name| !name.is_empty()),
+                share_id: item.share.id,
+            });
+        }
+        Ok(devices)
+    }
+
+    async fn device_metadata_by_uid(&self, device_uid: &DeviceUid) -> Result<DeviceMetadata> {
+        self.device_metadata()
+            .await?
+            .into_iter()
+            .find(|device| &device.uid == device_uid)
+            .ok_or_else(|| ProtonError::invalid_operation(format!("device {device_uid} not found")))
+    }
+
+    /// Decrypt a device's name: the name of its root folder, which is encrypted
+    /// to the device's own share key. Caches the root-folder key so the device's
+    /// children can be enumerated without re-resolving the share.
+    async fn device_root_folder_name(&self, device: &DeviceMetadata) -> Result<String> {
+        let (share_key, _address_id) = self.share_key_by_id(&device.share_id).await?;
+
+        let uid = &device.root_folder_uid;
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let link = &details
+            .links
+            .first()
+            .ok_or_else(|| {
+                ProtonError::invalid_operation(format!("device root folder {uid} not found"))
+            })?
+            .link;
+
+        let decrypted = decrypt_link(&share_key, link)?;
+        self.cache
+            .lock()
+            .await
+            .folder_keys
+            .insert(uid.clone(), decrypted.node_key);
+        Ok(decrypted.name)
+    }
+
+    /// Fetch a share by id and unlock its key, returning it with the share's
+    /// membership address id. C# `ShareOperations.GetShareAsync`.
+    async fn share_key_by_id(&self, share_id: &ShareId) -> Result<(PrivateKey, AddressId)> {
+        let path = format!("shares/{share_id}");
+        let response: ShareResponse = self.http.get(&path).await?;
+        let key = decrypt_share_key(&self.account, &response.share).await?;
+        Ok((key, response.share.address_id))
+    }
+
+    /// The `AddressKeyID` of an address's primary key (write requests that bind
+    /// material to an address key need it alongside the `AddressID`).
+    async fn address_primary_key_id(&self, address_id: &AddressId) -> Result<AddressKeyId> {
+        self.account
+            .addresses()
+            .await?
+            .into_iter()
+            .find(|address| &address.id == address_id)
+            .map(|address| address.primary_key_id)
+            .ok_or_else(|| ProtonError::invalid_operation("membership address not found"))
+    }
 
     /// Create a fresh-file draft: generate a node key + content key, encrypt the
     /// name/passphrase/content-key-packet to the parent, and POST the draft.
@@ -2625,6 +2918,10 @@ impl ProtonDriveClient {
                 NodeKind::File {
                     media_type: file.media_type.clone(),
                     total_size_on_storage: file.total_size_on_storage,
+                    active_revision_state: file
+                        .active_revision
+                        .as_ref()
+                        .map(|rev| RevisionState::from_raw(rev.state)),
                     claimed_size,
                     claimed_modification_time,
                 }
@@ -2637,6 +2934,8 @@ impl ProtonDriveClient {
             }
         };
 
+        // C# `DtoToMetadataConverter`: the `Sharing` block's presence marks the
+        // node as shared; a `ShareURLID` inside it marks it as publicly shared.
         let node = Node {
             uid: uid.clone(),
             parent_uid,
@@ -2645,6 +2944,11 @@ impl ProtonDriveClient {
             creation_time: link.creation_time,
             modification_time: link.modification_time,
             trashed: link.is_trashed(),
+            is_shared: details.sharing.is_some(),
+            is_shared_publicly: details
+                .sharing
+                .as_ref()
+                .is_some_and(|sharing| sharing.share_url_id.is_some()),
             signature_email: link.signature_email.clone(),
             verification,
         };
@@ -2785,6 +3089,14 @@ fn is_my_files_missing(error: &ProtonError) -> bool {
     )
 }
 
+/// The current Unix epoch, in seconds.
+fn now_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Format a Unix epoch (seconds, UTC) as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`
 /// string for the `ExtendedAttributes.ModificationTime` field. C# writes the
 /// round-trip ("O") format; this drops the fractional-second component, which
@@ -2904,12 +3216,7 @@ fn build_photos_attributes(
     written: &BlockWriteResult,
     metadata: &PhotoUploadMetadata,
 ) -> PhotosAttributesDto {
-    let capture_time = metadata.capture_time.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    });
+    let capture_time = metadata.capture_time.unwrap_or_else(now_epoch_seconds);
     PhotosAttributesDto {
         capture_time,
         content_hash: hex::encode(hmac_sha256(parent_hash_key, written.sha1_hex.as_bytes())),

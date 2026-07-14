@@ -16,7 +16,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$ROOT/sdk"
 PIN_FILE="$ROOT/UPSTREAM_SYNC.md"
-SUBTREE="client/cs/sdk/src"
+# The C# sources moved from client/cs/sdk/src to client/cs/src in the mid-2026
+# projects reorg; watch both so ranges spanning the move stay complete.
+SUBTREE=(client/cs/src client/cs/sdk/src)
 REMOTE_REF="origin/main"
 
 # noise = conventional-commit prefixes that never carry portable behavior
@@ -40,14 +42,22 @@ PIN="$(grep -oE '[0-9a-f]{40}' "$PIN_FILE" | head -1)"
 echo "fetching upstream..." >&2
 git -C "$SDK" fetch --quiet origin
 
+# Upstream force-pushes: a pin whose object is gone would make the log below
+# fail, which used to read as "up to date". Fail loudly instead.
+if ! git -C "$SDK" cat-file -e "${PIN}^{commit}" 2>/dev/null; then
+  echo "error: pinned commit $PIN is not in the upstream history." >&2
+  echo "       upstream rewrote its history; re-pin from a commit date in the log." >&2
+  exit 1
+fi
+
 HEAD_SHA="$(git -C "$SDK" rev-parse --short "$REMOTE_REF")"
 echo "pinned:  ${PIN:0:8}"
 echo "head:    $HEAD_SHA  ($REMOTE_REF)"
-echo "subtree: $SUBTREE"
+echo "subtree: ${SUBTREE[*]}"
 echo
 
 RANGE="$PIN..$REMOTE_REF"
-commits="$(git -C "$SDK" log --oneline --no-decorate "$RANGE" -- "$SUBTREE" || true)"
+commits="$(git -C "$SDK" log --oneline --no-decorate "$RANGE" -- "${SUBTREE[@]}")"
 
 if [ -z "$commits" ]; then
   echo "up to date — no cs commits since pin."
@@ -74,11 +84,11 @@ echo "$relevant"
 
 if $show_diffs; then
   echo
-  echo "=== diffs (scoped to $SUBTREE) ==="
+  echo "=== diffs (scoped to ${SUBTREE[*]}) ==="
   echo "$relevant" | awk '{print $1}' | while read -r sha; do
     echo
     echo "----- $sha -----"
-    git -C "$SDK" show --stat --format="%H%n%an %ci%n%n    %s%n" "$sha" -- "$SUBTREE"
+    git -C "$SDK" show --stat --format="%H%n%an %ci%n%n    %s%n" "$sha" -- "${SUBTREE[@]}"
   done
 fi
 

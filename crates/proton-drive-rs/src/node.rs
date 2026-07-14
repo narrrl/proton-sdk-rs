@@ -17,6 +17,14 @@ pub struct Node {
     /// Last modification time, epoch seconds.
     pub modification_time: i64,
     pub trashed: bool,
+    /// Whether the node is shared at all — with members, by public link, or both
+    /// (C# `Node.IsShared`: the link details carry a `Sharing` block).
+    #[serde(default)]
+    pub is_shared: bool,
+    /// Whether the node is shared by *public link* (C# `Node.IsSharedPublicly`:
+    /// the `Sharing` block carries a `ShareURLID`). Implies [`Node::is_shared`].
+    #[serde(default)]
+    pub is_shared_publicly: bool,
     /// Email address that signed the node, if present.
     pub signature_email: Option<String>,
     /// Per-field signature-verification results gathered while decrypting the
@@ -70,6 +78,27 @@ impl NodeVerification {
     }
 }
 
+/// The state of a file revision. Mirrors C# `Proton.Drive.Sdk.Nodes.RevisionState`
+/// (the wire `ApiRevisionState` also has a `Draft = 0` that never surfaces on a
+/// node's *active* revision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevisionState {
+    Active,
+    Superseded,
+}
+
+impl RevisionState {
+    /// Map the wire `ApiRevisionState`. A link's active revision is Active by
+    /// definition, so an absent/draft state reads as [`RevisionState::Active`]
+    /// (C# `DtoToMetadataConverter` hardcodes it).
+    pub(crate) fn from_raw(value: Option<i32>) -> Self {
+        match value {
+            Some(2) => Self::Superseded,
+            _ => Self::Active,
+        }
+    }
+}
+
 /// Folder- or file-specific node data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -78,6 +107,10 @@ pub enum NodeKind {
         media_type: String,
         /// Total encrypted size on cloud storage, in bytes.
         total_size_on_storage: i64,
+        /// State of the file's active revision (C# `Revision.State`); `None` when
+        /// the file has no active revision (an unsealed draft).
+        #[serde(default)]
+        active_revision_state: Option<RevisionState>,
         /// Authoritative plaintext size from the active revision's decrypted
         /// extended attributes (C# `ClaimedSize`). `None` when the revision has
         /// no `XAttr` or it failed to decrypt.
@@ -182,5 +215,20 @@ impl FileThumbnail {
             file_uid,
             result: Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_state_maps_the_wire_value() {
+        assert_eq!(RevisionState::from_raw(Some(2)), RevisionState::Superseded);
+        assert_eq!(RevisionState::from_raw(Some(1)), RevisionState::Active);
+        // A link's active revision is Active even when the server omits the
+        // state (or still calls it a draft, as it does mid-upload).
+        assert_eq!(RevisionState::from_raw(Some(0)), RevisionState::Active);
+        assert_eq!(RevisionState::from_raw(None), RevisionState::Active);
     }
 }

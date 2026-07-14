@@ -162,6 +162,8 @@ mod tests {
             creation_time: 1,
             modification_time: 2,
             trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
             signature_email: None,
             verification: crate::node::NodeVerification::default(),
         }

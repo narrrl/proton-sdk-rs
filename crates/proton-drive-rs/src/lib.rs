@@ -36,6 +36,7 @@
 mod cache;
 mod client;
 mod crypto;
+mod devices;
 mod dtos;
 mod events;
 mod node;
@@ -43,8 +44,9 @@ mod photos;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
+pub use devices::{Device, DeviceType};
 pub use events::{DriveEvent, DriveEventScopeId};
-pub use node::{Node, NodeKind, Thumbnail, ThumbnailType};
+pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
 pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};

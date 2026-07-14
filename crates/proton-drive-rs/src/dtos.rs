@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use proton_sdk::ids::{AddressId, AddressKeyId, DriveEventId, LinkId, ShareId, VolumeId};
+use proton_sdk::ids::{
+    AddressId, AddressKeyId, DeviceUid, DriveEventId, LinkId, ShareId, ShareMembershipId, VolumeId,
+};
 
 /// `GET v2/shares/my-files`
 #[derive(Debug, Deserialize)]
@@ -105,6 +107,34 @@ pub struct LinkDetailsDto {
     /// photo fields are ignored. C# `linkDetailsDto.File ?? linkDetailsDto.Photo`.
     #[serde(rename = "Photo")]
     pub photo: Option<FileDto>,
+    /// Present when the node is shared (with members and/or via a public link).
+    #[serde(rename = "Sharing", default)]
+    pub sharing: Option<LinkSharingDto>,
+    /// Present when the node is shared *with us*: our membership in the sharer's
+    /// share. Carries the ids needed to leave the share.
+    #[serde(rename = "Membership", default)]
+    pub membership: Option<ShareMembershipSummaryDto>,
+}
+
+/// The sharing state of a node (C# `LinkSharingDto`). Its mere presence means
+/// the node is shared; a `ShareURLID` means it is also shared by public link.
+#[derive(Debug, Deserialize)]
+pub struct LinkSharingDto {
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "ShareURLID", default)]
+    pub share_url_id: Option<String>,
+}
+
+/// Our membership in a share someone else owns (C# `ShareMembershipSummaryDto`).
+#[derive(Debug, Deserialize)]
+pub struct ShareMembershipSummaryDto {
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "MembershipID")]
+    pub membership_id: ShareMembershipId,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: i32,
 }
 
 impl LinkDetailsDto {
@@ -190,6 +220,11 @@ pub struct ActiveRevisionDto {
     pub id: String,
     #[serde(rename = "CreateTime")]
     pub creation_time: i64,
+    /// Wire revision state (C# `ApiRevisionState`): 0 draft, 1 active, 2 obsolete.
+    /// Absent on older responses; a link's active revision is Active by
+    /// definition, which is what C# `DtoToMetadataConverter` records.
+    #[serde(rename = "State", default)]
+    pub state: Option<i32>,
     #[serde(rename = "EncryptedSize")]
     pub encrypted_size: i64,
     /// Email of the revision signer; empty/absent means the node key signed.
@@ -862,4 +897,225 @@ pub struct VolumeEventLinkDto {
     pub is_shared: bool,
     #[serde(rename = "IsTrashed", default)]
     pub is_trashed: bool,
+}
+
+/// `GET shares/{sid}` — a share and the material needed to unlock its key.
+/// C# `ShareResponse`; the share fields sit at the top level of the envelope, so
+/// they are flattened into the same [`ShareDto`] the my-files lookup returns.
+#[derive(Debug, Deserialize)]
+pub struct ShareResponse {
+    #[serde(flatten)]
+    pub share: ShareDto,
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "LinkID")]
+    pub root_link_id: LinkId,
+}
+
+/// `GET v2/sharedwithme` — one page of the items other users share with us.
+/// C# `SharedWithMeResponse`.
+#[derive(Debug, Deserialize)]
+pub struct SharedWithMeResponse {
+    #[serde(rename = "Links", default)]
+    pub links: Vec<SharedWithMeLinkDto>,
+    /// Cursor for the next page.
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<String>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+}
+
+/// One shared-with-me item. C# `SharedWithMeLinkDto`.
+#[derive(Debug, Deserialize)]
+pub struct SharedWithMeLinkDto {
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    /// What kind of item is shared. See [`ShareTargetType`].
+    #[serde(rename = "ShareTargetType", default)]
+    pub share_target_type: i32,
+}
+
+/// The kind of item a share points at. C# `ShareTargetType`.
+///
+/// The Drive client exposes folders, files and vendor items; albums and photos
+/// belong to the Photos client (C# `SharingOperations.DriveShareTargetTypes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ShareTargetType {
+    Root = 0,
+    Folder = 1,
+    File = 2,
+    Album = 3,
+    Photo = 4,
+    ProtonVendor = 5,
+}
+
+impl ShareTargetType {
+    pub fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Root),
+            1 => Some(Self::Folder),
+            2 => Some(Self::File),
+            3 => Some(Self::Album),
+            4 => Some(Self::Photo),
+            5 => Some(Self::ProtonVendor),
+            _ => None,
+        }
+    }
+
+    /// Whether the Drive client (rather than the Photos client) owns this kind.
+    pub fn is_drive_item(self) -> bool {
+        matches!(self, Self::Folder | Self::File | Self::ProtonVendor)
+    }
+}
+
+/// `GET devices` — the account's registered devices. C# `DeviceListResponse`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceListResponse {
+    #[serde(rename = "Devices", default)]
+    pub devices: Vec<DeviceListItemDto>,
+}
+
+/// C# `DeviceListItemDto`: a device and the share holding its root folder.
+#[derive(Debug, Deserialize)]
+pub struct DeviceListItemDto {
+    #[serde(rename = "Device")]
+    pub device: DeviceDataDto,
+    #[serde(rename = "Share")]
+    pub share: DeviceShareDataDto,
+}
+
+/// C# `DeviceDataDto`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceDataDto {
+    #[serde(rename = "DeviceID")]
+    pub id: DeviceUid,
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    /// `DeviceType`: 1 = Windows, 2 = macOS, 3 = Linux.
+    #[serde(rename = "Type")]
+    pub device_type: i32,
+    #[serde(rename = "CreateTime")]
+    pub creation_time: i64,
+    #[serde(rename = "LastSyncTime", default)]
+    pub last_sync_time: Option<i64>,
+}
+
+/// C# `DeviceShareDataDto`. `Name` is the *deprecated* device name: it used to
+/// live on the share and must be cleared when renaming an old device.
+#[derive(Debug, Deserialize)]
+pub struct DeviceShareDataDto {
+    #[serde(rename = "ShareID")]
+    pub id: ShareId,
+    #[serde(rename = "LinkID")]
+    pub root_link_id: LinkId,
+    #[serde(rename = "Name", default)]
+    pub name: Option<String>,
+}
+
+/// `POST devices` — register a device with its own share and root folder.
+/// C# `DeviceCreationRequest`.
+#[derive(Debug, Serialize)]
+pub struct DeviceCreationRequest {
+    #[serde(rename = "Device")]
+    pub device: DeviceCreationDeviceDto,
+    #[serde(rename = "Share")]
+    pub share: DeviceCreationShareDto,
+    #[serde(rename = "Link")]
+    pub link: DeviceCreationLinkDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceCreationDeviceDto {
+    #[serde(rename = "Type")]
+    pub device_type: i32,
+    /// Synchronisation state; 0 (off) when registering a new device.
+    #[serde(rename = "SyncState")]
+    pub sync_state: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceCreationShareDto {
+    #[serde(rename = "AddressID")]
+    pub address_id: AddressId,
+    #[serde(rename = "AddressKeyID")]
+    pub address_key_id: AddressKeyId,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Passphrase")]
+    pub passphrase: String,
+    #[serde(rename = "PassphraseSignature")]
+    pub passphrase_signature: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceCreationLinkDto {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NodeKey")]
+    pub key: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "NodePassphraseSignature")]
+    pub passphrase_signature: String,
+    #[serde(rename = "NodeHashKey")]
+    pub node_hash_key: String,
+}
+
+/// `POST devices` response. C# `DeviceCreationResponse`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceCreationResponse {
+    #[serde(rename = "Device")]
+    pub device: DeviceCreationResultDto,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceCreationResultDto {
+    #[serde(rename = "DeviceID")]
+    pub id: DeviceUid,
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "LinkID")]
+    pub root_link_id: LinkId,
+}
+
+/// `PUT devices/{uid}` — only ever used to clear the deprecated share-held name.
+/// C# `DeviceUpdateRequest`.
+#[derive(Debug, Serialize)]
+pub struct DeviceUpdateRequest {
+    #[serde(rename = "Share")]
+    pub share: DeviceUpdateShareDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceUpdateShareDto {
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_drive_share_targets_are_drive_items() {
+        // C# `SharingOperations.DriveShareTargetTypes`; albums and photos belong
+        // to the Photos client, and a root share is not a shared item.
+        for (raw, expected) in [
+            (0, false),
+            (1, true),
+            (2, true),
+            (3, false),
+            (4, false),
+            (5, true),
+        ] {
+            let kind = ShareTargetType::from_raw(raw).expect("known target type");
+            assert_eq!(kind.is_drive_item(), expected, "target type {raw}");
+        }
+        assert!(ShareTargetType::from_raw(6).is_none());
+    }
 }

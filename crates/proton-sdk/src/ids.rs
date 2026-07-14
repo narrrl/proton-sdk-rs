@@ -86,6 +86,18 @@ string_id!(
     /// Identifies a Drive volume event; doubles as the enumeration cursor.
     DriveEventId
 );
+string_id!(
+    /// Identifies a membership of an address in a Drive share.
+    ShareMembershipId
+);
+string_id!(
+    /// Identifies a Drive device (a synced folder registered by a desktop client).
+    ///
+    /// Opaque and volume-free: the C# `DeviceUid` dropped its volume component
+    /// (upstream `chore: remove volume id from device uid`), so it is a plain id
+    /// rather than a `{volume}~{link}` pair like [`NodeUid`].
+    DeviceUid
+);
 
 /// Globally addresses a Drive node: a [`LinkId`] qualified by its [`VolumeId`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
