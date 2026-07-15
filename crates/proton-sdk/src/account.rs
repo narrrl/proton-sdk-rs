@@ -43,6 +43,31 @@ pub struct Address {
     pub primary_key_id: AddressKeyId,
 }
 
+/// Total account storage usage, in bytes (all Proton products, not Drive-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    /// Total storage available to the account.
+    pub max_space: i64,
+    /// Storage currently used.
+    pub used_space: i64,
+}
+
+impl Quota {
+    /// Bytes still free (never negative).
+    pub fn available(&self) -> i64 {
+        (self.max_space - self.used_space).max(0)
+    }
+
+    /// Fraction of the quota in use, `0.0..=1.0` (0 when `max_space` is 0).
+    pub fn used_fraction(&self) -> f64 {
+        if self.max_space <= 0 {
+            0.0
+        } else {
+            (self.used_space as f64 / self.max_space as f64).clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Resolves account keys needed to decrypt Drive metadata.
 ///
 /// Construction takes the mailbox (data) password because, per Proton's key
@@ -236,6 +261,18 @@ impl AccountClient {
             .public_keys
             .insert(email.to_string(), keys.clone());
         keys
+    }
+
+    /// Total account storage usage (`core/v4/users`).
+    ///
+    /// Account-wide `MaxSpace`/`UsedSpace` across all Proton products, not the
+    /// Drive-only quota. Not cached — reflects live usage on each call.
+    pub async fn quota(&self) -> Result<Quota> {
+        let response: UserResponse = self.inner.http.get("core/v4/users").await?;
+        Ok(Quota {
+            max_space: response.user.max_space,
+            used_space: response.user.used_space,
+        })
     }
 
     /// Decrypted user (account) keys.

@@ -13,8 +13,10 @@ use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
-    ContentKey, VerificationKeyRing, VerificationStatus, build_volume_creation_material,
-    generate_node_hash_key, generate_node_key, generate_node_key_aead, verify_detached,
+    ContentKey, DEFAULT_BIT_LENGTH, VerificationKeyRing, VerificationStatus, accept_invitation,
+    build_standard_share_material, build_volume_creation_material, decrypt_armored_with_keys,
+    derive_key_passphrase, encrypt_external_invitation, encrypt_invitation, generate_node_hash_key,
+    generate_node_key, generate_node_key_aead, generate_verifier, verify_detached,
 };
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
@@ -35,25 +37,35 @@ use crate::crypto::{
 };
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
-    AggregateLinksResponse, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
-    BlockUploadPreparationResponse, BlockVerificationInputResponse, BlockVerifier,
-    CommonExtendedAttributes, DeviceCreationDeviceDto, DeviceCreationLinkDto,
-    DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse,
-    DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes, FileContentDigests,
-    FileCreationRequest, FileCreationResponse, FolderChildrenResponse, FolderCreationRequest,
-    FolderCreationResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
-    LinkDetailsResponse, LinkDto, LinkType, MoveLinkRequest, MoveMultipleLinksItem,
-    MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
+    AcceptInvitationRequest, AggregateLinksResponse, BlockCreationRequest, BlockDto,
+    BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockVerificationInputResponse,
+    BlockVerifier, BookmarkShareUrlDto, BookmarksResponse, CommonExtendedAttributes,
+    CreateBookmarkRequest, CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest,
+    CreateShareResponse, DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest,
+    DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest,
+    DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
+    ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
+    FolderChildrenResponse, FolderCreationRequest, FolderCreationResponse,
+    InvitationDetailsResponse, InvitationsListResponse, InviteEmailDetailsDto,
+    InviteExternalUserRequest, InviteExternalUserResponse, InviteProtonUserInvitationDto,
+    InviteProtonUserRequest, InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto,
+    LinkDetailsRequest, LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
+    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
     RenameLinkRequest, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
-    RevisionResponse, RevisionUpdateRequest, ShareResponse, ShareTargetType, SharedWithMeResponse,
+    RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
+    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlsResponse, SharedWithMeResponse,
     ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
-    TimelinePhotoListResponse, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
-    VolumeTrashResponse,
+    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
+    VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
+use crate::sharing::{
+    Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
+    PublicLink, ShareInvitation, ShareMember,
+};
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
 const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
@@ -207,6 +219,13 @@ impl ProtonDriveClient {
     /// The account client backing this Drive client's key chain.
     pub fn account(&self) -> &AccountClient {
         &self.account
+    }
+
+    /// Total account storage usage (`MaxSpace`/`UsedSpace`), account-wide across
+    /// all Proton products. Convenience passthrough to
+    /// [`AccountClient::quota`](proton_sdk::account::AccountClient::quota).
+    pub async fn quota(&self) -> Result<proton_sdk::account::Quota> {
+        self.account.quota().await
     }
 
     /// Attach a telemetry observer to receive a
@@ -1625,6 +1644,777 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// Share a node with one or more Proton users by email.
+    ///
+    /// Creates a standard share on the node if it is not shared yet, then invites
+    /// each user at the given [`MemberRole`]. Ported from the TypeScript SDK's
+    /// `shareNode` (the C# public SDK has no share-creation surface): the share
+    /// key is generated and bound to the node + owning address, and each invite
+    /// carries the share session key encrypted to the invitee's public key plus a
+    /// context-bound inviter signature over it.
+    ///
+    /// `email_message` is an optional note included in the invitation emails.
+    /// Returns the freshly created invitations. Invitees already invited or
+    /// already members are skipped (this does not update their role).
+    pub async fn share_node(
+        &self,
+        uid: &NodeUid,
+        invitees: &[(String, MemberRole)],
+        email_message: Option<&str>,
+    ) -> Result<Vec<ShareInvitation>> {
+        let mut timer = self.telemetry.start("share_node");
+
+        let (share_id, share_session_key, inviter_email, inviter_key) =
+            self.ensure_node_share(uid).await?;
+
+        // Skip anyone who is already invited or already a member.
+        let existing_invites = self.list_share_invitations_inner(&share_id).await?;
+        let existing_members = self.list_share_members_inner(&share_id).await?;
+        let already: std::collections::HashSet<String> = existing_invites
+            .iter()
+            .map(|i| i.invitee_email.to_lowercase())
+            .chain(existing_members.iter().map(|m| m.email.to_lowercase()))
+            .collect();
+
+        let mut created = Vec::new();
+        for (email, role) in invitees {
+            if already.contains(&email.to_lowercase()) {
+                tracing::info!(%email, "skipping already-invited/member for share");
+                continue;
+            }
+            let permissions = role.to_permissions().ok_or_else(|| {
+                ProtonError::invalid_operation("cannot invite a user with the inherited role")
+            })?;
+
+            let invitee_keys = self.account.public_keys(email).await;
+            let invitee_pubkey = invitee_keys.first().ok_or_else(|| {
+                ProtonError::invalid_operation(format!("no public key for invitee {email}"))
+            })?;
+
+            let (key_packet, key_packet_signature) =
+                encrypt_invitation(&share_session_key, &inviter_key, invitee_pubkey)?;
+
+            let request = InviteProtonUserRequest {
+                invitation: InviteProtonUserInvitationDto {
+                    inviter_email: inviter_email.clone(),
+                    invitee_email: email.clone(),
+                    permissions,
+                    key_packet,
+                    key_packet_signature,
+                    external_invitation_id: None,
+                },
+                email_details: InviteEmailDetailsDto {
+                    message: email_message.map(str::to_string),
+                    item_name: None,
+                },
+            };
+
+            let path = format!("v2/shares/{share_id}/invitations");
+            let response: InviteProtonUserResponse = self.http.post(&path, &request).await?;
+            created.push(invitation_from_dto(&share_id, response.invitation));
+        }
+
+        timer.success();
+        Ok(created)
+    }
+
+    /// List the members (accepted invitations) of the share on a node.
+    ///
+    /// Returns an empty list when the node is not shared.
+    pub async fn list_share_members(&self, uid: &NodeUid) -> Result<Vec<ShareMember>> {
+        let mut timer = self.telemetry.start("list_share_members");
+        let members = match self.node_share_id(uid).await? {
+            Some(share_id) => self.list_share_members_inner(&share_id).await?,
+            None => Vec::new(),
+        };
+        timer.success();
+        Ok(members)
+    }
+
+    /// List the pending Proton-user invitations of the share on a node.
+    ///
+    /// Returns an empty list when the node is not shared.
+    pub async fn list_share_invitations(&self, uid: &NodeUid) -> Result<Vec<ShareInvitation>> {
+        let mut timer = self.telemetry.start("list_share_invitations");
+        let invitations = match self.node_share_id(uid).await? {
+            Some(share_id) => self.list_share_invitations_inner(&share_id).await?,
+            None => Vec::new(),
+        };
+        timer.success();
+        Ok(invitations)
+    }
+
+    /// Change a member's role (`PUT v2/shares/{sid}/members/{mid}`).
+    pub async fn update_member_role(&self, member: &ShareMember, role: MemberRole) -> Result<()> {
+        let permissions = role.to_permissions().ok_or_else(|| {
+            ProtonError::invalid_operation("cannot set a member to the inherited role")
+        })?;
+        let path = format!(
+            "v2/shares/{}/members/{}",
+            member.share_id, member.membership_id
+        );
+        let _: proton_sdk::api::ApiResponse = self
+            .http
+            .put(&path, &UpdatePermissionsRequest { permissions })
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a member from a share, revoking their access
+    /// (`DELETE v2/shares/{sid}/members/{mid}`).
+    pub async fn remove_member(&self, member: &ShareMember) -> Result<()> {
+        self.remove_share_member(&member.share_id, &member.membership_id)
+            .await
+    }
+
+    /// Change a pending invitation's role
+    /// (`PUT v2/shares/{sid}/invitations/{iid}`).
+    pub async fn update_invitation_role(
+        &self,
+        invitation: &ShareInvitation,
+        role: MemberRole,
+    ) -> Result<()> {
+        let permissions = role.to_permissions().ok_or_else(|| {
+            ProtonError::invalid_operation("cannot set an invitation to the inherited role")
+        })?;
+        let path = format!(
+            "v2/shares/{}/invitations/{}",
+            invitation.share_id, invitation.invitation_id
+        );
+        let _: proton_sdk::api::ApiResponse = self
+            .http
+            .put(&path, &UpdatePermissionsRequest { permissions })
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke a pending invitation
+    /// (`DELETE v2/shares/{sid}/invitations/{iid}`).
+    pub async fn delete_invitation(&self, invitation: &ShareInvitation) -> Result<()> {
+        let path = format!(
+            "v2/shares/{}/invitations/{}",
+            invitation.share_id, invitation.invitation_id
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
+    }
+
+    /// Create a public share link on a node, returning the shareable URL.
+    ///
+    /// Ported from the TypeScript SDK's public-link flow: a random 12-character
+    /// link password (optionally suffixed with `custom_password`) protects the
+    /// share. The share session key is wrapped with the SRP-salted passphrase
+    /// (`SharePassphraseKeyPacket`), the password is stored encrypted to the
+    /// owner's address key, and an SRP verifier lets the server authenticate
+    /// visitors without learning the password. `role` must be Viewer or Editor
+    /// (public links cannot grant Admin). `expiration_time` is an optional Unix
+    /// timestamp. The returned [`PublicLink::url`] carries the secret fragment.
+    pub async fn create_public_link(
+        &self,
+        uid: &NodeUid,
+        role: MemberRole,
+        custom_password: Option<&str>,
+        expiration_time: Option<i64>,
+    ) -> Result<PublicLink> {
+        let mut timer = self.telemetry.start("create_public_link");
+
+        let permissions = match role {
+            MemberRole::Viewer | MemberRole::Editor => role.to_permissions().unwrap(),
+            _ => {
+                return Err(ProtonError::invalid_operation(
+                    "a public link can only grant the Viewer or Editor role",
+                ));
+            }
+        };
+
+        let (share_id, share_session_key, creator_email, address_key) =
+            self.ensure_node_share(uid).await?;
+
+        // The URL fragment is the generated password; the encryption password is
+        // the generated password with any custom password appended.
+        let generated = generate_public_link_password();
+        let full_password = match custom_password {
+            Some(custom) if !custom.is_empty() => format!("{generated}{custom}"),
+            _ => generated.clone(),
+        };
+
+        // Wrap the share session key with the SRP-salted passphrase, and store the
+        // password encrypted to the owner's address key.
+        let key_salt = generate_key_salt();
+        let salted_passphrase = derive_key_passphrase(full_password.as_bytes(), &key_salt)?;
+        let share_passphrase_key_packet =
+            base64_encode(share_session_key.encrypt_with_password(&salted_passphrase)?);
+        let armored_password = address_key.encrypt(full_password.as_bytes())?;
+
+        // SRP verifier over the link password, against a fresh signed modulus.
+        let modulus = self.fetch_srp_modulus().await?;
+        let verifier = generate_verifier(
+            full_password.as_bytes(),
+            &modulus.modulus,
+            DEFAULT_BIT_LENGTH,
+        )?;
+
+        let flags = if custom_password.map(|p| !p.is_empty()).unwrap_or(false) {
+            3 // random + custom password
+        } else {
+            2 // random password only
+        };
+
+        let request = CreatePublicLinkRequest {
+            creator_email,
+            permissions,
+            flags,
+            expiration_time,
+            share_password_salt: base64_encode(key_salt),
+            share_passphrase_key_packet,
+            password: armored_password,
+            url_password_salt: verifier.salt,
+            srp_verifier: verifier.verifier,
+            srp_modulus_id: modulus.modulus_id,
+            max_accesses: 0,
+        };
+
+        let path = format!("shares/{share_id}/urls");
+        let response: CreatePublicLinkResponse = self.http.post(&path, &request).await?;
+
+        timer.success();
+        Ok(PublicLink {
+            share_id,
+            public_link_id: response.share_url.share_url_id,
+            url: Some(format!("{}#{generated}", response.share_url.public_url)),
+            role,
+            creation_time: now_epoch_seconds(),
+            expiration_time,
+            has_custom_password: flags == 3,
+        })
+    }
+
+    /// The public link on a node, if one exists (metadata only — the secret URL
+    /// fragment is not reconstructed).
+    pub async fn get_public_link(&self, uid: &NodeUid) -> Result<Option<PublicLink>> {
+        let mut timer = self.telemetry.start("get_public_link");
+        let link = match self.node_share_id(uid).await? {
+            Some(share_id) => {
+                let path = format!("shares/{share_id}/urls");
+                let response: ShareUrlsResponse = self.http.get(&path).await?;
+                response
+                    .share_urls
+                    .into_iter()
+                    .next()
+                    .map(|dto| PublicLink {
+                        share_id,
+                        public_link_id: dto.share_url_id,
+                        url: None,
+                        role: MemberRole::from_permissions(dto.permissions),
+                        creation_time: dto.create_time,
+                        expiration_time: dto.expiration_time,
+                        has_custom_password: dto.flags == 3,
+                    })
+            }
+            None => None,
+        };
+        timer.success();
+        Ok(link)
+    }
+
+    /// Remove a public link, revoking access via the URL
+    /// (`DELETE shares/{sid}/urls/{urlID}`).
+    pub async fn remove_public_link(&self, link: &PublicLink) -> Result<()> {
+        let path = format!("shares/{}/urls/{}", link.share_id, link.public_link_id);
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
+    }
+
+    /// List invitations addressed to the current user (shared *with* me),
+    /// pending accept or reject.
+    ///
+    /// Pages `GET v2/shares/invitations`, then fetches and decrypts each
+    /// invitation's detail so the caller has the shared item's name. A single
+    /// invitation that fails to load is logged and skipped rather than failing
+    /// the whole listing. Mirrors JS `iterateInvitations`.
+    pub async fn list_incoming_invitations(&self) -> Result<Vec<IncomingInvitation>> {
+        let mut timer = self.telemetry.start("list_incoming_invitations");
+        let mut ids = Vec::new();
+        let mut anchor: Option<String> = None;
+        loop {
+            let path = match &anchor {
+                Some(a) => format!("v2/shares/invitations?AnchorID={a}"),
+                None => "v2/shares/invitations".to_string(),
+            };
+            let page: InvitationsListResponse = self.http.get(&path).await?;
+            for item in page.invitations {
+                ids.push(item.invitation_id);
+            }
+            anchor = page.anchor_id.filter(|a| !a.is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+
+        let mut invitations = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.incoming_invitation_detail(&id).await {
+                Ok(inv) => invitations.push(inv),
+                Err(e) => tracing::warn!(invitation = %id, "failed to load invitation: {e}"),
+            }
+        }
+        timer.success();
+        Ok(invitations)
+    }
+
+    /// Accept an invitation addressed to us, gaining access to the shared node.
+    ///
+    /// Fetches the invitation, decrypts its key packet with our address keys to
+    /// recover the share session key, signs the key under the member context, and
+    /// posts the signature. Mirrors JS `acceptInvitation`.
+    pub async fn accept_invitation(&self, invitation_id: &str) -> Result<()> {
+        let mut timer = self.telemetry.start("accept_invitation");
+        let detail = self.get_incoming_invitation(invitation_id).await?;
+
+        let (keys, signing_key) = self
+            .own_address_keys(&detail.invitation.invitee_email)
+            .await?;
+        let signature = accept_invitation(&detail.invitation.key_packet, &keys, &signing_key)?;
+
+        let path = format!("v2/shares/invitations/{invitation_id}/accept");
+        let _: proton_sdk::api::ApiResponse = self
+            .http
+            .post(
+                &path,
+                &AcceptInvitationRequest {
+                    session_key_signature: signature,
+                },
+            )
+            .await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Reject an invitation addressed to us, declining access.
+    pub async fn reject_invitation(&self, invitation_id: &str) -> Result<()> {
+        let path = format!("v2/shares/invitations/{invitation_id}/reject");
+        let _: proton_sdk::api::ApiResponse = self.http.post(&path, &serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Invite a mixed set of email addresses to a node's share, routing each to
+    /// the right flow: addresses that resolve to a Proton account get a normal
+    /// (encrypted-key-packet) invitation via [`share_node`](Self::share_node);
+    /// the rest get an [external invitation](Self::invite_external_users). Returns
+    /// `(proton_invited, external_invited)` counts. Already-invited or existing
+    /// members are skipped by the underlying calls.
+    pub async fn invite_users(
+        &self,
+        uid: &NodeUid,
+        invitees: &[(String, MemberRole)],
+        email_message: Option<&str>,
+    ) -> Result<(usize, usize)> {
+        let mut proton: Vec<(String, MemberRole)> = Vec::new();
+        let mut external: Vec<(String, MemberRole)> = Vec::new();
+        for (email, role) in invitees {
+            // A Proton account exposes at least one public key; an address with
+            // none is external and cannot receive an encrypted key packet.
+            if self.account.public_keys(email).await.is_empty() {
+                external.push((email.clone(), *role));
+            } else {
+                proton.push((email.clone(), *role));
+            }
+        }
+
+        let proton_invited = if proton.is_empty() {
+            0
+        } else {
+            self.share_node(uid, &proton, email_message).await?.len()
+        };
+        let external_invited = if external.is_empty() {
+            0
+        } else {
+            self.invite_external_users(uid, &external, email_message)
+                .await?
+                .len()
+        };
+        Ok((proton_invited, external_invited))
+    }
+
+    /// Invite non-Proton (external) email addresses to a node's share.
+    ///
+    /// The invitees have no Proton keys, so each gets an external invitation: the
+    /// inviter signs `"{email}|{base64(share session key)}"` under the external
+    /// context. When an invitee later signs up, the server converts the pending
+    /// invitation to a normal membership. Skips anyone already invited (Proton or
+    /// external) or already a member. Returns the freshly created invitations.
+    pub async fn invite_external_users(
+        &self,
+        uid: &NodeUid,
+        invitees: &[(String, MemberRole)],
+        email_message: Option<&str>,
+    ) -> Result<Vec<ExternalInvitation>> {
+        let mut timer = self.telemetry.start("invite_external_users");
+
+        let (share_id, share_session_key, _inviter_email, inviter_key) =
+            self.ensure_node_share(uid).await?;
+        let (address_id, _, _) = self.membership_address().await?;
+
+        let already: std::collections::HashSet<String> = self
+            .list_external_invitations_inner(&share_id)
+            .await?
+            .iter()
+            .map(|i| i.invitee_email.to_lowercase())
+            .chain(
+                self.list_share_invitations_inner(&share_id)
+                    .await?
+                    .iter()
+                    .map(|i| i.invitee_email.to_lowercase()),
+            )
+            .chain(
+                self.list_share_members_inner(&share_id)
+                    .await?
+                    .iter()
+                    .map(|m| m.email.to_lowercase()),
+            )
+            .collect();
+
+        let mut created = Vec::new();
+        for (email, role) in invitees {
+            if already.contains(&email.to_lowercase()) {
+                tracing::info!(%email, "skipping already-invited/member for external share");
+                continue;
+            }
+            let permissions = role.to_permissions().ok_or_else(|| {
+                ProtonError::invalid_operation("cannot invite a user with the inherited role")
+            })?;
+            let signature = encrypt_external_invitation(&share_session_key, &inviter_key, email)?;
+
+            let request = InviteExternalUserRequest {
+                external_invitation: ExternalInvitationDto {
+                    inviter_address_id: address_id.clone(),
+                    invitee_email: email.clone(),
+                    permissions,
+                    external_invitation_signature: signature,
+                },
+                email_details: InviteEmailDetailsDto {
+                    message: email_message.map(str::to_string),
+                    item_name: None,
+                },
+            };
+            let path = format!("v2/shares/{share_id}/external-invitations");
+            let response: InviteExternalUserResponse = self.http.post(&path, &request).await?;
+            created.push(external_invitation_from_dto(
+                &share_id,
+                response.external_invitation,
+            ));
+        }
+
+        timer.success();
+        Ok(created)
+    }
+
+    /// List the pending external (non-Proton) invitations on a node's share.
+    /// Returns an empty list when the node is not shared.
+    pub async fn list_external_invitations(
+        &self,
+        uid: &NodeUid,
+    ) -> Result<Vec<ExternalInvitation>> {
+        let mut timer = self.telemetry.start("list_external_invitations");
+        let invitations = match self.node_share_id(uid).await? {
+            Some(share_id) => self.list_external_invitations_inner(&share_id).await?,
+            None => Vec::new(),
+        };
+        timer.success();
+        Ok(invitations)
+    }
+
+    /// Revoke a pending external invitation
+    /// (`DELETE v2/shares/{sid}/external-invitations/{iid}`).
+    pub async fn delete_external_invitation(&self, invitation: &ExternalInvitation) -> Result<()> {
+        let path = format!(
+            "v2/shares/{}/external-invitations/{}",
+            invitation.share_id, invitation.invitation_id
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
+    }
+
+    // ---- bookmarks ---------------------------------------------------------
+
+    /// List the public links the user has saved to their account
+    /// (`GET v2/shared-bookmarks`). The URL is always recovered; the item name is
+    /// only present when the SRP-derived share key could be decrypted (not yet).
+    pub async fn list_bookmarks(&self) -> Result<Vec<Bookmark>> {
+        let mut timer = self.telemetry.start("list_bookmarks");
+        let response: BookmarksResponse = self.http.get("v2/shared-bookmarks").await?;
+
+        // Bookmark URL passwords are encrypted to our My Files share address key.
+        let (_, email, _) = self.membership_address().await?;
+        let (address_keys, _) = self.own_address_keys(&email).await?;
+
+        let mut bookmarks = Vec::with_capacity(response.bookmarks.len());
+        for dto in response.bookmarks {
+            let Some(enc) = dto.encrypted_url_password.as_deref() else {
+                continue;
+            };
+            let Ok(bytes) = decrypt_armored_with_keys(enc, &address_keys) else {
+                continue;
+            };
+            // The stored secret is the URL password with any custom password
+            // appended; the URL only needs the leading generated portion, but the
+            // API does not tell us the split, so the fragment is the whole string.
+            let url_password = String::from_utf8_lossy(&bytes).into_owned();
+
+            bookmarks.push(Bookmark {
+                url: format!(
+                    "https://drive.proton.me/urls/{}#{url_password}",
+                    dto.token.token
+                ),
+                token: dto.token.token,
+                // Name decryption needs the SRP-derived share key, not yet ported;
+                // the URL is enough to open the link.
+                node_name: None,
+                is_folder: dto.token.link_type == 1,
+                creation_time: dto.create_time,
+            });
+        }
+        timer.success();
+        Ok(bookmarks)
+    }
+
+    /// Save a public link to the account as a bookmark
+    /// (`POST v2/urls/{token}/bookmark`). `url` is the full public URL including
+    /// the `#password` fragment; `custom_password` is required only when the link
+    /// is additionally password-protected.
+    pub async fn create_bookmark(&self, url: &str, custom_password: Option<&str>) -> Result<()> {
+        let mut timer = self.telemetry.start("create_bookmark");
+        let (token, url_password) = parse_public_link_url(url)?;
+
+        let (address_id, email, _) = self.membership_address().await?;
+        let (_, address_key) = self.own_address_keys(&email).await?;
+        let address_key_id = self.address_primary_key_id(&address_id).await?;
+
+        // The stored secret is the URL password concatenated with any custom
+        // password, encrypted + signed to our own address key.
+        let concatenated = format!("{url_password}{}", custom_password.unwrap_or(""));
+        let encrypted_url_password =
+            address_key.encrypt_and_sign(&address_key, concatenated.as_bytes(), false, false)?;
+
+        let request = CreateBookmarkRequest {
+            bookmark_share_url: BookmarkShareUrlDto {
+                encrypted_url_password,
+                address_id,
+                address_key_id,
+            },
+        };
+        let path = format!("v2/urls/{token}/bookmark");
+        let _: proton_sdk::api::ApiResponse = self.http.post(&path, &request).await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Remove a saved bookmark (`DELETE v2/urls/{token}/bookmark`).
+    pub async fn delete_bookmark(&self, token: &str) -> Result<()> {
+        let path = format!("v2/urls/{token}/bookmark");
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
+    }
+
+    // ---- sharing internals -------------------------------------------------
+
+    /// Fetch a single incoming invitation's encrypted detail by id.
+    async fn get_incoming_invitation(
+        &self,
+        invitation_id: &str,
+    ) -> Result<InvitationDetailsResponse> {
+        let path = format!("v2/shares/invitations/{invitation_id}");
+        self.http.get(&path).await
+    }
+
+    /// Fetch and decrypt a single incoming invitation into its public form.
+    async fn incoming_invitation_detail(&self, invitation_id: &str) -> Result<IncomingInvitation> {
+        let detail = self.get_incoming_invitation(invitation_id).await?;
+        let node_uid = NodeUid::new(
+            VolumeId::from(detail.share.volume_id.clone()),
+            LinkId::from(detail.link.link_id.clone()),
+        );
+        let node_name = self.decrypt_invitation_name(&detail).await;
+
+        Ok(IncomingInvitation {
+            invitation_id: detail.invitation.invitation_id,
+            inviter_email: detail.invitation.inviter_email,
+            invitee_email: detail.invitation.invitee_email,
+            role: MemberRole::from_permissions(detail.invitation.permissions),
+            invitation_time: detail.invitation.create_time,
+            node_uid,
+            node_name,
+            is_folder: detail.link.link_type == 1,
+        })
+    }
+
+    /// Decrypt the shared item's name from an invitation, using the invitee's own
+    /// keys to unlock the share key. A failure yields `None` — the invitation is
+    /// still actionable (accept/reject) without a readable name.
+    async fn decrypt_invitation_name(&self, detail: &InvitationDetailsResponse) -> Option<String> {
+        let (keys, _) = self
+            .own_address_keys(&detail.invitation.invitee_email)
+            .await
+            .ok()?;
+        let passphrase = keys
+            .iter()
+            .find_map(|k| k.decrypt_armored_message(&detail.share.passphrase).ok())?;
+        let share_key = PrivateKey::from_armored(&detail.share.share_key, &passphrase).ok()?;
+        let name_bytes = share_key.decrypt_armored_message(&detail.link.name).ok()?;
+        String::from_utf8(name_bytes).ok()
+    }
+
+    /// The current user's own address keys for `email`: all its private keys (for
+    /// decryption) and the primary signing key.
+    async fn own_address_keys(&self, email: &str) -> Result<(Vec<PrivateKey>, PrivateKey)> {
+        let email_lc = email.to_lowercase();
+        let address = self
+            .account
+            .addresses()
+            .await?
+            .into_iter()
+            .find(|a| a.email.to_lowercase() == email_lc)
+            .ok_or_else(|| ProtonError::invalid_operation(format!("no own address for {email}")))?;
+        let keys = self.account.address_private_keys(&address.id).await?;
+        let signing_key = keys
+            .get(address.primary_key_index)
+            .cloned()
+            .ok_or_else(|| ProtonError::invalid_operation("address has no primary key"))?;
+        Ok((keys, signing_key))
+    }
+
+    async fn list_external_invitations_inner(
+        &self,
+        share_id: &ShareId,
+    ) -> Result<Vec<ExternalInvitation>> {
+        let path = format!("v2/shares/{share_id}/external-invitations");
+        let response: ExternalInvitationsResponse = self.http.get(&path).await?;
+        Ok(response
+            .external_invitations
+            .into_iter()
+            .map(|i| external_invitation_from_dto(share_id, i))
+            .collect())
+    }
+
+    /// Fetch a fresh signed SRP modulus (`GET auth/v4/modulus`, root route).
+    async fn fetch_srp_modulus(&self) -> Result<ModulusResponse> {
+        // The modulus endpoint lives at the API root, not under `drive/`, and is
+        // a GET (the server rejects POST with 405 "Allow: GET").
+        let root = self.http.with_base_route("");
+        root.get("auth/v4/modulus").await
+    }
+
+    /// The id of the standard share on a node, if it is shared.
+    async fn node_share_id(&self, uid: &NodeUid) -> Result<Option<ShareId>> {
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        Ok(details
+            .links
+            .into_iter()
+            .find(|detail| detail.link.id == uid.link_id)
+            .and_then(|detail| detail.sharing)
+            .map(|sharing| sharing.share_id))
+    }
+
+    /// Get-or-create the standard share on a node, returning its id, passphrase
+    /// session key (for inviting), and the owning address's email + signing key.
+    async fn ensure_node_share(
+        &self,
+        uid: &NodeUid,
+    ) -> Result<(ShareId, ContentKey, String, PrivateKey)> {
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let detail = details
+            .links
+            .into_iter()
+            .find(|detail| detail.link.id == uid.link_id)
+            .ok_or_else(|| ProtonError::invalid_operation("node not found"))?;
+        let link = &detail.link;
+
+        let parent_key = self.resolve_parent_key(&uid.volume_id, link).await?;
+        let node_key = decrypt_link(&parent_key, link)?.node_key;
+
+        let (address_id, inviter_email, address_key) = self.membership_address().await?;
+
+        if let Some(sharing) = detail.sharing {
+            // Already shared: recover the existing share's passphrase session key
+            // (the passphrase is encrypted to the node key) so we can invite.
+            let path = format!("shares/{}", sharing.share_id);
+            let response: ShareResponse = self.http.get(&path).await?;
+            let share_session_key =
+                node_key.recover_message_session_key(&response.share.passphrase)?;
+            return Ok((
+                sharing.share_id,
+                share_session_key,
+                inviter_email,
+                address_key,
+            ));
+        }
+
+        // Not shared yet: lift the node's passphrase + name session keys, build a
+        // fresh share bound to the node + owning address, and create it.
+        let node_passphrase_sk = parent_key.recover_message_session_key(&link.passphrase)?;
+        let node_name_sk = parent_key.recover_message_session_key(&link.name)?;
+        let material = build_standard_share_material(
+            &node_key,
+            &node_passphrase_sk,
+            &node_name_sk,
+            &address_key,
+        )?;
+
+        let request = CreateShareRequest {
+            root_link_id: uid.link_id.clone(),
+            address_id,
+            name: "New Share".to_string(),
+            share_key: material.share_key_armored,
+            share_passphrase: material.share_passphrase,
+            share_passphrase_signature: material.share_passphrase_signature,
+            passphrase_key_packet: material.passphrase_key_packet,
+            name_key_packet: material.name_key_packet,
+        };
+        let path = format!("volumes/{}/shares", uid.volume_id);
+        let response: CreateShareResponse = self.http.post(&path, &request).await?;
+
+        Ok((
+            response.share.id,
+            material.share_session_key,
+            inviter_email,
+            address_key,
+        ))
+    }
+
+    async fn list_share_members_inner(&self, share_id: &ShareId) -> Result<Vec<ShareMember>> {
+        let path = format!("v2/shares/{share_id}/members");
+        let response: ShareMembersResponse = self.http.get(&path).await?;
+        Ok(response
+            .members
+            .into_iter()
+            .map(|m| ShareMember {
+                share_id: share_id.clone(),
+                membership_id: m.member_id,
+                email: m.email,
+                added_by_email: m.inviter_email,
+                role: MemberRole::from_permissions(m.permissions),
+                invitation_time: m.create_time,
+            })
+            .collect())
+    }
+
+    async fn list_share_invitations_inner(
+        &self,
+        share_id: &ShareId,
+    ) -> Result<Vec<ShareInvitation>> {
+        let path = format!("v2/shares/{share_id}/invitations");
+        let response: ShareInvitationsResponse = self.http.get(&path).await?;
+        Ok(response
+            .invitations
+            .into_iter()
+            .map(|i| invitation_from_dto(share_id, i))
+            .collect())
+    }
+
     /// The account's registered devices, with their root-folder names decrypted.
     ///
     /// Mirrors C# `DeviceOperations.EnumerateDevicesAsync` (`GET devices` then
@@ -1731,8 +2521,28 @@ impl ProtonDriveClient {
             .resolve_membership_address(membership_address_id)
             .await?;
 
+        // Proton's rename endpoint keeps the link's existing name *key packet* and
+        // replaces only the *data packet*, so the new name must be encrypted under
+        // the **same** session key as the current name (otherwise the retained key
+        // packet no longer decrypts the data packet). Recover that session key from
+        // the current root-folder name and reuse it. Mirrors C#
+        // `DeviceOperations.RenameRootFolderAsync` (`GetNodeMetadata` →
+        // `NameSessionKey` → `DeviceCrypto.GetRenameRequest`).
+        let uid = &device.root_folder_uid;
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let current_name = details
+            .links
+            .into_iter()
+            .find(|detail| detail.link.id == uid.link_id)
+            .map(|detail| detail.link.name)
+            .ok_or_else(|| {
+                ProtonError::invalid_operation(format!("device root folder {uid} not found"))
+            })?;
+        let name_session_key = share_key.recover_message_session_key(&current_name)?;
         let encrypted_name =
-            share_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
+            name_session_key.encrypt_and_sign_text_to(&share_key, &signing_key, name.as_bytes())?;
         let request = RenameLinkRequest {
             name: encrypted_name,
             name_hash: String::new(),
@@ -3087,6 +3897,80 @@ fn is_my_files_missing(error: &ProtonError) -> bool {
         ProtonError::Api(e)
             if e.code == proton_sdk::api::ResponseCode::DoesNotExist || e.http_status == 404
     )
+}
+
+/// base64-encode bytes with the standard alphabet.
+fn base64_encode(bytes: impl AsRef<[u8]>) -> String {
+    BASE64.encode(bytes)
+}
+
+/// The alphabet for generated public-link passwords (JS `generatePublicLinkPassword`).
+const PUBLIC_LINK_PASSWORD_CHARSET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// Generated public-link password length (JS `PUBLIC_LINK_GENERATED_PASSWORD_LENGTH`).
+const PUBLIC_LINK_PASSWORD_LEN: usize = 12;
+
+/// Generate a random 12-character alphanumeric public-link password.
+fn generate_public_link_password() -> String {
+    let mut raw = [0u8; PUBLIC_LINK_PASSWORD_LEN];
+    getrandom::fill(&mut raw).expect("system RNG");
+    raw.iter()
+        .map(|b| {
+            PUBLIC_LINK_PASSWORD_CHARSET[*b as usize % PUBLIC_LINK_PASSWORD_CHARSET.len()] as char
+        })
+        .collect()
+}
+
+/// Generate a fresh 16-byte key salt (Proton `generateKeySalt`).
+fn generate_key_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    getrandom::fill(&mut salt).expect("system RNG");
+    salt
+}
+
+/// Build a [`ShareInvitation`] model from its wire DTO.
+fn invitation_from_dto(share_id: &ShareId, dto: ShareInvitationDto) -> ShareInvitation {
+    ShareInvitation {
+        share_id: share_id.clone(),
+        invitation_id: dto.invitation_id,
+        invitee_email: dto.invitee_email,
+        inviter_email: dto.inviter_email,
+        role: MemberRole::from_permissions(dto.permissions),
+        invitation_time: dto.create_time,
+    }
+}
+
+fn external_invitation_from_dto(
+    share_id: &ShareId,
+    dto: ExternalInvitationResponseDto,
+) -> ExternalInvitation {
+    ExternalInvitation {
+        share_id: share_id.clone(),
+        invitation_id: dto.external_invitation_id,
+        invitee_email: dto.invitee_email,
+        inviter_email: dto.inviter_email,
+        role: MemberRole::from_permissions(dto.permissions),
+        invitation_time: dto.create_time,
+        state: ExternalInvitationState::from_raw(dto.state),
+    }
+}
+
+/// Split a public-link URL (`https://drive.proton.me/urls/{token}#{password}`)
+/// into its token and password. Mirrors JS `getTokenAndPasswordFromUrl`: the
+/// token is the last path segment, the password the fragment after `#`.
+fn parse_public_link_url(url: &str) -> Result<(String, String)> {
+    let invalid = || ProtonError::invalid_operation("invalid public link url");
+    let (before_hash, password) = url.split_once('#').ok_or_else(invalid)?;
+    let token = before_hash
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(invalid)?;
+    if password.is_empty() {
+        return Err(invalid());
+    }
+    Ok((token.to_string(), password.to_string()))
 }
 
 /// The current Unix epoch, in seconds.

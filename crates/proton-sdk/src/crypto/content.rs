@@ -15,13 +15,16 @@ use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{
     LiteralData, Packet, PacketParser, PacketTrait, PublicKeyEncryptedSessionKey,
-    SymEncryptedProtectedData,
+    SymEncryptedProtectedData, SymKeyEncryptedSessionKey,
 };
-use pgp::types::{DecryptionKey, EncryptionKey, EskType, PkeskVersion, Seipdv1ReadMode};
+use pgp::types::{
+    DecryptionKey, EncryptionKey, EskType, Password, PkeskVersion, Seipdv1ReadMode, StringToKey,
+};
 
-use super::encrypt::{RecipientOp, recipient_encryption_key};
+use super::encrypt::{RecipientOp, recipient_encryption_key, recipient_encryption_key_public};
 use super::errors::CryptoError;
 use super::keys::PrivateKey;
+use super::verify::PublicKey;
 
 /// The AEAD algorithm Proton uses for SEIPDv2 content blocks: AES-256-GCM.
 /// Encrypted v6 session keys carry no algorithm info, so it is fixed here (the
@@ -47,7 +50,7 @@ impl ContentKey {
     ///
     /// Mirrors C# `PgpSessionKey.Generate()`.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let sym_alg = SymmetricKeyAlgorithm::AES256;
         let key = sym_alg.new_session_key(&mut rng);
         ContentKey {
@@ -61,7 +64,7 @@ impl ContentKey {
     /// content key packet as a v6 PKESK. Mirrors C#
     /// `PgpSessionKey.GenerateForAead()`.
     pub fn generate_aead() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let key = SymmetricKeyAlgorithm::AES256.new_session_key(&mut rng);
         ContentKey {
             session_key: PlainSessionKey::V6 { key },
@@ -106,7 +109,7 @@ impl ContentKey {
         signer: &PrivateKey,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
 
         // Build a signed (but unencrypted) message: one-pass signature, literal
         // data, then the signature packet. `seipd_*` would generate its own
@@ -131,7 +134,7 @@ impl ContentKey {
     /// [`encrypt_thumbnail`](Self::encrypt_thumbnail).
     fn seal_seipd(&self, inner: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let (sym_alg, key) = self.session_parts()?;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
 
         let seipd = if self.is_aead() {
             SymEncryptedProtectedData::encrypt_seipdv2(
@@ -172,6 +175,146 @@ impl ContentKey {
         packet
             .to_writer_with_header(&mut out)
             .map_err(|e| CryptoError::Encrypt(format!("serialize content key packet: {e}")))?;
+        Ok(out)
+    }
+
+    /// Encrypt this session key to a recipient **public** key as a PKESK.
+    ///
+    /// Used for the sharing invitation `KeyPacket`: the share's passphrase
+    /// session key delivered to an invitee whose public key we resolved via
+    /// `core/v4/keys/all`. Mirrors JS `encryptSessionKey(shareSessionKey,
+    /// inviteePublicKey)`.
+    pub fn to_packet_for_public(&self, pubkey: &PublicKey) -> Result<Vec<u8>, CryptoError> {
+        let (sym_alg, key) = self.session_parts()?;
+
+        let packet = if self.is_aead() {
+            recipient_encryption_key_public(pubkey.signed(), ContentKeyPacketV6Op { key })?
+        } else {
+            recipient_encryption_key_public(pubkey.signed(), ContentKeyPacketOp { sym_alg, key })?
+        };
+
+        let mut out = Vec::new();
+        packet
+            .to_writer_with_header(&mut out)
+            .map_err(|e| CryptoError::Encrypt(format!("serialize session key packet: {e}")))?;
+        Ok(out)
+    }
+
+    /// Encrypt `data` to one or more recipient keys under this session key,
+    /// returning an armored PGP message: a PKESK per recipient followed by the
+    /// SEIPD body. No inline signature — Proton signs share/node passphrases with
+    /// a *detached* signature carried separately.
+    ///
+    /// Used to build a standard share's `SharePassphrase`, which must be
+    /// decryptable by both the node key and the owning address key (JS
+    /// `generateKey([nodeKey, addressKey], addressKey)`), while keeping this
+    /// session key so it can later be handed to invitees.
+    pub fn encrypt_message_to(
+        &self,
+        recipients: &[&PrivateKey],
+        data: &[u8],
+    ) -> Result<String, CryptoError> {
+        if recipients.is_empty() {
+            return Err(CryptoError::Encrypt(
+                "encrypt_message_to needs at least one recipient".into(),
+            ));
+        }
+
+        let mut message = Vec::new();
+        for recipient in recipients {
+            message.extend_from_slice(&self.to_packet(recipient)?);
+        }
+        message.extend_from_slice(&self.encrypt_block(data)?);
+
+        let mut out = Vec::new();
+        pgp::armor::write(
+            &RawPackets(&message),
+            pgp::armor::BlockType::Message,
+            &mut out,
+            None,
+            true,
+        )
+        .map_err(|e| CryptoError::Encrypt(format!("armor message: {e}")))?;
+        String::from_utf8(out)
+            .map_err(|e| CryptoError::Encrypt(format!("armored message is not utf8: {e}")))
+    }
+
+    /// Encrypt and inline-sign `data` as **text** under *this* session key,
+    /// wrapped to `recipient`, returning an armored PGP message (PKESK + SEIPD).
+    ///
+    /// Unlike [`PrivateKey::encrypt_and_sign`](crate::crypto::PrivateKey::encrypt_and_sign),
+    /// which mints a fresh session key, this reuses the session key already held
+    /// here. Renaming a device's root folder needs exactly this: Proton's rename
+    /// endpoint keeps the link's existing name *key packet* and replaces only the
+    /// *data packet*, so the new name text must be encrypted under the **same**
+    /// session key as the current name — otherwise the retained key packet can no
+    /// longer decrypt the data packet (MDC failure). Mirrors C#
+    /// `DeviceCrypto.GetRenameRequest` /
+    /// `PgpEncrypter.EncryptAndSignText(name, EncryptionSecrets(shareKey, nameSessionKey), signingKey)`,
+    /// where `nameSessionKey` is recovered from the current name via
+    /// [`PrivateKey::recover_message_session_key`](crate::crypto::PrivateKey::recover_message_session_key).
+    pub fn encrypt_and_sign_text_to(
+        &self,
+        recipient: &PrivateKey,
+        signer: &PrivateKey,
+        data: &[u8],
+    ) -> Result<String, CryptoError> {
+        let mut rng = rand_08::thread_rng();
+
+        // Build a signed (but unencrypted) *text* message — one-pass signature,
+        // text literal, then the signature packet — then seal it under this
+        // session key (as [`encrypt_thumbnail`](Self::encrypt_thumbnail) does).
+        let mut builder = MessageBuilder::from_bytes(bytes::Bytes::new(), data.to_vec());
+        builder.sign_text();
+        builder.sign(
+            &signer.key().primary_key,
+            signer.password(),
+            HashAlgorithm::Sha256,
+        );
+        let inner = builder
+            .to_vec(&mut rng)
+            .map_err(|e| CryptoError::Encrypt(format!("sign name: {e}")))?;
+
+        let mut message = self.to_packet(recipient)?;
+        message.extend_from_slice(&self.seal_seipd(&inner)?);
+
+        let mut out = Vec::new();
+        pgp::armor::write(
+            &RawPackets(&message),
+            pgp::armor::BlockType::Message,
+            &mut out,
+            None,
+            true,
+        )
+        .map_err(|e| CryptoError::Encrypt(format!("armor message: {e}")))?;
+        String::from_utf8(out)
+            .map_err(|e| CryptoError::Encrypt(format!("armored message is not utf8: {e}")))
+    }
+
+    /// Encrypt this session key **symmetrically** under a password as a v4 SKESK
+    /// packet, returning the raw packet bytes.
+    ///
+    /// Used for a public share link's `SharePassphraseKeyPacket`: the share
+    /// session key wrapped with the SRP-salted passphrase so anyone with the link
+    /// password can open it. The S2K (salt + iteration count) travels inside the
+    /// packet, so the recipient re-derives the key from the same password. Mirrors
+    /// JS `encryptSessionKeyWithPassword`.
+    pub fn encrypt_with_password(&self, password: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let (sym_alg, key) = self.session_parts()?;
+        let mut rng = rand_08::thread_rng();
+        let s2k = StringToKey::new_default(&mut rng);
+        let skesk = SymKeyEncryptedSessionKey::encrypt_v4(
+            &Password::from(password),
+            &RawSessionKey::from(key),
+            s2k,
+            sym_alg,
+        )
+        .map_err(|e| CryptoError::Encrypt(format!("skesk encrypt: {e}")))?;
+
+        let mut out = Vec::new();
+        skesk
+            .to_writer_with_header(&mut out)
+            .map_err(|e| CryptoError::Encrypt(format!("serialize skesk: {e}")))?;
         Ok(out)
     }
 
@@ -350,6 +493,23 @@ impl PrivateKey {
     /// parent → new parent), so the locked node key still unlocks and the node's
     /// `NodePassphraseSignature` need not be reissued. Mirrors C# move's
     /// `destinationKey.EncryptSessionKey(currentKey.DecryptSessionKey(passphrase))`.
+    /// Recover the session key of an armored PGP message addressed to this key.
+    ///
+    /// De-armors the message and decrypts its leading PKESK to recover the
+    /// symmetric session key (the trailing SEIPD is ignored). Used when creating
+    /// a share to lift a node's passphrase/name session keys so they can be
+    /// re-encrypted to the share key (JS `getNodePrivateAndSessionKeys`).
+    pub fn recover_message_session_key(
+        &self,
+        armored_message: &str,
+    ) -> Result<ContentKey, CryptoError> {
+        let mut raw = Vec::new();
+        let mut dearmor = Dearmor::new(Cursor::new(armored_message.as_bytes()));
+        std::io::Read::read_to_end(&mut dearmor, &mut raw)
+            .map_err(|e| CryptoError::Parse(format!("de-armor message: {e}")))?;
+        self.decrypt_content_key(&raw)
+    }
+
     pub fn rewrap_message_to(
         &self,
         armored_message: &str,
@@ -430,7 +590,7 @@ impl RecipientOp for ContentKeyPacketOp<'_> {
     type Out = PublicKeyEncryptedSessionKey;
 
     fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<Self::Out> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let session_key = RawSessionKey::from(self.key);
         PublicKeyEncryptedSessionKey::from_session_key_v3(
             &mut rng,
@@ -451,7 +611,7 @@ impl RecipientOp for ContentKeyPacketV6Op<'_> {
     type Out = PublicKeyEncryptedSessionKey;
 
     fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<Self::Out> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let session_key = RawSessionKey::from(self.key);
         PublicKeyEncryptedSessionKey::from_session_key_v6(&mut rng, &session_key, pubkey)
     }
@@ -468,7 +628,7 @@ mod tests {
     /// Generate a passphrase-locked RSA key able to both sign and encrypt — a
     /// stand-in for a Proton node key (single primary, no subkey).
     fn generate_node_key(passphrase: &str) -> SignedSecretKey {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let params = SecretKeyParamsBuilder::default()
             .key_type(KeyType::Rsa(2048))
             .can_sign(true)
@@ -483,7 +643,7 @@ mod tests {
 
     #[test]
     fn content_key_packet_and_block_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let signed = generate_node_key("pw");
         let armored = signed
             .to_armored_string(None.into())
@@ -511,6 +671,42 @@ mod tests {
             .expect("decrypt block");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn content_key_password_skesk_round_trip() {
+        // Public-link path: wrap the share session key under a password as a
+        // SKESK, then re-derive the key from the same password (via the packet's
+        // own S2K) and recover the session key.
+        let content_key = ContentKey::generate();
+        let password = b"the-link-password";
+
+        let skesk_bytes = content_key
+            .encrypt_with_password(password)
+            .expect("skesk encrypt");
+
+        // The bytes are a bare SKESK (no data packet); parse the packet directly.
+        let mut parser = PacketParser::new(Cursor::new(&skesk_bytes));
+        let packet = parser.next().expect("a packet").expect("valid packet");
+        let Packet::SymKeyEncryptedSessionKey(skesk) = packet else {
+            panic!("expected a SKESK packet");
+        };
+
+        // Re-derive the symmetric key from the password using the packet's S2K,
+        // then decrypt the wrapped session key.
+        let s2k = skesk.s2k().expect("skesk has s2k");
+        let alg = SymmetricKeyAlgorithm::AES256;
+        let derived = s2k
+            .derive_key(&password[..], alg.key_size())
+            .expect("derive key");
+        let recovered = skesk.decrypt(derived).expect("decrypt skesk");
+
+        match &recovered {
+            PlainSessionKey::V3_4 { key, .. } => {
+                assert_eq!(key.as_ref(), content_key.export().unwrap());
+            }
+            other => panic!("unexpected session key variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -557,6 +753,85 @@ mod tests {
             .encrypt_block(&plaintext)
             .expect("encrypt block");
         assert_eq!(recovered.decrypt_block(&block).expect("decrypt"), plaintext);
+    }
+
+    #[test]
+    fn rename_reusing_session_key_survives_key_packet_retention() {
+        // Device rename: Proton keeps the link's existing name *key packet* (PKESK)
+        // and swaps only its *data packet* (SEIPD). Reproduce that here — encrypt a
+        // fresh name to the share key, recover its session key, encrypt a new name
+        // under that same session key, then reassemble the message as the server
+        // would (original key packet + new data packet) and confirm it decrypts.
+        let share = super::super::encrypt::generate_node_key().expect("generate share key");
+        let signer = super::super::encrypt::generate_node_key().expect("generate signer");
+
+        // The original name, encrypted to the share key with a fresh session key.
+        let original = share
+            .key
+            .encrypt_and_sign(&signer.key, b"my-device", true, false)
+            .expect("encrypt original name");
+        assert_eq!(
+            share
+                .key
+                .decrypt_armored_message(&original)
+                .expect("decrypt original"),
+            b"my-device"
+        );
+
+        // Recover that session key and re-encrypt the new name under it.
+        let name_session_key = share
+            .key
+            .recover_message_session_key(&original)
+            .expect("recover name session key");
+        let renamed = name_session_key
+            .encrypt_and_sign_text_to(&share.key, &signer.key, b"my-device-renamed")
+            .expect("encrypt renamed");
+
+        // A naive re-encrypt would round-trip on its own, but the server discards
+        // our key packet. Reassemble original-PKESK + renamed-SEIPD and decrypt.
+        let original_pkesk = {
+            let mut raw = Vec::new();
+            let mut dearmor = Dearmor::new(Cursor::new(original.as_bytes()));
+            std::io::Read::read_to_end(&mut dearmor, &mut raw).expect("de-armor original");
+            let mut parser = PacketParser::new(Cursor::new(&raw));
+            let packet = parser.next().expect("a packet").expect("valid packet");
+            let Packet::PublicKeyEncryptedSessionKey(pkesk) = packet else {
+                panic!("expected a leading PKESK");
+            };
+            let mut out = Vec::new();
+            pkesk
+                .to_writer_with_header(&mut out)
+                .expect("serialize pkesk");
+            out
+        };
+        let renamed_seipd = {
+            let mut raw = Vec::new();
+            let mut dearmor = Dearmor::new(Cursor::new(renamed.as_bytes()));
+            std::io::Read::read_to_end(&mut dearmor, &mut raw).expect("de-armor renamed");
+            serialize_seipd(&raw).expect("serialize renamed seipd")
+        };
+
+        let mut server_stored = original_pkesk;
+        server_stored.extend_from_slice(&renamed_seipd);
+        let mut armored = Vec::new();
+        pgp::armor::write(
+            &RawPackets(&server_stored),
+            pgp::armor::BlockType::Message,
+            &mut armored,
+            None,
+            true,
+        )
+        .expect("armor server-stored message");
+        let armored = String::from_utf8(armored).expect("utf8");
+
+        assert_eq!(
+            share
+                .key
+                .decrypt_armored_message(&armored)
+                .expect("decrypt server-reassembled renamed name"),
+            b"my-device-renamed",
+            "reusing the recovered session key must keep the retained key packet valid"
+        );
     }
 
     #[test]
@@ -698,7 +973,7 @@ mod tests {
 
     #[test]
     fn rejects_non_pkesk_content_key_packet() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let key = PrivateKey::from_armored(
             &generate_node_key("pw")
                 .to_armored_string(None.into())

@@ -11,13 +11,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use pgp::composed::{
     ArmorOptions, DetachedSignature, EncryptionCaps, KeyType, MessageBuilder,
-    SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder,
+    SecretKeyParamsBuilder, SignedPublicKey, SignedSecretKey, SubkeyParamsBuilder,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::packet::{Notation, SignatureConfig, SignatureType, Subpacket, SubpacketData};
 use pgp::types::{CompressionAlgorithm, EncryptionKey, KeyDetails, KeyVersion};
-use rand::RngCore;
+use rand_08::RngCore;
 
 use super::errors::CryptoError;
 use super::keys::PrivateKey;
@@ -64,6 +64,33 @@ pub(crate) fn recipient_encryption_key<Op: RecipientOp>(
     ))
 }
 
+/// Like [`recipient_encryption_key`] but for a recipient we only hold the
+/// **public** key of (e.g. a sharing invitee resolved via `core/v4/keys/all`).
+///
+/// `EncryptionKey for SignedPublicKey` encrypts to the *primary* key, but Proton
+/// keys have a signing primary and a separate encryption subkey, so we must pick
+/// the encryption-capable (sub)key ourselves — same rule as the secret path.
+pub(crate) fn recipient_encryption_key_public<Op: RecipientOp>(
+    key: &SignedPublicKey,
+    op: Op,
+) -> Result<Op::Out, CryptoError> {
+    if key.primary_key.algorithm().can_encrypt() {
+        return op
+            .run(&key.primary_key)
+            .map_err(|e| CryptoError::Encrypt(format!("encrypt to primary key: {e}")));
+    }
+    for sub in &key.public_subkeys {
+        if sub.key.algorithm().can_encrypt() {
+            return op
+                .run(&sub.key)
+                .map_err(|e| CryptoError::Encrypt(format!("encrypt to subkey: {e}")));
+        }
+    }
+    Err(CryptoError::Encrypt(
+        "public key has no encryption-capable (sub)key".into(),
+    ))
+}
+
 /// A freshly generated, passphrase-locked node key.
 pub struct GeneratedNodeKey {
     /// The unlocked node key, ready to sign and decrypt.
@@ -99,7 +126,7 @@ pub fn generate_node_key_aead() -> Result<GeneratedNodeKey, CryptoError> {
 /// Generate a node key (Ed25519 primary + X25519 encryption subkey) at the given
 /// OpenPGP key version. v4 for legacy files/folders, v6 for AEAD files.
 fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, CryptoError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand_08::thread_rng();
     let passphrase = generate_passphrase();
     let pw_string = String::from_utf8(passphrase.clone())
         .map_err(|e| CryptoError::Encrypt(format!("passphrase is not ascii: {e}")))?;
@@ -144,7 +171,7 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
 /// 32 random bytes, base64-encoded (the locking passphrase format).
 fn generate_passphrase() -> Vec<u8> {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand_08::thread_rng().fill_bytes(&mut bytes);
     BASE64.encode(bytes).into_bytes()
 }
 
@@ -158,7 +185,7 @@ fn generate_passphrase() -> Vec<u8> {
 /// signer) with `CryptoGenerator.GenerateFolderHashKey` (32 bytes).
 pub fn generate_node_hash_key(node_key: &PrivateKey) -> Result<String, CryptoError> {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand_08::thread_rng().fill_bytes(&mut bytes);
     encrypt_and_sign(node_key.key(), Some(node_key), &bytes, false, false)
 }
 
@@ -216,7 +243,7 @@ pub fn build_volume_creation_material(
     let folder_passphrase_signature = address_key.sign_detached(&folder.passphrase)?;
 
     let mut hash_key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut hash_key);
+    rand_08::thread_rng().fill_bytes(&mut hash_key);
     let folder_hash_key = folder
         .key
         .encrypt_and_sign(address_key, &hash_key, false, false)?;
@@ -257,7 +284,7 @@ pub(crate) fn encrypt_and_sign(
 /// Produce an armored detached signature over `data` by `signer`'s primary
 /// (signing) key. Mirrors C# `PgpPrivateKey.Sign` / `SignDetached`.
 pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, CryptoError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand_08::thread_rng();
     let key = &signer.key().primary_key;
     let pw = signer.password();
 
@@ -293,6 +320,212 @@ pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, 
         .map_err(|e| CryptoError::Encrypt(format!("armor signature: {e}")))
 }
 
+/// The notation name GopenPGP uses to carry a signature *context* for domain
+/// separation (`context@proton.ch`, critical). Proton signs sharing invitations,
+/// members and external invitations under distinct contexts so a signature made
+/// for one purpose cannot be replayed as another.
+const SIGNATURE_CONTEXT_NOTATION: &[u8] = b"context@proton.ch";
+
+/// Like [`sign_detached`] but stamps a GopenPGP signature *context* — a critical
+/// `context@proton.ch` notation — into the hashed subpackets, and returns the
+/// **raw** (binary) detached-signature packet bytes rather than armoring them.
+///
+/// The sharing endpoints carry these signatures as base64 of the binary packet
+/// (JS `signature.toBase64()`), not as an armored block. Mirrors the JS
+/// `openPGPCrypto.sign(data, key, { signatureContext: { critical: true, value } })`.
+pub(crate) fn sign_detached_binary_with_context(
+    signer: &PrivateKey,
+    data: &[u8],
+    context: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut rng = rand_08::thread_rng();
+    let key = &signer.key().primary_key;
+    let pw = signer.password();
+
+    let mut config = SignatureConfig::from_key(&mut rng, key, SignatureType::Binary)
+        .map_err(|e| CryptoError::Encrypt(format!("signature config: {e}")))?;
+
+    // Same subpacket stamping as `sign_detached` (issuer fingerprint + creation
+    // time, else GopenPGP rejects the signature) plus the critical context
+    // notation the server verifies against.
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint()))
+            .map_err(|e| CryptoError::Encrypt(format!("issuer fingerprint subpacket: {e}")))?,
+        Subpacket::regular(SubpacketData::SignatureCreationTime(
+            pgp::types::Timestamp::now(),
+        ))
+        .map_err(|e| CryptoError::Encrypt(format!("creation-time subpacket: {e}")))?,
+        Subpacket::critical(SubpacketData::Notation(Notation {
+            readable: true,
+            name: Bytes::from_static(SIGNATURE_CONTEXT_NOTATION),
+            value: Bytes::copy_from_slice(context.as_bytes()),
+        }))
+        .map_err(|e| CryptoError::Encrypt(format!("context notation subpacket: {e}")))?,
+    ];
+    if key.version() <= KeyVersion::V4 {
+        config.unhashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::IssuerKeyId(key.legacy_key_id()))
+                .map_err(|e| CryptoError::Encrypt(format!("issuer subpacket: {e}")))?,
+        ];
+    }
+
+    let signature = config
+        .sign(key, &pw, data)
+        .map_err(|e| CryptoError::Encrypt(format!("detached sign: {e}")))?;
+
+    let mut bytes = Vec::new();
+    pgp::ser::Serialize::to_writer(&DetachedSignature::new(signature), &mut bytes)
+        .map_err(|e| CryptoError::Encrypt(format!("serialize signature: {e}")))?;
+    Ok(bytes)
+}
+
+/// GopenPGP signing context for the inviter's signature over a sharing
+/// invitation key packet (`drive.share-member.inviter`).
+pub const SHARING_INVITER_CONTEXT: &str = "drive.share-member.inviter";
+/// GopenPGP signing context for an accepting member's signature over the share
+/// session key (`drive.share-member.member`).
+pub const SHARING_MEMBER_CONTEXT: &str = "drive.share-member.member";
+/// GopenPGP signing context for the inviter's signature over an external
+/// (non-Proton) invitation (`drive.share-member.external-invitation`).
+pub const SHARING_EXTERNAL_INVITATION_CONTEXT: &str = "drive.share-member.external-invitation";
+
+/// The locked share key plus the crypto payload the `volumes/{vid}/shares`
+/// endpoint needs to create a standard (shared) share on a node.
+///
+/// Mirrors JS `SharingCryptoService.generateShareKeys` output. The `share_key`
+/// and `share_session_key` are kept (not sent) so invitations can encrypt the
+/// share session key to invitees right after the share is created.
+pub struct StandardShareMaterial {
+    /// Locked share secret key (armored) — `ShareKey`.
+    pub share_key_armored: String,
+    /// Share passphrase encrypted to `[node_key, address_key]` — `SharePassphrase`.
+    pub share_passphrase: String,
+    /// Detached signature over the share passphrase by the address key.
+    pub share_passphrase_signature: String,
+    /// base64 PKESK: the node's passphrase session key re-encrypted to the share
+    /// key — `PassphraseKeyPacket` (lets the share decrypt the node passphrase).
+    pub passphrase_key_packet: String,
+    /// base64 PKESK: the node's name session key re-encrypted to the share key —
+    /// `NameKeyPacket`.
+    pub name_key_packet: String,
+    /// The unlocked share key (not sent; kept for follow-up crypto).
+    pub share_key: PrivateKey,
+    /// The share passphrase session key (not sent; handed to invitees).
+    pub share_session_key: super::content::ContentKey,
+}
+
+/// Build the crypto material for a standard share over a node.
+///
+/// Mirrors JS `generateShareKeys(nodeKeys, addressKey)`:
+/// - a fresh share key is generated and locked with a random passphrase;
+/// - that passphrase is encrypted (via a fresh session key) to **both** the node
+///   key and the address key, and detached-signed by the address key — so any
+///   admin holding the node key, and the owner, can unwrap the share;
+/// - the node's own passphrase and name session keys are re-encrypted to the new
+///   share key, so the share grants access to the node's passphrase and name.
+pub fn build_standard_share_material(
+    node_key: &PrivateKey,
+    node_passphrase_session_key: &super::content::ContentKey,
+    node_name_session_key: &super::content::ContentKey,
+    address_key: &PrivateKey,
+) -> Result<StandardShareMaterial, CryptoError> {
+    let generated = generate_node_key()?;
+
+    let share_session_key = super::content::ContentKey::generate();
+    let share_passphrase =
+        share_session_key.encrypt_message_to(&[node_key, address_key], &generated.passphrase)?;
+    let share_passphrase_signature = address_key.sign_detached(&generated.passphrase)?;
+
+    let passphrase_key_packet =
+        BASE64.encode(node_passphrase_session_key.to_packet(&generated.key)?);
+    let name_key_packet = BASE64.encode(node_name_session_key.to_packet(&generated.key)?);
+
+    Ok(StandardShareMaterial {
+        share_key_armored: generated.locked_armored,
+        share_passphrase,
+        share_passphrase_signature,
+        passphrase_key_packet,
+        name_key_packet,
+        share_key: generated.key,
+        share_session_key,
+    })
+}
+
+/// Encrypt a sharing invitation for a Proton user.
+///
+/// The share's passphrase session key is encrypted to the invitee's public key
+/// (`KeyPacket`) and the packet bytes are detached-signed by the inviter's
+/// address key under the `drive.share-member.inviter` context
+/// (`KeyPacketSignature`). Both are returned base64-encoded. Mirrors JS
+/// `encryptInvitation`.
+pub fn encrypt_invitation(
+    share_session_key: &super::content::ContentKey,
+    inviter_key: &PrivateKey,
+    invitee_public_key: &super::verify::PublicKey,
+) -> Result<(String, String), CryptoError> {
+    let key_packet = share_session_key.to_packet_for_public(invitee_public_key)?;
+    let signature =
+        sign_detached_binary_with_context(inviter_key, &key_packet, SHARING_INVITER_CONTEXT)?;
+    Ok((BASE64.encode(&key_packet), BASE64.encode(&signature)))
+}
+
+/// Sign an accepted invitation's share session key.
+///
+/// The invitation's `KeyPacket` (base64 PKESK addressed to the invitee) is
+/// decrypted with the invitee's address keys to recover the share session key,
+/// whose raw bytes are detached-signed under the `drive.share-member.member`
+/// context by the invitee's key. Returns the base64 signature the
+/// `.../accept` endpoint expects as `SessionKeySignature`. Mirrors JS
+/// `acceptInvitation`.
+pub fn accept_invitation(
+    base64_key_packet: &str,
+    invitee_keys: &[PrivateKey],
+    signing_key: &PrivateKey,
+) -> Result<String, CryptoError> {
+    let key_packet = BASE64
+        .decode(base64_key_packet)
+        .map_err(|e| CryptoError::Parse(format!("invitation key packet base64: {e}")))?;
+
+    let session_key = invitee_keys
+        .iter()
+        .find_map(|k| k.decrypt_content_key(&key_packet).ok())
+        .ok_or_else(|| {
+            CryptoError::Decrypt("no invitee key could decrypt the invitation key packet".into())
+        })?;
+
+    let signature = sign_detached_binary_with_context(
+        signing_key,
+        &session_key.export()?,
+        SHARING_MEMBER_CONTEXT,
+    )?;
+    Ok(BASE64.encode(&signature))
+}
+
+/// Sign an external (non-Proton) invitation.
+///
+/// The invitee has no Proton key to encrypt the share session key to, so instead
+/// the inviter signs the payload `"{invitee_email}|{base64(share session key)}"`
+/// under the `drive.share-member.external-invitation` context. When the invitee
+/// later signs up, the server can bind the pending invitation to their new key.
+/// Returns the base64 signature the external-invitations endpoint expects.
+/// Mirrors JS `encryptExternalInvitation`.
+pub fn encrypt_external_invitation(
+    share_session_key: &super::content::ContentKey,
+    inviter_key: &PrivateKey,
+    invitee_email: &str,
+) -> Result<String, CryptoError> {
+    let payload = format!(
+        "{invitee_email}|{}",
+        BASE64.encode(share_session_key.export()?)
+    );
+    let signature = sign_detached_binary_with_context(
+        inviter_key,
+        payload.as_bytes(),
+        SHARING_EXTERNAL_INVITATION_CONTEXT,
+    )?;
+    Ok(BASE64.encode(&signature))
+}
+
 /// Inline encrypt-and-sign against a selected recipient public key.
 struct EncryptSignOp<'a> {
     data: Vec<u8>,
@@ -305,7 +538,7 @@ impl RecipientOp for EncryptSignOp<'_> {
     type Out = String;
 
     fn run(self, pubkey: &impl EncryptionKey) -> pgp::errors::Result<String> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_08::thread_rng();
         let mut builder = MessageBuilder::from_bytes(Bytes::new(), self.data)
             .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
 
@@ -438,5 +671,156 @@ mod tests {
             .decrypt_armored_message(&armored)
             .expect("decrypt hash key");
         assert_eq!(hash_key.len(), 32);
+    }
+
+    #[test]
+    fn standard_share_material_round_trips() {
+        use super::super::content::ContentKey;
+
+        // Stand-ins for the node key, the owning address key, and the node's own
+        // passphrase + name session keys.
+        let node = generate_node_key().expect("generate node key");
+        let address = generate_node_key().expect("generate address key");
+        let node_passphrase_sk = ContentKey::generate();
+        let node_name_sk = ContentKey::generate();
+
+        let material = build_standard_share_material(
+            &node.key,
+            &node_passphrase_sk,
+            &node_name_sk,
+            &address.key,
+        )
+        .expect("build share material");
+
+        // The share passphrase must be decryptable by BOTH the node key and the
+        // address key, and its detached signature verify against the address key.
+        let via_node = node
+            .key
+            .decrypt_armored_message(&material.share_passphrase)
+            .expect("decrypt share passphrase via node key");
+        let via_address = address
+            .key
+            .decrypt_armored_message(&material.share_passphrase)
+            .expect("decrypt share passphrase via address key");
+        assert_eq!(via_node, via_address);
+        address
+            .key
+            .verify_detached_signature(&material.share_passphrase_signature, &via_node)
+            .expect("verify share passphrase signature");
+
+        // That passphrase unlocks the share key.
+        let share_key =
+            PrivateKey::from_armored(&material.share_key_armored, &via_node).expect("unlock share");
+
+        // The passphrase/name key packets re-deliver the node's session keys to
+        // the share key: decrypting them with the share key yields the originals.
+        let recovered_pp = share_key
+            .decrypt_content_key(&BASE64.decode(&material.passphrase_key_packet).unwrap())
+            .expect("recover passphrase session key");
+        assert_eq!(
+            recovered_pp.export().unwrap(),
+            node_passphrase_sk.export().unwrap()
+        );
+        let recovered_name = share_key
+            .decrypt_content_key(&BASE64.decode(&material.name_key_packet).unwrap())
+            .expect("recover name session key");
+        assert_eq!(
+            recovered_name.export().unwrap(),
+            node_name_sk.export().unwrap()
+        );
+    }
+
+    #[test]
+    fn invitation_key_packet_round_trips_to_invitee() {
+        use super::super::content::ContentKey;
+        use super::super::verify::PublicKey;
+        use pgp::composed::Deserializable as _;
+
+        let node = generate_node_key().expect("generate node key");
+        let address = generate_node_key().expect("generate address key");
+        let material = build_standard_share_material(
+            &node.key,
+            &ContentKey::generate(),
+            &ContentKey::generate(),
+            &address.key,
+        )
+        .expect("build share material");
+
+        // The invitee is any Proton-shaped key; we hold only its public half.
+        let invitee = generate_node_key().expect("generate invitee key");
+        let invitee_pub_armored = invitee
+            .key
+            .signed_public_key()
+            .to_armored_string(Default::default())
+            .expect("armor invitee public key");
+        let invitee_pub = PublicKey::from_armored(&invitee_pub_armored).expect("parse invitee pub");
+
+        let (key_packet_b64, signature_b64) =
+            encrypt_invitation(&material.share_session_key, &address.key, &invitee_pub)
+                .expect("encrypt invitation");
+
+        // The invitee recovers the share session key from the key packet.
+        let key_packet = BASE64.decode(&key_packet_b64).expect("decode key packet");
+        let recovered = invitee
+            .key
+            .decrypt_content_key(&key_packet)
+            .expect("invitee decrypts key packet");
+        assert_eq!(
+            recovered.export().unwrap(),
+            material.share_session_key.export().unwrap()
+        );
+
+        // The inviter's context signature over the key packet parses and verifies
+        // against the inviter (address) key.
+        let sig_bytes = BASE64.decode(&signature_b64).expect("decode signature");
+        let sig = DetachedSignature::from_bytes(&sig_bytes[..]).expect("parse signature");
+        sig.signature
+            .verify(&address.key.signed_public_key(), &key_packet[..])
+            .expect("verify inviter context signature");
+    }
+
+    #[test]
+    fn signing_with_a_clone_does_not_corrupt_the_original_for_decryption() {
+        // Regression for the live device-rename failure: the account caches
+        // unlocked address keys and hands out `PrivateKey` *clones*. If signing
+        // with a clone mutated shared secret-key state (pgp interior mutability),
+        // a later decryption with the cached original would fail with an MDC
+        // error. Prove clone + sign leaves the original intact for decryption.
+        let address = generate_node_key().expect("generate address key");
+
+        // Something encrypted to the address key (stands in for a share passphrase).
+        let secret = b"share passphrase bytes".to_vec();
+        let armored = address
+            .key
+            .encrypt(&secret)
+            .expect("encrypt to address key");
+
+        // First decryption works.
+        assert_eq!(
+            address
+                .key
+                .decrypt_armored_message(&armored)
+                .expect("decrypt #1"),
+            secret
+        );
+
+        // Sign with a *clone* of the cached key (what rename_device does).
+        let clone = address.key.clone();
+        let _sig = clone
+            .sign_detached(b"device name")
+            .expect("sign with clone");
+        let _enc = clone
+            .encrypt_and_sign(&clone, b"device name", true, false)
+            .expect("encrypt+sign with clone");
+
+        // The original must still decrypt afterwards.
+        assert_eq!(
+            address
+                .key
+                .decrypt_armored_message(&armored)
+                .expect("decrypt #2 after signing with clone"),
+            secret,
+            "signing with a clone must not corrupt the original key"
+        );
     }
 }

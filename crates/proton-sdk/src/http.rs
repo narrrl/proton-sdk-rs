@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -573,7 +573,7 @@ fn backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     if ceiling_ms == 0 {
         return Duration::ZERO;
     }
-    Duration::from_millis(rand::thread_rng().gen_range(0..=ceiling_ms))
+    Duration::from_millis(rand::rng().random_range(0..=ceiling_ms))
 }
 
 fn ensure_trailing_slash(url: &str) -> String {

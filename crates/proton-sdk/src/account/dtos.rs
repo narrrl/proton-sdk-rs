@@ -20,6 +20,12 @@ pub(super) struct UserResponse {
 pub(super) struct UserDto {
     #[serde(rename = "ID")]
     pub id: UserId,
+    /// Total account storage in bytes (all Proton products).
+    #[serde(rename = "MaxSpace")]
+    pub max_space: i64,
+    /// Used account storage in bytes.
+    #[serde(rename = "UsedSpace")]
+    pub used_space: i64,
     #[serde(rename = "Keys")]
     pub keys: Vec<UserKeyDto>,
 }

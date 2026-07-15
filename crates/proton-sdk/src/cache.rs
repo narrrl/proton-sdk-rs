@@ -232,7 +232,7 @@ impl EncryptedCacheRepository {
 
     fn encrypt(&self, entry_key: &str, plaintext: &str) -> Result<String> {
         let mut salt = [0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt)
+        getrandom::fill(&mut salt)
             .map_err(|e| ProtonError::invalid_operation(format!("cache salt: {e}")))?;
         let (key, nonce) = self.derive(&salt, entry_key)?;
         let cipher = Aes256Gcm::new_from_slice(&key)
@@ -241,7 +241,7 @@ impl EncryptedCacheRepository {
         // `ciphertext || tag` — matching the C# `[salt][ciphertext][tag]` layout.
         let sealed = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: plaintext.as_bytes(),
                     aad: &[],
@@ -268,7 +268,7 @@ impl EncryptedCacheRepository {
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|e| ProtonError::invalid_operation(format!("cache cipher: {e}")))?;
         match cipher.decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: sealed,
                 aad: &[],

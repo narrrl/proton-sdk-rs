@@ -37,6 +37,7 @@ num-bigint.workspace = true
 num-traits.workspace = true
 getrandom.workspace = true
 rand.workspace = true
+rand_08.workspace = true
 
 [dev-dependencies]
 # A one-shot loopback HTTP server backs the telemetry-instrumentation test;

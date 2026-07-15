@@ -1119,3 +1119,417 @@ mod tests {
         assert!(ShareTargetType::from_raw(6).is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sharing: creating shares, inviting Proton users, members + invitations.
+// Ported from the TypeScript SDK (`internal/sharing/apiService.ts`); the C#
+// public SDK does not expose share creation.
+// ---------------------------------------------------------------------------
+
+/// `POST volumes/{volumeID}/shares` — create a standard share on a node.
+#[derive(Debug, Serialize)]
+pub struct CreateShareRequest {
+    #[serde(rename = "RootLinkID")]
+    pub root_link_id: LinkId,
+    #[serde(rename = "AddressID")]
+    pub address_id: AddressId,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "ShareKey")]
+    pub share_key: String,
+    #[serde(rename = "SharePassphrase")]
+    pub share_passphrase: String,
+    #[serde(rename = "SharePassphraseSignature")]
+    pub share_passphrase_signature: String,
+    #[serde(rename = "PassphraseKeyPacket")]
+    pub passphrase_key_packet: String,
+    #[serde(rename = "NameKeyPacket")]
+    pub name_key_packet: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateShareResponse {
+    #[serde(rename = "Share")]
+    pub share: CreatedShareDto,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatedShareDto {
+    #[serde(rename = "ID")]
+    pub id: ShareId,
+    #[serde(rename = "EditorsCanShare", default)]
+    pub editors_can_share: bool,
+}
+
+/// `POST v2/shares/{shareID}/invitations` — invite a Proton user.
+#[derive(Debug, Serialize)]
+pub struct InviteProtonUserRequest {
+    #[serde(rename = "Invitation")]
+    pub invitation: InviteProtonUserInvitationDto,
+    #[serde(rename = "EmailDetails")]
+    pub email_details: InviteEmailDetailsDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InviteProtonUserInvitationDto {
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email: String,
+    #[serde(rename = "InviteeEmail")]
+    pub invitee_email: String,
+    #[serde(rename = "Permissions")]
+    pub permissions: i32,
+    #[serde(rename = "KeyPacket")]
+    pub key_packet: String,
+    #[serde(rename = "KeyPacketSignature")]
+    pub key_packet_signature: String,
+    #[serde(
+        rename = "ExternalInvitationID",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_invitation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InviteEmailDetailsDto {
+    #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(rename = "ItemName", skip_serializing_if = "Option::is_none")]
+    pub item_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InviteProtonUserResponse {
+    #[serde(rename = "Invitation")]
+    pub invitation: ShareInvitationDto,
+}
+
+/// `GET v2/shares/{shareID}/invitations`
+#[derive(Debug, Deserialize)]
+pub struct ShareInvitationsResponse {
+    #[serde(rename = "Invitations", default)]
+    pub invitations: Vec<ShareInvitationDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShareInvitationDto {
+    #[serde(rename = "InvitationID")]
+    pub invitation_id: String,
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email: String,
+    #[serde(rename = "InviteeEmail")]
+    pub invitee_email: String,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: Option<i32>,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+}
+
+/// `GET v2/shares/{shareID}/members`
+#[derive(Debug, Deserialize)]
+pub struct ShareMembersResponse {
+    #[serde(rename = "Members", default)]
+    pub members: Vec<ShareMemberDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShareMemberDto {
+    #[serde(rename = "MemberID")]
+    pub member_id: ShareMembershipId,
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email: String,
+    #[serde(rename = "Email")]
+    pub email: String,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: Option<i32>,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+}
+
+/// `PUT v2/shares/{shareID}/members/{memberID}` and the invitation equivalent.
+#[derive(Debug, Serialize)]
+pub struct UpdatePermissionsRequest {
+    #[serde(rename = "Permissions")]
+    pub permissions: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Incoming invitations: invitations addressed to the current user, and
+// accept/reject. `GET v2/shares/invitations` lists them; the detail, accept and
+// reject routes are keyed by invitation id alone.
+// ---------------------------------------------------------------------------
+
+/// `GET v2/shares/invitations` — the invitations where we are the invitee.
+#[derive(Debug, Deserialize)]
+pub struct InvitationsListResponse {
+    #[serde(rename = "Invitations", default)]
+    pub invitations: Vec<InvitationListItemDto>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvitationListItemDto {
+    #[serde(rename = "InvitationID")]
+    pub invitation_id: String,
+    #[serde(rename = "ShareID", default)]
+    pub share_id: String,
+    #[serde(rename = "ShareTargetType", default)]
+    pub share_target_type: i32,
+}
+
+/// `GET v2/shares/invitations/{invitationID}` — the encrypted invitation, the
+/// share crypto needed to decrypt it, and the shared node's link.
+#[derive(Debug, Deserialize)]
+pub struct InvitationDetailsResponse {
+    #[serde(rename = "Invitation")]
+    pub invitation: IncomingInvitationDto,
+    #[serde(rename = "Share")]
+    pub share: InvitationShareDto,
+    #[serde(rename = "Link")]
+    pub link: InvitationLinkDto,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncomingInvitationDto {
+    #[serde(rename = "InvitationID")]
+    pub invitation_id: String,
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email: String,
+    #[serde(rename = "InviteeEmail")]
+    pub invitee_email: String,
+    #[serde(rename = "KeyPacket")]
+    pub key_packet: String,
+    #[serde(rename = "KeyPacketSignature", default)]
+    pub key_packet_signature: String,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: Option<i32>,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvitationShareDto {
+    #[serde(rename = "ShareKey")]
+    pub share_key: String,
+    #[serde(rename = "Passphrase")]
+    pub passphrase: String,
+    #[serde(rename = "CreatorEmail", default)]
+    pub creator_email: String,
+    #[serde(rename = "VolumeID")]
+    pub volume_id: String,
+    #[serde(rename = "ShareTargetType", default)]
+    pub share_target_type: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvitationLinkDto {
+    #[serde(rename = "LinkID")]
+    pub link_id: String,
+    #[serde(rename = "Type", default)]
+    pub link_type: i32,
+    #[serde(rename = "MIMEType", default)]
+    pub mime_type: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+/// `POST v2/shares/invitations/{invitationID}/accept`.
+#[derive(Debug, Serialize)]
+pub struct AcceptInvitationRequest {
+    #[serde(rename = "SessionKeySignature")]
+    pub session_key_signature: String,
+}
+
+// ---------------------------------------------------------------------------
+// External (non-Proton) invitations. Same share-invitation model, but the
+// invitee has no Proton key, so instead of a key packet the inviter carries a
+// detached signature over the invitee email + share session key.
+// ---------------------------------------------------------------------------
+
+/// `POST v2/shares/{shareID}/external-invitations`.
+#[derive(Debug, Serialize)]
+pub struct InviteExternalUserRequest {
+    #[serde(rename = "ExternalInvitation")]
+    pub external_invitation: ExternalInvitationDto,
+    #[serde(rename = "EmailDetails")]
+    pub email_details: InviteEmailDetailsDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExternalInvitationDto {
+    #[serde(rename = "InviterAddressID")]
+    pub inviter_address_id: AddressId,
+    #[serde(rename = "InviteeEmail")]
+    pub invitee_email: String,
+    #[serde(rename = "Permissions")]
+    pub permissions: i32,
+    #[serde(rename = "ExternalInvitationSignature")]
+    pub external_invitation_signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InviteExternalUserResponse {
+    #[serde(rename = "ExternalInvitation")]
+    pub external_invitation: ExternalInvitationResponseDto,
+}
+
+/// `GET v2/shares/{shareID}/external-invitations`.
+#[derive(Debug, Deserialize)]
+pub struct ExternalInvitationsResponse {
+    #[serde(rename = "ExternalInvitations", default)]
+    pub external_invitations: Vec<ExternalInvitationResponseDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExternalInvitationResponseDto {
+    #[serde(rename = "ExternalInvitationID")]
+    pub external_invitation_id: String,
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email: String,
+    #[serde(rename = "InviteeEmail")]
+    pub invitee_email: String,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: Option<i32>,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+    /// `1` = pending (invitee has no Proton account yet), else user-registered.
+    #[serde(rename = "State", default)]
+    pub state: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Bookmarks: public links the user has saved to their account.
+// ---------------------------------------------------------------------------
+
+/// `GET v2/shared-bookmarks`.
+#[derive(Debug, Deserialize)]
+pub struct BookmarksResponse {
+    #[serde(rename = "Bookmarks", default)]
+    pub bookmarks: Vec<BookmarkDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BookmarkDto {
+    #[serde(rename = "Token")]
+    pub token: BookmarkTokenDto,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+    #[serde(rename = "EncryptedUrlPassword", default)]
+    pub encrypted_url_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BookmarkTokenDto {
+    #[serde(rename = "Token")]
+    pub token: String,
+    #[serde(rename = "ShareKey")]
+    pub share_key: String,
+    #[serde(rename = "SharePassphrase")]
+    pub share_passphrase: String,
+    #[serde(rename = "SharePasswordSalt")]
+    pub share_password_salt: String,
+    #[serde(rename = "LinkType", default)]
+    pub link_type: i32,
+    #[serde(rename = "MIMEType", default)]
+    pub mime_type: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NodeKey", default)]
+    pub node_key: String,
+    #[serde(rename = "NodePassphrase", default)]
+    pub node_passphrase: String,
+    #[serde(rename = "ContentKeyPacket", default)]
+    pub content_key_packet: Option<String>,
+}
+
+/// `POST v2/urls/{token}/bookmark`.
+#[derive(Debug, Serialize)]
+pub struct CreateBookmarkRequest {
+    #[serde(rename = "BookmarkShareURL")]
+    pub bookmark_share_url: BookmarkShareUrlDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BookmarkShareUrlDto {
+    #[serde(rename = "EncryptedUrlPassword")]
+    pub encrypted_url_password: String,
+    #[serde(rename = "AddressID")]
+    pub address_id: AddressId,
+    #[serde(rename = "AddressKeyID")]
+    pub address_key_id: AddressKeyId,
+}
+
+// ---------------------------------------------------------------------------
+// Public share links (`shares/{shareID}/urls`) + SRP modulus fetch.
+// ---------------------------------------------------------------------------
+
+/// `POST auth/v4/modulus` (root route) — a fresh signed SRP modulus.
+#[derive(Debug, Deserialize)]
+pub struct ModulusResponse {
+    #[serde(rename = "Modulus")]
+    pub modulus: String,
+    #[serde(rename = "ModulusID")]
+    pub modulus_id: String,
+}
+
+/// `POST shares/{shareID}/urls` — create a public link.
+#[derive(Debug, Serialize)]
+pub struct CreatePublicLinkRequest {
+    #[serde(rename = "CreatorEmail")]
+    pub creator_email: String,
+    #[serde(rename = "Permissions")]
+    pub permissions: i32,
+    #[serde(rename = "Flags")]
+    pub flags: i32,
+    #[serde(rename = "ExpirationTime", skip_serializing_if = "Option::is_none")]
+    pub expiration_time: Option<i64>,
+    #[serde(rename = "SharePasswordSalt")]
+    pub share_password_salt: String,
+    #[serde(rename = "SharePassphraseKeyPacket")]
+    pub share_passphrase_key_packet: String,
+    #[serde(rename = "Password")]
+    pub password: String,
+    #[serde(rename = "UrlPasswordSalt")]
+    pub url_password_salt: String,
+    #[serde(rename = "SRPVerifier")]
+    pub srp_verifier: String,
+    #[serde(rename = "SRPModulusID")]
+    pub srp_modulus_id: String,
+    #[serde(rename = "MaxAccesses")]
+    pub max_accesses: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePublicLinkResponse {
+    #[serde(rename = "ShareURL")]
+    pub share_url: ShareUrlDto,
+}
+
+/// `GET shares/{shareID}/urls`
+#[derive(Debug, Deserialize)]
+pub struct ShareUrlsResponse {
+    #[serde(rename = "ShareURLs", default)]
+    pub share_urls: Vec<ShareUrlDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShareUrlDto {
+    #[serde(rename = "ShareURLID")]
+    pub share_url_id: String,
+    #[serde(rename = "ShareID", default)]
+    pub share_id: Option<ShareId>,
+    #[serde(rename = "PublicUrl", default)]
+    pub public_url: String,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: i64,
+    #[serde(rename = "ExpirationTime", default)]
+    pub expiration_time: Option<i64>,
+    #[serde(rename = "Permissions", default)]
+    pub permissions: Option<i32>,
+    #[serde(rename = "Flags", default)]
+    pub flags: i32,
+    #[serde(rename = "NumAccesses", default)]
+    pub num_accesses: i64,
+}

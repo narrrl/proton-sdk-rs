@@ -47,6 +47,45 @@ pub struct SrpProofs {
     pub expected_server_proof: Vec<u8>,
 }
 
+/// An SRP verifier for a password, as sent when creating a Proton public share
+/// link. Mirrors go-srp `GenerateVerifier` / GopenPGP `getSrpVerifier`.
+pub struct SrpVerifier {
+    /// base64 of the random 10-byte SRP salt (`UrlPasswordSalt`).
+    pub salt: String,
+    /// base64 of the little-endian verifier bytes (`SRPVerifier`).
+    pub verifier: String,
+}
+
+/// Generate an SRP verifier `v = g^x mod N` for `password`, where `g = 2`, `N`
+/// is Proton's signed modulus, and `x` is the Proton password hash over a fresh
+/// random salt. Used to secure a public share link with a password.
+///
+/// Mirrors go-srp `GenerateVerifier`: the salt is 10 random bytes and the
+/// verifier is emitted little-endian, both base64-encoded.
+pub fn generate_verifier(
+    password: &[u8],
+    signed_modulus: &str,
+    bit_length: usize,
+) -> Result<SrpVerifier, CryptoError> {
+    let byte_len = bit_length / 8;
+    let modulus = verify_and_decode_modulus(signed_modulus)?;
+
+    let mut salt = [0u8; 10];
+    getrandom::fill(&mut salt).map_err(|e| CryptoError::Decrypt(format!("rng: {e}")))?;
+
+    let hashed_password = hash_password_v3(password, &salt, &modulus)?;
+    let n = from_le(&modulus);
+    let x = from_le(&hashed_password);
+    let g = BigUint::from(2u32);
+    let verifier = g.modpow(&x, &n);
+    let verifier_le = to_le_fixed(&verifier, byte_len)?;
+
+    Ok(SrpVerifier {
+        salt: BASE64.encode(salt),
+        verifier: BASE64.encode(verifier_le),
+    })
+}
+
 /// Verify the cleartext-signed modulus against Proton's key and return the raw
 /// (base64-decoded) modulus bytes. Mirrors go-srp `readClearSignedMessage`.
 fn verify_and_decode_modulus(signed_modulus: &str) -> Result<Vec<u8>, CryptoError> {
@@ -174,7 +213,7 @@ fn generate_ephemeral(
 
     loop {
         let mut buf = vec![0u8; byte_len];
-        getrandom::getrandom(&mut buf).map_err(|e| CryptoError::Decrypt(format!("rng: {e}")))?;
+        getrandom::fill(&mut buf).map_err(|e| CryptoError::Decrypt(format!("rng: {e}")))?;
         let secret = from_le(&buf) % n_minus_1;
         if secret <= lower_bound || secret >= *n_minus_1 {
             continue;

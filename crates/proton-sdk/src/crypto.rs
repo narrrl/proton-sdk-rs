@@ -17,12 +17,14 @@ mod verify;
 pub use content::ContentKey;
 pub use derive::derive_key_passphrase;
 pub use encrypt::{
-    GeneratedNodeKey, VolumeCreationMaterial, build_volume_creation_material,
-    generate_node_hash_key, generate_node_key, generate_node_key_aead,
+    GeneratedNodeKey, SHARING_EXTERNAL_INVITATION_CONTEXT, SHARING_INVITER_CONTEXT,
+    SHARING_MEMBER_CONTEXT, StandardShareMaterial, VolumeCreationMaterial, accept_invitation,
+    build_standard_share_material, build_volume_creation_material, encrypt_external_invitation,
+    encrypt_invitation, generate_node_hash_key, generate_node_key, generate_node_key_aead,
 };
 pub use errors::CryptoError;
 pub use keys::{PrivateKey, decrypt_armored_with_keys};
-pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, generate_proofs};
+pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, SrpVerifier, generate_proofs, generate_verifier};
 pub use verify::{PublicKey, VerificationKeyRing, VerificationStatus, verify_detached};
 
 /// Result alias for crypto operations.

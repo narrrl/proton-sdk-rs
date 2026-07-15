@@ -41,6 +41,7 @@ mod dtos;
 mod events;
 mod node;
 mod photos;
+mod sharing;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
@@ -50,5 +51,9 @@ pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
 pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
+pub use sharing::{
+    Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
+    PublicLink, ShareInvitation, ShareMember,
+};
 
 pub use proton_sdk;

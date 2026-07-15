@@ -55,7 +55,7 @@ impl PublicKey {
         Ok(Self { key })
     }
 
-    fn signed(&self) -> &SignedPublicKey {
+    pub(crate) fn signed(&self) -> &SignedPublicKey {
         &self.key
     }
 }

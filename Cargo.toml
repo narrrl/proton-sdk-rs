@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narrrl/proton-sdk-rs"
@@ -28,16 +28,19 @@ hex = "0.4"
 hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hkdf = "0.13"
 bcrypt = "0.19"
 pgp = "0.20"
 # Match the chrono line rPGP pulls in; used to stamp detached-signature subpackets.
 chrono = "0.4"
 tracing = "0.1"
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
-getrandom = "0.2"
+getrandom = "0.4"
+# General-purpose RNG (HTTP retry jitter, etc.).
+rand = "0.10"
 # rPGP (pgp 0.20) still depends on rand 0.8 and passes its CryptoRng/Rng traits
 # across its public API, so the RNG we hand to keygen/encryption must be rand 0.8.
-rand = "0.8"
+# Kept under an alias alongside rand 0.10; crypto/ uses `rand_08`, the rest `rand`.
+rand_08 = { package = "rand", version = "0.8" }
