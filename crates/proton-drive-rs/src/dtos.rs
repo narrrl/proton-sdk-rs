@@ -1522,6 +1522,11 @@ pub struct ShareUrlDto {
     pub share_id: Option<ShareId>,
     #[serde(rename = "PublicUrl", default)]
     pub public_url: String,
+    /// The link password (generated portion + any custom password), PGP-encrypted
+    /// to the share creator's address key. Decrypting it recovers the secret URL
+    /// fragment. Absent on the create response, present when listing.
+    #[serde(rename = "Password", default)]
+    pub password: Option<String>,
     #[serde(rename = "CreateTime", default)]
     pub create_time: i64,
     #[serde(rename = "ExpirationTime", default)]

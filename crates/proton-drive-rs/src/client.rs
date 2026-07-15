@@ -54,10 +54,10 @@ use crate::dtos::{
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
     RenameLinkRequest, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
     RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
-    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlsResponse, SharedWithMeResponse,
-    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
-    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
-    VolumeEventListResponse, VolumeTrashResponse,
+    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
+    SharedWithMeResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
+    ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, UpdatePermissionsRequest,
+    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
@@ -1889,32 +1889,56 @@ impl ProtonDriveClient {
         })
     }
 
-    /// The public link on a node, if one exists (metadata only — the secret URL
-    /// fragment is not reconstructed).
+    /// The public link on a node, if one exists. The secret URL fragment is
+    /// recovered by decrypting the stored link password with the owner's address
+    /// key and taking the generated (non-custom) portion — the same recovery the
+    /// web client does when re-displaying an existing link.
     pub async fn get_public_link(&self, uid: &NodeUid) -> Result<Option<PublicLink>> {
         let mut timer = self.telemetry.start("get_public_link");
         let link = match self.node_share_id(uid).await? {
             Some(share_id) => {
                 let path = format!("shares/{share_id}/urls");
                 let response: ShareUrlsResponse = self.http.get(&path).await?;
-                response
-                    .share_urls
-                    .into_iter()
-                    .next()
-                    .map(|dto| PublicLink {
-                        share_id,
-                        public_link_id: dto.share_url_id,
-                        url: None,
-                        role: MemberRole::from_permissions(dto.permissions),
-                        creation_time: dto.create_time,
-                        expiration_time: dto.expiration_time,
-                        has_custom_password: dto.flags == 3,
-                    })
+                match response.share_urls.into_iter().next() {
+                    Some(dto) => {
+                        let url = self.recover_public_link_url(&dto).await;
+                        Some(PublicLink {
+                            share_id,
+                            public_link_id: dto.share_url_id,
+                            url,
+                            role: MemberRole::from_permissions(dto.permissions),
+                            creation_time: dto.create_time,
+                            expiration_time: dto.expiration_time,
+                            has_custom_password: dto.flags == 3,
+                        })
+                    }
+                    None => None,
+                }
             }
             None => None,
         };
         timer.success();
         Ok(link)
+    }
+
+    /// Rebuild the full public URL (`{public_url}#{generated}`) for an existing
+    /// link by decrypting its stored `Password` with the owner's address key. The
+    /// stored secret is the generated password with any custom password appended;
+    /// only the leading generated portion belongs in the URL fragment (the
+    /// recipient supplies the custom password separately). Returns `None` if the
+    /// link carries no password or it can't be decrypted, so the caller still gets
+    /// the link's metadata.
+    async fn recover_public_link_url(&self, dto: &ShareUrlDto) -> Option<String> {
+        if dto.public_url.is_empty() {
+            return None;
+        }
+        let enc = dto.password.as_deref()?;
+        let (_, email, _) = self.membership_address().await.ok()?;
+        let (address_keys, _) = self.own_address_keys(&email).await.ok()?;
+        let bytes = decrypt_armored_with_keys(enc, &address_keys).ok()?;
+        let full = String::from_utf8_lossy(&bytes);
+        let generated: String = full.chars().take(PUBLIC_LINK_PASSWORD_LEN).collect();
+        Some(format!("{}#{generated}", dto.public_url))
     }
 
     /// Remove a public link, revoking access via the URL
