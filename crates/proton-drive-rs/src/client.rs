@@ -55,9 +55,10 @@ use crate::dtos::{
     RenameLinkRequest, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
     RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
     ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
-    SharedWithMeResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
-    ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, UpdatePermissionsRequest,
-    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
+    SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
+    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
+    UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
+    VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
@@ -1606,6 +1607,43 @@ impl ProtonDriveClient {
                 if is_drive_item {
                     uids.push(NodeUid::new(link.volume_id.clone(), link.link_id.clone()));
                 }
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+
+        timer.success();
+        Ok(uids)
+    }
+
+    /// The nodes I have shared with others, as [`NodeUid`]s.
+    ///
+    /// Ported from the TypeScript SDK's `iterateSharedNodeUids`: page
+    /// `GET drive/v2/volumes/{vid}/shares` on its `AnchorID` cursor (the `drive/`
+    /// prefix comes from the client's base route). The endpoint lists only
+    /// collaborative shares that are still live — those with members, pending
+    /// invitations or a public URL — so an unshared or abandoned node never
+    /// appears. Materialize the uids with [`enumerate_nodes`](Self::enumerate_nodes).
+    pub async fn enumerate_shared_by_me_node_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self.telemetry.start("enumerate_shared_by_me_node_uids");
+        let volume_id = self.main_volume_id().await?;
+        let mut uids = Vec::new();
+        let mut anchor: Option<String> = None;
+
+        loop {
+            let path = match &anchor {
+                Some(anchor_id) => {
+                    format!("v2/volumes/{volume_id}/shares?AnchorID={anchor_id}")
+                }
+                None => format!("v2/volumes/{volume_id}/shares"),
+            };
+            let page: SharedByMeResponse = self.http.get(&path).await?;
+
+            for link in &page.links {
+                uids.push(NodeUid::new(volume_id.clone(), link.link_id.clone()));
             }
 
             anchor = page.anchor_id.filter(|id| !id.is_empty());

@@ -939,6 +939,30 @@ pub struct SharedWithMeLinkDto {
     pub share_target_type: i32,
 }
 
+/// `GET drive/v2/volumes/{volumeID}/shares` — one page of the collaborative
+/// shares I own that are still live (have members, invitations or a public URL).
+/// TS SDK `SharedByMeResponseDto`.
+#[derive(Debug, Deserialize)]
+pub struct SharedByMeResponse {
+    #[serde(rename = "Links", default)]
+    pub links: Vec<SharedByMeLinkDto>,
+    /// Cursor for the next page.
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<String>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+}
+
+/// One shared-by-me item. TS SDK `LinkSharedByMeResponseDto`. The volume is the
+/// one queried, so only the link (and its share) come back per entry.
+#[derive(Debug, Deserialize)]
+pub struct SharedByMeLinkDto {
+    #[serde(rename = "ShareID")]
+    pub share_id: ShareId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+}
+
 /// The kind of item a share points at. C# `ShareTargetType`.
 ///
 /// The Drive client exposes folders, files and vendor items; albums and photos
