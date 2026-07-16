@@ -33,7 +33,7 @@ use sha1::Sha1;
 use crate::cache::DriveEntityCache;
 use crate::crypto::{
     decrypt_content_key_verified, decrypt_extended_attributes_verified, decrypt_link,
-    decrypt_link_verified, decrypt_share_key,
+    decrypt_link_name_verified, decrypt_link_verified, decrypt_share_key,
 };
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
@@ -81,6 +81,23 @@ const TRASH_PAGE_SIZE: usize = 500;
 
 /// Photos returned per timeline page (C# `PhotosNodeOperations.TimelinePageSize`).
 const TIMELINE_PAGE_SIZE: usize = 500;
+
+/// How much of a node to decrypt when building it.
+///
+/// Unlocking a node's own key costs an S2K derivation (tens of milliseconds), so
+/// it is worth avoiding for callers that do not need what it protects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeDetail {
+    /// Decrypt everything: the node's key, and for a file the content key and
+    /// extended attributes it protects (so `claimed_size` and
+    /// `claimed_modification_time` are populated).
+    Full,
+    /// Decrypt only what the *parent* key can read: name, and signature
+    /// statuses. A file's key is left locked, leaving its claimed metadata and
+    /// content-key/xattr verification absent. Folders are unaffected — their key
+    /// is needed to reach their children.
+    Light,
+}
 
 /// Candidate name hashes checked per `checkAvailableHashes` request (C#
 /// `NodeOperations.GetAvailableNameAsync` `batchSize`).
@@ -279,7 +296,7 @@ impl ProtonDriveClient {
             .resolve_parent_key(&uid.volume_id, &details.link)
             .await?;
         let node = self
-            .build_node(&uid.volume_id, &details, &parent_key)
+            .build_node(&uid.volume_id, &details, &parent_key, NodeDetail::Full)
             .await?;
         timer.success();
         Ok(Some(node))
@@ -343,23 +360,54 @@ impl ProtonDriveClient {
     /// to decrypt is logged and skipped (matching enumeration's partial-node
     /// behavior), so the result may be shorter than `uids`.
     pub async fn enumerate_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
+        self.enumerate_nodes_detail(uids, NodeDetail::Full).await
+    }
+
+    /// As [`enumerate_nodes`](Self::enumerate_nodes), but skips the parts of a
+    /// *file* that only its own node key can decrypt. The returned files carry
+    /// no [`claimed_size`](NodeKind::File::claimed_size) or
+    /// [`claimed_modification_time`](NodeKind::File::claimed_modification_time),
+    /// and no content-key or extended-attribute verification status. Everything
+    /// else — name, uid, parentage, timestamps, trashed/shared flags, and
+    /// `total_size_on_storage` — is identical. Folders are returned in full.
+    ///
+    /// Unlocking a file's node key costs an S2K derivation of tens of
+    /// milliseconds, which dominates a walk over a large tree. Use this to
+    /// enumerate cheaply and find what changed, then call
+    /// [`enumerate_nodes`](Self::enumerate_nodes) for the few nodes whose
+    /// claimed metadata you actually need.
+    pub async fn enumerate_nodes_light(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
+        self.enumerate_nodes_detail(uids, NodeDetail::Light).await
+    }
+
+    async fn enumerate_nodes_detail(
+        &self,
+        uids: &[NodeUid],
+        detail: NodeDetail,
+    ) -> Result<Vec<Node>> {
         let mut nodes = Vec::new();
 
         for (volume_id, link_ids) in group_by_volume(uids) {
             for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
                 let details = self.get_link_details(&volume_id, chunk).await?;
-                for detail in &details.links {
-                    let parent_key = match self.resolve_parent_key(&volume_id, &detail.link).await {
+                for link_details in &details.links {
+                    let parent_key = match self
+                        .resolve_parent_key(&volume_id, &link_details.link)
+                        .await
+                    {
                         Ok(key) => key,
                         Err(e) => {
-                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping node: parent key unavailable");
+                            tracing::warn!(link_id = %link_details.link.id, error = %e, "skipping node: parent key unavailable");
                             continue;
                         }
                     };
-                    match self.build_node(&volume_id, detail, &parent_key).await {
+                    match self
+                        .build_node(&volume_id, link_details, &parent_key, detail)
+                        .await
+                    {
                         Ok(node) => nodes.push(node),
                         Err(e) => {
-                            tracing::warn!(link_id = %detail.link.id, error = %e, "skipping undecryptable node");
+                            tracing::warn!(link_id = %link_details.link.id, error = %e, "skipping undecryptable node");
                         }
                     }
                 }
@@ -3307,6 +3355,39 @@ impl ProtonDriveClient {
             .clone())
     }
 
+    /// The share key that unlocks a volume-*root* link. Normally that's the My
+    /// Files root (backed by the main share key), but a registered device's
+    /// root folder is also parentless and lives on the same volume while being
+    /// wrapped to that device's *own* share key. Match the root link id against
+    /// the device set and unlock the matching device share; fall back to the My
+    /// Files share for anything unrecognised (preserving the prior behaviour).
+    async fn root_link_share_key(
+        &self,
+        volume_id: &VolumeId,
+        root_id: &LinkId,
+    ) -> Result<PrivateKey> {
+        self.ensure_my_files().await?;
+        if self
+            .cache
+            .lock()
+            .await
+            .my_files_root
+            .as_ref()
+            .is_some_and(|uid| &uid.link_id == root_id)
+        {
+            return self.root_share_key().await;
+        }
+        if let Ok(devices) = self.device_metadata().await
+            && let Some(device) = devices.into_iter().find(|d| {
+                &d.root_folder_uid.link_id == root_id && &d.root_folder_uid.volume_id == volume_id
+            })
+        {
+            let (key, _address_id) = self.share_key_by_id(&device.share_id).await?;
+            return Ok(key);
+        }
+        self.root_share_key().await
+    }
+
     /// Resolve the Photos share + root folder, caching them.
     ///
     /// Mirrors C# `PhotosNodeOperations.GetFreshExistingPhotosFolderAsync`:
@@ -3408,7 +3489,13 @@ impl ProtonDriveClient {
             .resolve_parent_key_ctx(&uid.volume_id, &details.link, true)
             .await?;
         let node = self
-            .build_node_ctx(&uid.volume_id, &details, &parent_key, true)
+            .build_node_ctx(
+                &uid.volume_id,
+                &details,
+                &parent_key,
+                true,
+                NodeDetail::Full,
+            )
             .await?;
         Ok(Some(node))
     }
@@ -3433,7 +3520,7 @@ impl ProtonDriveClient {
                         }
                     };
                     match self
-                        .build_node_ctx(&volume_id, detail, &parent_key, true)
+                        .build_node_ctx(&volume_id, detail, &parent_key, true, NodeDetail::Full)
                         .await
                     {
                         Ok(node) => nodes.push(node),
@@ -3645,7 +3732,15 @@ impl ProtonDriveClient {
         let mut key = match base_key {
             Some(key) => key,
             None if for_photos => self.photos_share_key().await?,
-            None => self.root_share_key().await?,
+            None => {
+                // The topmost ancestor (or `link` itself when it is parentless)
+                // is a volume root. Usually that's My Files, but device roots
+                // live on the same volume with their *own* share key, so pick
+                // the share by matching the root link id rather than assuming
+                // My Files (which would fail to decrypt: "missing key").
+                let root_id = ancestry.last().map_or(&link.id, |a| &a.id);
+                self.root_link_share_key(volume_id, root_id).await?
+            }
         };
 
         for ancestor in ancestry.iter().rev() {
@@ -3693,8 +3788,9 @@ impl ProtonDriveClient {
         volume_id: &VolumeId,
         details: &LinkDetailsDto,
         parent_key: &PrivateKey,
+        detail: NodeDetail,
     ) -> Result<Node> {
-        self.build_node_ctx(volume_id, details, parent_key, false)
+        self.build_node_ctx(volume_id, details, parent_key, false, detail)
             .await
     }
 
@@ -3704,10 +3800,26 @@ impl ProtonDriveClient {
         details: &LinkDetailsDto,
         parent_key: &PrivateKey,
         for_photos: bool,
+        detail: NodeDetail,
     ) -> Result<Node> {
         let link = &details.link;
-        let (decrypted, mut verification) =
-            decrypt_link_verified(&self.account, parent_key, link).await?;
+
+        // A file's node key is only needed to read its contents (content key,
+        // extended attributes), so a `Light` build of a file skips unlocking it
+        // — that unlock is an S2K derivation, and it dominates a walk over many
+        // nodes. A folder's key is always unlocked: it is what its children are
+        // decrypted with, so the walk cannot proceed without it.
+        let want_node_key =
+            detail == NodeDetail::Full || !matches!(link.parsed_type(), LinkType::File);
+        let (name, node_key, mut verification) = if want_node_key {
+            let (decrypted, verification) =
+                decrypt_link_verified(&self.account, parent_key, link).await?;
+            (decrypted.name, Some(decrypted.node_key), verification)
+        } else {
+            let (name, verification) =
+                decrypt_link_name_verified(&self.account, parent_key, link).await?;
+            (name, None, verification)
+        };
 
         let uid = NodeUid::new(volume_id.clone(), link.id.clone());
         let parent_uid = link
@@ -3717,12 +3829,15 @@ impl ProtonDriveClient {
 
         let kind = match link.parsed_type() {
             LinkType::Folder | LinkType::Album => {
+                let node_key = node_key.as_ref().ok_or_else(|| {
+                    ProtonError::invalid_operation("folder node built without its key")
+                })?;
                 // Cache the folder's node key for later child enumeration.
                 self.cache
                     .lock()
                     .await
                     .folder_keys
-                    .insert(uid.clone(), decrypted.node_key.clone());
+                    .insert(uid.clone(), node_key.clone());
                 NodeKind::Folder
             }
             LinkType::File => {
@@ -3733,12 +3848,14 @@ impl ProtonDriveClient {
                 // Decrypt + verify the content key (`ContentKeyPacketSignature`).
                 // Best-effort: a decode/decrypt failure leaves the status absent
                 // rather than failing the whole node.
-                if let Some(packet_b64) = file.content_key_packet.as_deref() {
+                if let Some(node_key) = node_key.as_ref()
+                    && let Some(packet_b64) = file.content_key_packet.as_deref()
+                {
                     match BASE64.decode(packet_b64) {
                         Ok(packet) => {
                             match decrypt_content_key_verified(
                                 &self.account,
-                                &decrypted.node_key,
+                                node_key,
                                 link.signature_email.as_deref(),
                                 &packet,
                                 file.content_key_signature.as_deref(),
@@ -3764,12 +3881,13 @@ impl ProtonDriveClient {
                 // leaves the claimed metadata absent rather than failing the node.
                 let mut claimed_size = None;
                 let mut claimed_modification_time = None;
-                if let Some(rev) = file.active_revision.as_ref()
+                if let Some(node_key) = node_key.as_ref()
+                    && let Some(rev) = file.active_revision.as_ref()
                     && let Some(xattr) = rev.extended_attributes.as_deref()
                 {
                     match decrypt_extended_attributes_verified(
                         &self.account,
-                        &decrypted.node_key,
+                        node_key,
                         rev.signature_email.as_deref(),
                         xattr,
                     )
@@ -3812,7 +3930,7 @@ impl ProtonDriveClient {
             uid: uid.clone(),
             parent_uid,
             kind,
-            name: decrypted.name,
+            name,
             creation_time: link.creation_time,
             modification_time: link.modification_time,
             trashed: link.is_trashed(),

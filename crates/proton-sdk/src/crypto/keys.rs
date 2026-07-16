@@ -1,8 +1,10 @@
 //! PGP secret-key parsing and the layered Proton decryption chain.
 //!
-//! rPGP 0.16 decrypts directly with a `(key, password)` pair rather than a
-//! distinct pre-unlock step, so a [`PrivateKey`] simply pairs a parsed
-//! [`SignedSecretKey`] with the passphrase that unlocks it.
+//! rPGP decrypts with a `(key, password)` pair rather than a distinct pre-unlock
+//! step, so a [`PrivateKey`] pairs a parsed [`SignedSecretKey`] with the
+//! passphrase that unlocks it. The secret material is decrypted once at parse
+//! time (see [`PrivateKey::from_armored`]) so that each later operation does not
+//! re-run the key's S2K derivation.
 
 use pgp::composed::{Deserializable, DetachedSignature, SignedSecretKey};
 use pgp::types::Password;
@@ -13,7 +15,9 @@ use super::messages;
 /// A Proton private key: a parsed secret key plus the passphrase that unlocks it.
 ///
 /// `Password` is not `Clone`, so we retain the raw passphrase bytes and build a
-/// `Password` on demand for each operation.
+/// `Password` on demand for each operation. The passphrase is still needed after
+/// construction only for key material that could not be decrypted up front (see
+/// [`PrivateKey::from_armored`]); decrypted material ignores the password.
 #[derive(Clone)]
 pub struct PrivateKey {
     key: SignedSecretKey,
@@ -22,18 +26,39 @@ pub struct PrivateKey {
 
 impl PrivateKey {
     /// Parse an armored secret key and validate that `passphrase` unlocks it.
+    ///
+    /// The secret material is decrypted in place and kept that way. rPGP derives
+    /// the key's S2K on *every* operation that takes a locked key plus a
+    /// password, and Proton's S2K is deliberately expensive — so leaving the key
+    /// locked here costs one full derivation per decrypt/sign, which dominates
+    /// any walk over many nodes (each node key is unlocked to read its children).
+    /// Decrypting once turns that into a one-off cost per key.
+    ///
+    /// This keeps the plaintext secret material resident for the key's lifetime,
+    /// which is no weaker than the alternative: we hold `passphrase` alongside
+    /// the locked key regardless, so the material is recoverable from memory
+    /// either way. Only the in-memory form changes — the armored key uploaded to
+    /// the server is built separately and stays locked.
     pub fn from_armored(armored: &str, passphrase: &[u8]) -> Result<Self, CryptoError> {
-        let (key, _headers) = SignedSecretKey::from_string(armored)
+        let (mut key, _headers) = SignedSecretKey::from_string(armored)
             .map_err(|e| CryptoError::Parse(format!("secret key: {e}")))?;
 
-        // Confirm the passphrase is correct up front, mirroring the C# `Unlock`.
-        // `unlock` returns `Result<Result<T>>`: the outer layer reports whether
-        // the secret params could be decrypted (i.e. the passphrase fit), the
-        // inner layer is our (trivial) closure result.
+        // Decrypting the primary key doubles as the passphrase check the C#
+        // `Unlock` does: a wrong passphrase cannot decrypt the secret params.
+        // (A key whose material is already plain is left alone and accepted, as
+        // an `unlock` check would have been.)
         let password = password_from_bytes(passphrase);
-        key.unlock(&password, |_, _| Ok(()))
-            .map_err(|e| CryptoError::Unlock(e.to_string()))?
+        key.primary_key
+            .remove_password(&password)
             .map_err(|e| CryptoError::Unlock(e.to_string()))?;
+
+        // Subkeys are locked with the same passphrase, so this normally succeeds
+        // for all of them. A subkey that resists is left locked rather than
+        // failing the whole key: it still works via `password()` (just at full
+        // S2K cost per use), and the primary may be all the caller needs.
+        for subkey in &mut key.secret_subkeys {
+            let _ = subkey.key.remove_password(&password);
+        }
 
         Ok(Self {
             key,
@@ -126,4 +151,50 @@ pub fn decrypt_armored_with_keys(
 
 pub(crate) fn password_from_bytes(bytes: &[u8]) -> Password {
     Password::from(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::encrypt::generate_node_key;
+
+    #[test]
+    fn from_armored_rejects_a_wrong_passphrase() {
+        // `from_armored` doubles as the passphrase check, so a key that does not
+        // belong to the passphrase must not parse.
+        let node = generate_node_key().expect("generate node key");
+        // Not `expect_err`: `PrivateKey` deliberately has no `Debug` (it holds
+        // decrypted secret material), so match the result instead.
+        match PrivateKey::from_armored(&node.locked_armored, b"not the passphrase") {
+            Err(CryptoError::Unlock(_)) => {}
+            Err(e) => panic!("expected an unlock error, got {e:?}"),
+            Ok(_) => panic!("wrong passphrase must not unlock the key"),
+        }
+    }
+
+    #[test]
+    fn key_decrypted_at_parse_time_still_decrypts_and_signs() {
+        // The secret material is decrypted in place at parse time; every
+        // operation must keep working against a key re-parsed from its armored
+        // (locked) form.
+        let node = generate_node_key().expect("generate node key");
+        let reparsed = PrivateKey::from_armored(&node.locked_armored, &node.passphrase)
+            .expect("correct passphrase unlocks the key");
+
+        // Decrypt (exercises the X25519 subkey) — the message is encrypted to the
+        // original handle and must open with the re-parsed one.
+        let plaintext = b"node passphrase".to_vec();
+        let armored = node.key.encrypt(&plaintext).expect("encrypt");
+        assert_eq!(
+            reparsed.decrypt_armored_message(&armored).expect("decrypt"),
+            plaintext
+        );
+
+        // Sign (exercises the Ed25519 primary).
+        let data = b"manifest bytes";
+        let sig = reparsed.sign_detached(data).expect("detached sign");
+        reparsed
+            .verify_detached_signature(&sig, data)
+            .expect("verify detached signature");
+    }
 }

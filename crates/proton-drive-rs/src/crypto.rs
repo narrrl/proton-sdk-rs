@@ -107,6 +107,38 @@ pub async fn decrypt_link_verified(
     parent_key: &PrivateKey,
     link: &LinkDto,
 ) -> Result<(DecryptedLink, NodeVerification)> {
+    let (passphrase, name, verification) = decrypt_link_parts(account, parent_key, link).await?;
+    let node_key = PrivateKey::from_armored(&link.key, &passphrase)?;
+    Ok((DecryptedLink { node_key, name }, verification))
+}
+
+/// As [`decrypt_link_verified`], but stops short of unlocking the node's own
+/// key: it yields only what the parent key can read (the name, and the
+/// signature statuses).
+///
+/// Unlocking a node key runs its S2K, which costs tens of milliseconds — per
+/// node. A caller that only needs a link's name and identity (enumerating a tree
+/// to find what changed, say) pays that for nothing, so it can stop here. The
+/// node key is only needed to reach a node's *contents*: its content key, its
+/// extended attributes, or its children.
+pub async fn decrypt_link_name_verified(
+    account: &AccountClient,
+    parent_key: &PrivateKey,
+    link: &LinkDto,
+) -> Result<(String, NodeVerification)> {
+    let (_passphrase, name, verification) = decrypt_link_parts(account, parent_key, link).await?;
+    Ok((name, verification))
+}
+
+/// The shared body of [`decrypt_link_verified`] and
+/// [`decrypt_link_name_verified`]: everything the parent key alone can decrypt.
+/// Returns the node passphrase (for callers that go on to unlock the node key),
+/// the name, and the signature statuses.
+async fn decrypt_link_parts(
+    account: &AccountClient,
+    parent_key: &PrivateKey,
+    link: &LinkDto,
+) -> Result<(Vec<u8>, String, NodeVerification)> {
     let node_claim = AuthorshipClaim::create(account, link.signature_email.as_deref()).await;
     let name_claim = if link.name_signature_email == link.signature_email {
         node_claim.clone()
@@ -117,7 +149,6 @@ pub async fn decrypt_link_verified(
     // Passphrase: decrypted with the parent key, signed (detached) by the node
     // author; verify against the node claim (fallback = parent key).
     let passphrase = parent_key.decrypt_armored_message(&link.passphrase)?;
-    let node_key = PrivateKey::from_armored(&link.key, &passphrase)?;
     let passphrase_status = match &link.passphrase_signature {
         Some(sig) => verify_detached(sig, &passphrase, &node_claim.ring(parent_key)),
         None => VerificationStatus::NotSigned,
@@ -136,7 +167,7 @@ pub async fn decrypt_link_verified(
         content_key: None,
         extended_attributes: None,
     };
-    Ok((DecryptedLink { node_key, name }, verification))
+    Ok((passphrase, name, verification))
 }
 
 /// Decrypt a file's content key and verify its `ContentKeyPacketSignature`.
