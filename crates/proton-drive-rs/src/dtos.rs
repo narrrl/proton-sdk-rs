@@ -692,6 +692,17 @@ pub struct RevisionCreationIdentity {
     pub revision_id: String,
 }
 
+/// `Details` object attached to an `AlreadyExists` (2500) error from
+/// `POST .../revisions`: the server names the draft revision already open on the
+/// link, and which client left it there. Mirrors C# `RevisionConflict`.
+#[derive(Debug, Deserialize)]
+pub struct RevisionConflict {
+    #[serde(rename = "ConflictDraftRevisionID", default)]
+    pub draft_revision_id: Option<String>,
+    #[serde(rename = "ConflictDraftClientUID", default)]
+    pub draft_client_uid: Option<String>,
+}
+
 /// `GET v2/volumes/{vid}/links/{lid}/revisions/{rid}/verification`.
 #[derive(Debug, Deserialize)]
 pub struct BlockVerificationInputResponse {

@@ -165,7 +165,14 @@ impl ApiHttpClient {
     pub async fn get_storage_blob(&self, url: &str, token: &str) -> Result<Bytes> {
         let mut timer = self.telemetry().start("storage_download");
         let response = send_retrying(&self.inner.config.retry_policy, || {
-            let mut request = self.inner.http.get(url).header(STORAGE_TOKEN_HEADER, token);
+            // Override the client-level (API) timeout: a 4 MiB block on a slow
+            // uplink legitimately outruns the 30s JSON budget.
+            let mut request = self
+                .inner
+                .http
+                .get(url)
+                .timeout(self.inner.config.storage_timeout)
+                .header(STORAGE_TOKEN_HEADER, token);
             if !self.inner.config.user_agent.is_empty() {
                 request =
                     request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
@@ -216,6 +223,7 @@ impl ApiHttpClient {
                 .inner
                 .http
                 .post(url)
+                .timeout(self.inner.config.storage_timeout)
                 .header(STORAGE_TOKEN_HEADER, token)
                 .multipart(form);
 
@@ -492,6 +500,7 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
         .as_ref()
         .map(|e| e.code)
         .unwrap_or(ResponseCode::Unknown);
+    let details = envelope.as_ref().and_then(|e| e.details.clone());
     let message = envelope.and_then(|e| e.error_message).unwrap_or_else(|| {
         status
             .canonical_reason()
@@ -503,6 +512,7 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
         code,
         http_status: status.as_u16(),
         message,
+        details,
     })
 }
 

@@ -9,7 +9,16 @@ pub const DEFAULT_BASE_URL: &str = "https://drive-api.proton.me/";
 pub const DEFAULT_REFRESH_REDIRECT_URI: &str = "https://proton.me";
 
 /// Default per-request timeout, matching `ProtonApiDefaults.DefaultTimeoutSeconds`.
+/// Applies to the JSON API calls (link details, listings, revision creation) —
+/// small requests where 30s is generous and a stall should fail fast.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default timeout for a single block-storage transfer (`get_storage_blob` /
+/// `post_storage_blob`). A block is up to 4 MiB and rides a different host from
+/// the API; on a slow uplink that transfer legitimately takes far longer than a
+/// JSON call, so it gets its own, much larger budget rather than tripping the
+/// 30s API timeout spuriously.
+pub const DEFAULT_STORAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default number of automatic retries on a retryable failure (rate-limit,
 /// transient transport error). The original attempt is not counted, so the
@@ -74,6 +83,10 @@ pub struct ProtonClientConfiguration {
     pub user_agent: String,
     pub refresh_redirect_uri: String,
     pub request_timeout: Duration,
+    /// Timeout for a single block-storage transfer. Separate from
+    /// `request_timeout` so a large block on a slow link does not fail against
+    /// the (short) API timeout. See [`DEFAULT_STORAGE_TIMEOUT`].
+    pub storage_timeout: Duration,
     pub retry_policy: RetryPolicy,
 }
 
@@ -86,6 +99,7 @@ impl ProtonClientConfiguration {
             user_agent: String::new(),
             refresh_redirect_uri: DEFAULT_REFRESH_REDIRECT_URI.to_owned(),
             request_timeout: DEFAULT_TIMEOUT,
+            storage_timeout: DEFAULT_STORAGE_TIMEOUT,
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -102,6 +116,11 @@ impl ProtonClientConfiguration {
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    pub fn with_storage_timeout(mut self, timeout: Duration) -> Self {
+        self.storage_timeout = timeout;
         self
     }
 

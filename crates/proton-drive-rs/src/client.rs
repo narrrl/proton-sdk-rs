@@ -2,15 +2,18 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 
 use proton_sdk::account::{AccountClient, KeySalt};
+use proton_sdk::api::ResponseCode;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
@@ -53,10 +56,10 @@ use crate::dtos::{
     LinkDetailsRequest, LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
     MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
-    RenameLinkRequest, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
-    RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
-    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
-    SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
+    RenameLinkRequest, RevisionConflict, RevisionCreationRequest, RevisionCreationResponse,
+    RevisionDto, RevisionResponse, RevisionUpdateRequest, ShareInvitationDto,
+    ShareInvitationsResponse, ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto,
+    ShareUrlsResponse, SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
     ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
     UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
     VolumeTrashResponse,
@@ -169,7 +172,13 @@ struct Bootstrap {
     photos: Mutex<()>,
 }
 
-#[derive(Default)]
+/// Upper bound on decrypted folder node keys held in memory. Reached only by a
+/// daemon that has navigated into more than this many distinct folders; eviction
+/// is always safe (a missing key is re-derived from the parent chain or, for a
+/// root, the share key), so this caps memory rather than changing behavior. See
+/// SDK plan #9.
+const FOLDER_KEY_CACHE_CAP: usize = 512;
+
 struct DriveCache {
     main_volume_id: Option<VolumeId>,
     my_files_share: Option<ShareKey>,
@@ -183,11 +192,32 @@ struct DriveCache {
     /// `v2/shares/photos` on every timeline page; `None` means "not yet checked".
     photos_volume_exists: Option<bool>,
     /// Decrypted node key per folder, used as the parent key for its children.
-    folder_keys: HashMap<NodeUid, PrivateKey>,
+    /// Bounded LRU ([`FOLDER_KEY_CACHE_CAP`]): a long-running daemon would
+    /// otherwise accumulate one entry per folder ever visited and never release
+    /// them. Entries are also dropped on the matching remote event
+    /// ([`ProtonDriveClient::invalidate_caches_for_event`]).
+    folder_keys: LruCache<NodeUid, PrivateKey>,
     /// The membership share behind each node another user shares with us, keyed
     /// by the shared node itself (which is that share's root link). `None` until
     /// [`ProtonDriveClient::shared_with_me_shares`] pages `v2/sharedwithme`.
     shared_with_me_shares: Option<HashMap<NodeUid, ShareId>>,
+}
+
+impl Default for DriveCache {
+    fn default() -> Self {
+        Self {
+            main_volume_id: None,
+            my_files_share: None,
+            my_files_root: None,
+            photos_share: None,
+            photos_root: None,
+            photos_volume_exists: None,
+            folder_keys: LruCache::new(
+                NonZeroUsize::new(FOLDER_KEY_CACHE_CAP).expect("cap is non-zero"),
+            ),
+            shared_with_me_shares: None,
+        }
+    }
 }
 
 /// An open revision draft ready to receive content blocks: the target revision
@@ -360,8 +390,22 @@ impl ProtonDriveClient {
     }
 
     /// Fetch a single node's decrypted metadata, or `None` if it does not exist.
+    ///
+    /// Read-through: a node already in the entity cache is returned without the
+    /// link-details round-trip or the S2K decryption the cold path pays (SDK plan
+    /// #7). The cache is kept honest by event-driven invalidation
+    /// ([`invalidate_caches_for_event`](Self::invalidate_caches_for_event) drops
+    /// a node on its remote change), so a hit is as fresh as the last event poll
+    /// — the same staleness window a consumer's own tree has. Callers that must
+    /// bypass the cache to force a refresh use
+    /// [`enumerate_nodes`](Self::enumerate_nodes), which always hits the network.
     pub async fn get_node(&self, uid: &NodeUid) -> Result<Option<Node>> {
         let mut timer = self.telemetry.start("get_node");
+        if let Some(info) = self.entities.try_get_node(uid).await? {
+            timer.attr("cache", "hit");
+            timer.success();
+            return Ok(Some(info.node));
+        }
         let response = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
@@ -613,6 +657,37 @@ impl ProtonDriveClient {
         }
 
         Ok(events)
+    }
+
+    /// Drop any cached state that a remote event may have invalidated.
+    ///
+    /// The in-memory [`DriveCache::folder_keys`] and the persistable
+    /// [`DriveEntityCache`] are populated on read and otherwise never expire, so
+    /// a node moved, renamed or re-keyed by another client would be served from a
+    /// stale entry forever (the leak/staleness called out as SDK plan #9). An
+    /// event consumer — e.g. [`EventManager`](crate::EventManager) — calls this
+    /// per event so those caches converge on the server.
+    ///
+    /// - `NodeUpdated` / `NodeDeleted`: forget the node's own folder key (its
+    ///   passphrase may have been re-encrypted) and its entity-cache entry. The
+    ///   parent's key is untouched — adding or removing a child does not re-key
+    ///   the parent.
+    /// - `ContinuityLost` / `ScopeAccessLost`: the cursor gap means we cannot know
+    ///   what changed, so drop every folder key and clear the entity cache.
+    /// - cursor-only / shared-with-me events: nothing cached to invalidate.
+    pub async fn invalidate_caches_for_event(&self, event: &DriveEvent) -> Result<()> {
+        match event {
+            DriveEvent::NodeUpdated { node_uid, .. } | DriveEvent::NodeDeleted { node_uid, .. } => {
+                self.cache.lock().await.folder_keys.pop(node_uid);
+                self.entities.remove_node(node_uid).await?;
+            }
+            DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
+                self.cache.lock().await.folder_keys.clear();
+                self.entities.clear().await?;
+            }
+            DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
+        }
+        Ok(())
     }
 
     /// Download and decrypt a file's active revision, returning its plaintext.
@@ -2855,7 +2930,7 @@ impl ProtonDriveClient {
             .lock()
             .await
             .folder_keys
-            .insert(uid.clone(), decrypted.node_key);
+            .put(uid.clone(), decrypted.node_key);
         Ok(decrypted.name)
     }
 
@@ -2995,16 +3070,66 @@ impl ProtonDriveClient {
         let (address_id, email, signing_key) = self.membership_address().await?;
 
         // Create the revision draft, superseding the active revision.
+        let client_uid = self.http.session_id().to_string();
         let request = RevisionCreationRequest {
             current_revision_id: active_revision_id,
-            client_uid: Some(self.http.session_id().to_string()),
+            client_uid: Some(client_uid.clone()),
             intended_upload_size,
         };
         let path = format!(
             "v2/volumes/{volume_id}/files/{}/revisions",
             file_uid.link_id
         );
-        let created: RevisionCreationResponse = self.http.post(&path, &request).await?;
+
+        // An upload interrupted mid-flight (e.g. the daemon was killed) leaves a
+        // draft revision open on the link, and every later attempt 409s with
+        // `AlreadyExists` forever. When the abandoned draft is our own client's
+        // (the server echoes `ConflictDraftClientUID`), delete it and retry —
+        // never touch another client's in-progress draft. Mirrors C#
+        // `NewRevisionDraftProvider`.
+        const MAX_DRAFT_ATTEMPTS: usize = 3;
+        let mut created: Option<RevisionCreationResponse> = None;
+        for _ in 0..MAX_DRAFT_ATTEMPTS {
+            match self
+                .http
+                .post::<_, RevisionCreationResponse>(&path, &request)
+                .await
+            {
+                Ok(response) => {
+                    created = Some(response);
+                    break;
+                }
+                Err(ProtonError::Api(ref e)) if e.code == ResponseCode::AlreadyExists => {
+                    let conflict = e
+                        .details
+                        .as_ref()
+                        .and_then(|d| serde_json::from_value::<RevisionConflict>(d.clone()).ok());
+                    let Some(RevisionConflict {
+                        draft_revision_id: Some(draft_id),
+                        draft_client_uid: Some(owner),
+                    }) = conflict
+                    else {
+                        // No detail, or a draft we can't attribute — do not delete
+                        // a draft that might be another client's live upload.
+                        return Err(ProtonError::invalid_operation(
+                            "revision draft already exists and cannot be recovered",
+                        ));
+                    };
+                    if owner != client_uid {
+                        return Err(ProtonError::invalid_operation(
+                            "revision draft is held by another client",
+                        ));
+                    }
+                    tracing::warn!(%file_uid, draft_id, "deleting our stale draft revision, then retrying");
+                    self.delete_revision(&volume_id, &file_uid.link_id, &draft_id)
+                        .await?;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        let created = created.ok_or_else(|| {
+            ProtonError::invalid_operation("revision draft creation kept conflicting after retries")
+        })?;
 
         Ok(RevisionDraft {
             volume_id,
@@ -3017,6 +3142,21 @@ impl ProtonDriveClient {
             signing_key,
             parent_hash_key: Vec::new(),
         })
+    }
+
+    /// Delete a revision (`DELETE v2/volumes/{vid}/files/{lid}/revisions/{rid}`).
+    /// Used to clear an abandoned draft revision left by an interrupted upload;
+    /// the server permits a writer to delete its own drafts. Mirrors C#
+    /// `FilesApiClient.DeleteRevisionAsync`.
+    async fn delete_revision(
+        &self,
+        volume_id: &VolumeId,
+        link_id: &LinkId,
+        revision_id: &str,
+    ) -> Result<()> {
+        let path = format!("v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}");
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        Ok(())
     }
 
     /// Encrypt, sign, verify and upload every content block of a draft revision,
@@ -3470,7 +3610,7 @@ impl ProtonDriveClient {
         let mut cache = self.cache.lock().await;
         cache.main_volume_id = Some(volume_id);
         cache.my_files_root = Some(root_uid.clone());
-        cache.folder_keys.insert(root_uid, decrypted_root.node_key);
+        cache.folder_keys.put(root_uid, decrypted_root.node_key);
         cache.my_files_share = Some(ShareKey {
             share_id,
             address_id: response.share.address_id.clone(),
@@ -3632,7 +3772,7 @@ impl ProtonDriveClient {
 
         let mut cache = self.cache.lock().await;
         cache.photos_root = Some(root_uid.clone());
-        cache.folder_keys.insert(root_uid, decrypted_root.node_key);
+        cache.folder_keys.put(root_uid, decrypted_root.node_key);
         cache.photos_share = Some(ShareKey {
             share_id,
             address_id: response.share.address_id.clone(),
@@ -3878,7 +4018,7 @@ impl ProtonDriveClient {
             .lock()
             .await
             .folder_keys
-            .insert(uid.clone(), decrypted.node_key.clone());
+            .put(uid.clone(), decrypted.node_key.clone());
         Ok(decrypted.node_key)
     }
 
@@ -3950,7 +4090,7 @@ impl ProtonDriveClient {
                 .lock()
                 .await
                 .folder_keys
-                .insert(uid, decrypted.node_key.clone());
+                .put(uid, decrypted.node_key.clone());
             key = decrypted.node_key;
         }
 
@@ -4037,7 +4177,7 @@ impl ProtonDriveClient {
                     .lock()
                     .await
                     .folder_keys
-                    .insert(uid.clone(), node_key.clone());
+                    .put(uid.clone(), node_key.clone());
                 NodeKind::Folder
             }
             LinkType::File => {
@@ -4508,9 +4648,20 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DriveEvent, alternate_names, epoch_to_iso8601, to_drive_event};
+    use super::{
+        DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, alternate_names, epoch_to_iso8601,
+        to_drive_event,
+    };
     use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
     use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
+
+    #[test]
+    fn folder_key_cache_is_bounded() {
+        // The LRU that plan #9 introduced must actually carry the cap, or the
+        // daemon leaks one decrypted folder key per folder ever visited.
+        let cache = DriveCache::default();
+        assert_eq!(cache.folder_keys.cap().get(), FOLDER_KEY_CACHE_CAP);
+    }
 
     #[test]
     fn epoch_formats_as_iso8601_utc() {

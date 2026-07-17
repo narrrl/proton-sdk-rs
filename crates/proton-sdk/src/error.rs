@@ -44,6 +44,9 @@ pub struct ProtonApiError {
     pub http_status: u16,
     /// Human-readable message from the `Error` field, if present.
     pub message: String,
+    /// Raw `Details` object from the error envelope, when present. Endpoint
+    /// specific — e.g. a revision-creation conflict names the existing draft.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ProtonApiError {

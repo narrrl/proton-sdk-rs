@@ -13,6 +13,12 @@ pub struct ApiResponse {
 
     #[serde(rename = "Error", default)]
     pub error_message: Option<String>,
+
+    /// Endpoint-specific error detail object, when the API attaches one (e.g. a
+    /// revision-creation conflict names the existing draft here). Kept raw so
+    /// each caller can deserialize the shape it expects.
+    #[serde(rename = "Details", default)]
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiResponse {

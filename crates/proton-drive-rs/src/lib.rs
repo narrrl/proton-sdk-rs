@@ -37,6 +37,7 @@ mod client;
 mod crypto;
 mod devices;
 mod dtos;
+mod event_manager;
 mod events;
 mod node;
 mod photos;
@@ -46,6 +47,10 @@ mod sharing;
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
 pub use devices::{Device, DeviceType};
+pub use event_manager::{
+    CursorStore, DEFAULT_BACKGROUND_INTERVAL, DEFAULT_FOREGROUND_INTERVAL, EventManager,
+    EventManagerConfig, MemoryCursorStore,
+};
 pub use events::{DriveEvent, DriveEventScopeId};
 pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
