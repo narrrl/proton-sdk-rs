@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narrrl/proton-sdk-rs"
@@ -15,7 +15,7 @@ categories = ["api-bindings", "cryptography", "filesystem"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream", "multipart", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"

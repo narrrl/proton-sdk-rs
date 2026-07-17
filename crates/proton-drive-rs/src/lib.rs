@@ -1,8 +1,7 @@
 //! High-level Proton Drive client (Rust port).
 //!
-//! Built on top of [`proton_sdk`]. Milestone 1 covers session-backed read
-//! operations: resolving the My Files folder, fetching node metadata and
-//! enumerating folder children.
+//! Built on top of [`proton_sdk`]. Implements full read/write, uploads/downloads,
+//! sharing, bookmarks, device sync registration, events tracking, and photos timeline.
 //!
 //! ```no_run
 //! # async fn run() -> proton_sdk::error::Result<()> {
@@ -41,6 +40,7 @@ mod dtos;
 mod events;
 mod node;
 mod photos;
+mod revision;
 mod sharing;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
@@ -51,6 +51,7 @@ pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
 pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
+pub use revision::RevisionReader;
 pub use sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
     PublicLink, ShareInvitation, ShareMember,

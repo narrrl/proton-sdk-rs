@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rand::RngExt;
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
@@ -72,8 +73,14 @@ impl ApiHttpClient {
         session_id: SessionId,
         tokens: Tokens,
     ) -> Result<Self> {
+        // `gzip` makes reqwest advertise Accept-Encoding and transparently decode
+        // the response. The Proton API honours it for the JSON envelope, which is
+        // the bulk of a metadata-heavy walk (link details, listings). Block bodies
+        // are already ciphertext and will not compress — the header costs nothing
+        // there, and storage responses are unaffected either way.
         let http = reqwest::Client::builder()
             .timeout(config.request_timeout)
+            .gzip(true)
             .build()?;
 
         let base_url = ensure_trailing_slash(&config.base_url);
@@ -150,7 +157,12 @@ impl ApiHttpClient {
     /// rather than the session bearer. Mirrors C# `StorageApiClient
     /// .GetBlobStreamAsync`. A successful response is raw binary; an error
     /// response is the usual JSON envelope.
-    pub async fn get_storage_blob(&self, url: &str, token: &str) -> Result<Vec<u8>> {
+    ///
+    /// Returns [`Bytes`] rather than `Vec<u8>` so the 4 MiB body is not copied
+    /// on its way to the decryptor — the reference-counted buffer reqwest
+    /// already assembled is handed straight through, including into the
+    /// blocking decrypt task.
+    pub async fn get_storage_blob(&self, url: &str, token: &str) -> Result<Bytes> {
         let mut timer = self.telemetry().start("storage_download");
         let response = send_retrying(&self.inner.config.retry_policy, || {
             let mut request = self.inner.http.get(url).header(STORAGE_TOKEN_HEADER, token);
@@ -176,7 +188,7 @@ impl ApiHttpClient {
         }
 
         timer.success();
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// `POST {url}` a block blob to storage as `multipart/form-data`.
@@ -431,6 +443,7 @@ pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
 ) -> Result<T> {
     let http = reqwest::Client::builder()
         .timeout(config.request_timeout)
+        .gzip(true)
         .build()?;
 
     let base_url = ensure_trailing_slash(&config.base_url);

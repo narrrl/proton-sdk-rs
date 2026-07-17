@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, KeyInit, Mac};
 use proton_drive_rs::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
+use proton_sdk::error::ProtonError;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -70,16 +71,33 @@ async fn build_live_client() -> Option<LiveClient> {
     let config = ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT);
 
     // Fast path: resume a cached session (no TOTP). Validate with one cheap
-    // authenticated call so a dead/revoked session falls through to a fresh login.
+    // authenticated call so a session the tests cannot use falls through to a
+    // fresh login.
+    //
+    // The probe is `core/v4/keys/salts` specifically. A resumed session keeps
+    // working for most routes — `core/v4/users`, `core/v4/addresses`, even
+    // `drive/v2/shares/my-files` all still answer — long after its *password*
+    // scope has lapsed. Only the key-salts route reflects that, with
+    // `InsufficientScope` (HTTP 403). Since the salts are step one of every
+    // decryption chain (salt → bcrypt → unlock user keys), a session that cannot
+    // read them is useless to these tests even though it looks alive. Probing a
+    // route that does not need the scope is what let a dead session through and
+    // failed the whole binary.
     if let Some(stored) = load_cached_session() {
         let session = ProtonApiSession::resume(config.clone(), stored.into_params())
             .expect("resume cached session");
-        match session
+        let probe = session
             .http()
-            .get::<serde_json::Value>("core/v4/users")
-            .await
-        {
-            Ok(_) => {
+            .get::<serde_json::Value>("core/v4/keys/salts")
+            .await;
+
+        match probe {
+            Err(e) if needs_fresh_login(&e) => {
+                eprintln!("[auth] cached session lost its password scope ({e}); logging in fresh");
+            }
+            // Anything else — success, or a transport/parse hiccup — leaves the
+            // session usable; don't burn a TOTP window over it.
+            Ok(_) | Err(_) => {
                 eprintln!("[auth] resumed cached session (no TOTP)");
                 // Refresh may have rotated the tokens; re-persist the current set.
                 save_session(&session).await;
@@ -89,7 +107,6 @@ async fn build_live_client() -> Option<LiveClient> {
                     _session: session,
                 });
             }
-            Err(e) => eprintln!("[auth] cached session invalid ({e}); logging in fresh"),
         }
     }
 
@@ -119,6 +136,21 @@ async fn build_live_client() -> Option<LiveClient> {
         client,
         _session: session,
     })
+}
+
+/// Whether an error means the cached session cannot be used and a fresh SRP+2FA
+/// login is required.
+///
+/// `InsufficientScope` is the important one: no amount of token refreshing fixes
+/// it (the user must re-authenticate with their password), so the http client's
+/// automatic 401-refresh path cannot recover and every later call needing that
+/// scope fails the same way. A bare 401 that survived that refresh path means the
+/// refresh token is dead too.
+fn needs_fresh_login(error: &ProtonError) -> bool {
+    matches!(
+        error,
+        ProtonError::Api(e) if e.is_insufficient_scope() || e.is_unauthorized()
+    )
 }
 
 /// Persisted session credentials. Mirrors [`ResumeParameters`], serialized to a

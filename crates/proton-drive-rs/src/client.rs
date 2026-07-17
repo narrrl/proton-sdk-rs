@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
@@ -63,6 +64,9 @@ use crate::dtos::{
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
+use crate::revision::{
+    MAX_CONCURRENT_BLOCK_DOWNLOADS, RevisionReader, digest_and_decrypt_block_blocking,
+};
 use crate::sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
     PublicLink, ShareInvitation, ShareMember,
@@ -74,6 +78,19 @@ const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
 /// Maximum links per batch trash/restore/delete request (C#
 /// `NodeOperations.MaximumBatchCount`).
 const MAX_BATCH_COUNT: usize = 150;
+
+/// Content blocks a client keeps in memory at once, across every download it is
+/// running.
+///
+/// [`MAX_CONCURRENT_BLOCK_DOWNLOADS`] bounds one file; nothing bounded the host,
+/// so N concurrent downloads cost N times that — a mount pinning a handful of
+/// large files could hold hundreds of MiB of block buffers. This is the missing
+/// global ceiling (TypeScript caps concurrent *files* instead, in
+/// `internal/download/queue.ts`; capping blocks bounds the memory directly).
+///
+/// Sized a little above one file's concurrency so a lone download still
+/// saturates its pipeline and a second one is not starved.
+const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 12;
 
 /// Trashed links requested per page when enumerating the trash (C#
 /// `VolumeOperations.TrashPageSize`).
@@ -125,6 +142,31 @@ pub struct ProtonDriveClient {
     /// [`NoopTelemetry`]; supply one via
     /// [`ProtonDriveClient::with_telemetry`].
     telemetry: Arc<dyn Telemetry>,
+    /// Global cap on content blocks resident in memory across *all* downloads
+    /// this client is running. See
+    /// [`with_max_inflight_blocks`](ProtonDriveClient::with_max_inflight_blocks).
+    /// Shared across clones, which is the point: the bound is per host, not per
+    /// download.
+    block_slots: Arc<Semaphore>,
+    /// Serializes the My Files and Photos bootstraps against themselves.
+    ///
+    /// [`ensure_my_files`](ProtonDriveClient::ensure_my_files) and
+    /// [`ensure_photos`](ProtonDriveClient::ensure_photos) are check-then-act:
+    /// they read `cache`, drop its guard, fetch and decrypt a share over the
+    /// network, then re-acquire and store. Concurrent first calls would each run
+    /// the whole bootstrap. Holding this across the network is safe precisely
+    /// because it guards nothing else — `cache` stays free for every other
+    /// caller — and the loser re-checks and finds the work already done.
+    bootstrap: Arc<Bootstrap>,
+}
+
+/// The one-time-per-account setup that [`ProtonDriveClient`] single-flights.
+/// Separate locks: a Photos bootstrap has no reason to wait behind a My Files
+/// one, and neither ever waits on the other.
+#[derive(Default)]
+struct Bootstrap {
+    my_files: Mutex<()>,
+    photos: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -142,6 +184,10 @@ struct DriveCache {
     photos_volume_exists: Option<bool>,
     /// Decrypted node key per folder, used as the parent key for its children.
     folder_keys: HashMap<NodeUid, PrivateKey>,
+    /// The membership share behind each node another user shares with us, keyed
+    /// by the shared node itself (which is that share's root link). `None` until
+    /// [`ProtonDriveClient::shared_with_me_shares`] pages `v2/sharedwithme`.
+    shared_with_me_shares: Option<HashMap<NodeUid, ShareId>>,
 }
 
 /// An open revision draft ready to receive content blocks: the target revision
@@ -208,6 +254,8 @@ impl ProtonDriveClient {
             cache: Arc::new(Mutex::new(DriveCache::default())),
             entities: DriveEntityCache::new(entity_repository),
             telemetry: NoopTelemetry::shared(),
+            block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
+            bootstrap: Arc::new(Bootstrap::default()),
         }
     }
 
@@ -231,10 +279,19 @@ impl ProtonDriveClient {
             cache: Arc::new(Mutex::new(DriveCache::default())),
             entities: DriveEntityCache::new(InMemoryCacheRepository::shared()),
             telemetry: NoopTelemetry::shared(),
+            block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
+            bootstrap: Arc::new(Bootstrap::default()),
         }
     }
 
     /// The account client backing this Drive client's key chain.
+    /// The underlying HTTP client, for sibling modules that issue their own
+    /// requests against the same session (e.g. [`RevisionReader`] fetching
+    /// block bodies from storage).
+    pub(crate) fn http(&self) -> &ApiHttpClient {
+        &self.http
+    }
+
     pub fn account(&self) -> &AccountClient {
         &self.account
     }
@@ -261,6 +318,28 @@ impl ProtonDriveClient {
         self.http.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self
+    }
+
+    /// Cap the content blocks this client holds in memory at once, across every
+    /// download it is running. Defaults to [`DEFAULT_MAX_INFLIGHT_BLOCKS`].
+    ///
+    /// A permit is held from the moment a block's fetch starts until its
+    /// plaintext is consumed, so `blocks * BLOCK_SIZE` is roughly the ceiling on
+    /// resident block memory — the knob to turn down on a memory-constrained
+    /// host, at the cost of download throughput. Must be non-zero; a zero cap
+    /// would deadlock every download, so it is clamped to 1.
+    ///
+    /// Applies to this client and every clone made from it *afterwards*; clones
+    /// already taken keep the previous cap (they share the previous semaphore).
+    pub fn with_max_inflight_blocks(mut self, blocks: usize) -> Self {
+        self.block_slots = Arc::new(Semaphore::new(blocks.max(1)));
+        self
+    }
+
+    /// The global in-flight block permits, for [`RevisionReader`] and the
+    /// whole-file download path to acquire against.
+    pub(crate) fn block_slots(&self) -> Arc<Semaphore> {
+        self.block_slots.clone()
     }
 
     /// Resolve (and cache) the user's "My Files" root folder.
@@ -610,43 +689,40 @@ impl ProtonDriveClient {
             }
         }
 
-        for block in &blocks {
-            let ciphertext = self
-                .http
-                .get_storage_blob(&block.bare_url, &block.token)
-                .await?;
-            let digest = Sha256::digest(&ciphertext);
-            let plaintext = content_key.decrypt_block(&ciphertext)?;
-            output
-                .write_all(&plaintext)
-                .map_err(|e| ProtonError::invalid_operation(format!("write block: {e}")))?;
-            manifest.extend_from_slice(&digest);
-        }
+        self.write_content_blocks(&blocks, &content_key, &mut manifest, output)
+            .await?;
 
         verify_manifest(&self.account, &revision, &node_key, &manifest).await;
         timer.success();
         Ok(())
     }
 
-    /// Download and decrypt only the plaintext byte range `[offset, offset + length)`
-    /// of a file's active revision.
+    /// Open a seekable reader on a file's active revision.
     ///
     /// Each content block decrypts independently under the revision's content
-    /// key ([`ContentKey::decrypt_block`]), so an on-demand reader can fetch
-    /// just the blocks that overlap the requested range instead of the whole
-    /// file — the basis for a FUSE/placeholder mount that hydrates on access.
+    /// key ([`ContentKey::decrypt_block`]), so a reader can fetch just the
+    /// blocks that overlap a requested range instead of the whole file — the
+    /// basis for a FUSE/placeholder mount that hydrates on access.
+    ///
+    /// This resolves everything a read needs — link details, the ancestor chain,
+    /// the node key (an S2K unlock), the content key, the block table and the
+    /// per-block plaintext sizes — **once**. Subsequent
+    /// [`RevisionReader::read_at`] calls cost only the block bodies they
+    /// overlap. A caller that reads a file more than once (any on-demand mount:
+    /// a `read(2)` is far smaller than a 4 MiB block) should hold the reader for
+    /// as long as the file is open rather than calling
+    /// [`download_range`](Self::download_range) per read.
     ///
     /// Block plaintext sizes come from the revision's extended attributes
     /// (`Common.BlockSizes`); absent that, blocks are assumed to be
     /// [`DEFAULT_BLOCK_SIZE`] with a possibly-shorter final block inferred from
-    /// the recorded total size. The range is clamped to the file's length, so a
-    /// read at or past EOF yields fewer bytes (or none).
+    /// the recorded total size.
     ///
-    /// Unlike [`download_file_to`](Self::download_file_to), a partial read
-    /// cannot recompute the full content manifest, so manifest-signature
-    /// verification is skipped.
-    pub async fn download_range(&self, uid: &NodeUid, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let mut timer = self.telemetry.start("download_range");
+    /// The reader is pinned to the revision that is active now; it does not
+    /// follow later revisions of the same file.
+    pub async fn open_revision(&self, uid: &NodeUid) -> Result<RevisionReader> {
+        let mut timer = self.telemetry.start("open_revision");
+
         let details = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
@@ -684,40 +760,38 @@ impl ProtonDriveClient {
         let block_sizes = self
             .resolve_block_sizes(&node_key, &revision, blocks.len())
             .await;
-        let file_size: u64 = block_sizes.iter().sum();
 
-        if length == 0 || offset >= file_size {
-            timer.success();
-            return Ok(Vec::new());
-        }
-        let end = offset.saturating_add(length).min(file_size);
+        timer.success();
+        Ok(RevisionReader::new(
+            self.clone(),
+            uid.clone(),
+            revision_id,
+            content_key,
+            blocks,
+            block_sizes,
+        ))
+    }
 
-        // Walk blocks in order, fetching and decrypting only those whose
-        // plaintext span overlaps `[offset, end)`.
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        let mut block_start: u64 = 0;
-        for (block, &bsize) in blocks.iter().zip(block_sizes.iter()) {
-            let block_end = block_start + bsize;
-            if block_end <= offset {
-                block_start = block_end;
-                continue;
-            }
-            if block_start >= end {
-                break;
-            }
-            let ciphertext = self
-                .http
-                .get_storage_blob(&block.bare_url, &block.token)
-                .await?;
-            let plaintext = content_key.decrypt_block(&ciphertext)?;
-            let from = offset.saturating_sub(block_start) as usize;
-            let to = ((end - block_start) as usize).min(plaintext.len());
-            if from < to {
-                out.extend_from_slice(&plaintext[from..to]);
-            }
-            block_start = block_end;
-        }
-
+    /// Download and decrypt only the plaintext byte range `[offset, offset + length)`
+    /// of a file's active revision.
+    ///
+    /// A one-shot convenience over [`open_revision`](Self::open_revision): it
+    /// resolves the revision's keys and block table, reads the range, and drops
+    /// them. Callers that issue more than one read against the same file should
+    /// hold a [`RevisionReader`] instead — this call repeats the whole
+    /// resolution (two API round-trips and an S2K node-key unlock) every time.
+    ///
+    /// The range is clamped to the file's length, so a read at or past EOF
+    /// yields fewer bytes (or none).
+    ///
+    /// Unlike [`download_file_to`](Self::download_file_to), a partial read
+    /// cannot recompute the full content manifest, so manifest-signature
+    /// verification is skipped.
+    pub async fn download_range(&self, uid: &NodeUid, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let mut timer = self.telemetry.start("download_range");
+        let reader = self.open_revision(uid).await?;
+        let out = reader.read_at(offset, length).await?;
+        timer.attr("byte_count", out.len());
         timer.success();
         Ok(out)
     }
@@ -1639,7 +1713,20 @@ impl ProtonDriveClient {
     /// [`enumerate_nodes`](Self::enumerate_nodes).
     pub async fn enumerate_shared_with_me_node_uids(&self) -> Result<Vec<NodeUid>> {
         let mut timer = self.telemetry.start("enumerate_shared_with_me_node_uids");
+        let uids = self.page_shared_with_me().await?;
+        timer.success();
+        Ok(uids)
+    }
+
+    /// Page `v2/sharedwithme` in the order the API returns, recording each item's
+    /// membership share on the way through. Returns the uids; the share index is
+    /// left in the cache for [`shared_with_me_shares`](Self::shared_with_me_shares).
+    ///
+    /// Order is the API's and is preserved: it is what a front-end lists, and a
+    /// set's iteration order would reshuffle the page on every refresh.
+    async fn page_shared_with_me(&self) -> Result<Vec<NodeUid>> {
         let mut uids = Vec::new();
+        let mut shares = HashMap::new();
         let mut anchor: Option<String> = None;
 
         loop {
@@ -1653,7 +1740,9 @@ impl ProtonDriveClient {
                 let is_drive_item = ShareTargetType::from_raw(link.share_target_type)
                     .is_some_and(ShareTargetType::is_drive_item);
                 if is_drive_item {
-                    uids.push(NodeUid::new(link.volume_id.clone(), link.link_id.clone()));
+                    let uid = NodeUid::new(link.volume_id.clone(), link.link_id.clone());
+                    shares.insert(uid.clone(), link.share_id.clone());
+                    uids.push(uid);
                 }
             }
 
@@ -1663,8 +1752,29 @@ impl ProtonDriveClient {
             }
         }
 
-        timer.success();
+        self.cache.lock().await.shared_with_me_shares = Some(shares);
         Ok(uids)
+    }
+
+    /// The membership share id behind each node shared with us, keyed by the
+    /// shared node. Pages `v2/sharedwithme` on a miss; `refresh` re-pages even
+    /// when the index is already cached.
+    ///
+    /// A shared node is the root of the share its owner granted us, so it comes
+    /// back parentless on *their* volume and only that share's key unlocks it —
+    /// see [`root_link_share_key`](Self::root_link_share_key).
+    async fn shared_with_me_shares(&self, refresh: bool) -> Result<HashMap<NodeUid, ShareId>> {
+        if !refresh && let Some(shares) = self.cache.lock().await.shared_with_me_shares.clone() {
+            return Ok(shares);
+        }
+        self.page_shared_with_me().await?;
+        Ok(self
+            .cache
+            .lock()
+            .await
+            .shared_with_me_shares
+            .clone()
+            .unwrap_or_default())
     }
 
     /// The nodes I have shared with others, as [`NodeUid`]s.
@@ -3222,7 +3332,61 @@ impl ProtonDriveClient {
 
     /// Fetch every block of a revision (paginated), returning the revision
     /// metadata plus the contiguous, index-sorted block list.
-    async fn fetch_revision_blocks(
+    /// Fetch every content block, decrypt it, write the plaintext to `output`
+    /// and append the ciphertext digest to `manifest`.
+    ///
+    /// Blocks are fetched [`MAX_CONCURRENT_BLOCK_DOWNLOADS`] at a time and
+    /// decrypted off-runtime, but are consumed strictly in index order: both the
+    /// manifest (whose signature is checked over the concatenated digests) and
+    /// `output` depend on that ordering.
+    async fn write_content_blocks<W: std::io::Write>(
+        &self,
+        blocks: &[BlockDto],
+        content_key: &ContentKey,
+        manifest: &mut Vec<u8>,
+        output: &mut W,
+    ) -> Result<()> {
+        // Each fetch owns its url/token rather than borrowing `blocks`. Borrowing
+        // here makes the resulting future carry a higher-ranked lifetime that
+        // `tokio::spawn` rejects ("implementation of `FnOnce` is not general
+        // enough") in *callers* of `download_file_to` — a downstream break, not a
+        // local one, so it does not show up in this crate's own build.
+        let fetches: Vec<(String, String)> = blocks
+            .iter()
+            .map(|block| (block.bare_url.clone(), block.token.clone()))
+            .collect();
+
+        let mut decrypted = stream::iter(fetches.into_iter().map(|(url, token)| {
+            let http = self.http.clone();
+            let content_key = content_key.clone();
+            let slots = self.block_slots();
+            async move {
+                // The client-wide in-flight block cap. Held across fetch and
+                // decrypt, and returned to the caller so it outlives the
+                // plaintext sitting in `buffered`'s queue — see
+                // `RevisionReader::block_plaintext`.
+                let permit = slots.acquire_owned().await.map_err(|e| {
+                    ProtonError::invalid_operation(format!("block slots closed: {e}"))
+                })?;
+                let ciphertext = http.get_storage_blob(&url, &token).await?;
+                let (digest, plaintext) =
+                    digest_and_decrypt_block_blocking(content_key, ciphertext).await?;
+                Ok::<_, ProtonError>((digest, plaintext, permit))
+            }
+        }))
+        .buffered(MAX_CONCURRENT_BLOCK_DOWNLOADS);
+
+        while let Some((digest, plaintext, _permit)) = decrypted.try_next().await? {
+            output
+                .write_all(&plaintext)
+                .map_err(|e| ProtonError::invalid_operation(format!("write block: {e}")))?;
+            manifest.extend_from_slice(&digest);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_revision_blocks(
         &self,
         volume_id: &VolumeId,
         link_id: &LinkId,
@@ -3269,6 +3433,15 @@ impl ProtonDriveClient {
     }
 
     async fn ensure_my_files(&self) -> Result<()> {
+        if self.cache.lock().await.my_files_share.is_some() {
+            return Ok(());
+        }
+
+        // Only one of a burst of first calls does the bootstrap; the rest wait
+        // here and take the second check below. On failure the guard is dropped
+        // with nothing cached, so the next caller retries rather than inheriting
+        // the error.
+        let _guard = self.bootstrap.my_files.lock().await;
         if self.cache.lock().await.my_files_share.is_some() {
             return Ok(());
         }
@@ -3358,9 +3531,11 @@ impl ProtonDriveClient {
     /// The share key that unlocks a volume-*root* link. Normally that's the My
     /// Files root (backed by the main share key), but a registered device's
     /// root folder is also parentless and lives on the same volume while being
-    /// wrapped to that device's *own* share key. Match the root link id against
-    /// the device set and unlock the matching device share; fall back to the My
-    /// Files share for anything unrecognised (preserving the prior behaviour).
+    /// wrapped to that device's *own* share key, and a node another user shares
+    /// with us is parentless on *their* volume, wrapped to the membership share
+    /// we were granted. Match the root link id against the device set, then the
+    /// shared-with-me set, unlocking whichever share owns it; fall back to the
+    /// My Files share for anything unrecognised.
     async fn root_link_share_key(
         &self,
         volume_id: &VolumeId,
@@ -3385,7 +3560,31 @@ impl ProtonDriveClient {
             let (key, _address_id) = self.share_key_by_id(&device.share_id).await?;
             return Ok(key);
         }
+
+        let root_uid = NodeUid::new(volume_id.clone(), root_id.clone());
+        if let Some(key) = self.shared_with_me_share_key(&root_uid).await? {
+            return Ok(key);
+        }
+
         self.root_share_key().await
+    }
+
+    /// The membership share key for a node shared with us, or `None` when the
+    /// node is not one. A cached listing that misses is re-paged once, so a
+    /// share joined since the last listing still resolves.
+    async fn shared_with_me_share_key(&self, uid: &NodeUid) -> Result<Option<PrivateKey>> {
+        let was_cached = self.cache.lock().await.shared_with_me_shares.is_some();
+        let mut share_id = self.shared_with_me_shares(false).await?.get(uid).cloned();
+        if share_id.is_none() && was_cached {
+            share_id = self.shared_with_me_shares(true).await?.get(uid).cloned();
+        }
+        match share_id {
+            Some(share_id) => {
+                let (key, _address_id) = self.share_key_by_id(&share_id).await?;
+                Ok(Some(key))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Resolve the Photos share + root folder, caching them.
@@ -3396,6 +3595,17 @@ impl ProtonDriveClient {
     /// volume — the API answers [`ResponseCode::DoesNotExist`], which C# catches
     /// the same way. Read-only: it does not create a photos volume.
     async fn ensure_photos(&self) -> Result<bool> {
+        {
+            let cache = self.cache.lock().await;
+            if let Some(exists) = cache.photos_volume_exists {
+                return Ok(exists);
+            }
+        }
+
+        // Single-flighted for the same reason as `ensure_my_files`: a burst of
+        // first photos calls (a gallery opening pages several at once) would
+        // otherwise each fetch and decrypt the share.
+        let _guard = self.bootstrap.photos.lock().await;
         {
             let cache = self.cache.lock().await;
             if let Some(exists) = cache.photos_volume_exists {
@@ -3638,18 +3848,8 @@ impl ProtonDriveClient {
             }
         }
 
-        for block in &blocks {
-            let ciphertext = self
-                .http
-                .get_storage_blob(&block.bare_url, &block.token)
-                .await?;
-            let digest = Sha256::digest(&ciphertext);
-            let plaintext = content_key.decrypt_block(&ciphertext)?;
-            output
-                .write_all(&plaintext)
-                .map_err(|e| ProtonError::invalid_operation(format!("write block: {e}")))?;
-            manifest.extend_from_slice(&digest);
-        }
+        self.write_content_blocks(&blocks, &content_key, &mut manifest, output)
+            .await?;
 
         verify_manifest(&self.account, &revision, &node_key, &manifest).await;
         Ok(())

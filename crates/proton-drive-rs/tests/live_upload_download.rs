@@ -8,7 +8,44 @@
 
 mod common;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use proton_sdk::ids::NodeUid;
+use proton_sdk::telemetry::{Telemetry, TelemetryEvent};
+
+/// Counts telemetry events per operation, so a test can assert *which* work an
+/// SDK call actually did (e.g. that a read issued no API requests).
+#[derive(Default)]
+struct OpCounter {
+    counts: Mutex<HashMap<&'static str, usize>>,
+}
+
+impl Telemetry for OpCounter {
+    fn record(&self, event: &TelemetryEvent) {
+        *self
+            .counts
+            .lock()
+            .expect("counter poisoned")
+            .entry(event.operation)
+            .or_default() += 1;
+    }
+}
+
+impl OpCounter {
+    fn count(&self, operation: &str) -> usize {
+        self.counts
+            .lock()
+            .expect("counter poisoned")
+            .get(operation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn reset(&self) {
+        self.counts.lock().expect("counter poisoned").clear();
+    }
+}
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
 async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
@@ -259,4 +296,102 @@ async fn download_range_multi_block() {
     }
 
     cleanup(client, &[uid]).await;
+}
+
+/// A held `RevisionReader` serves the same ranges as `download_range`, and —
+/// the point of the handle — resolves the revision's metadata only once: the
+/// reads themselves must issue no API requests at all, only block fetches.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn open_revision_reader_reuses_resolved_metadata() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+
+    let counter = Arc::new(OpCounter::default());
+    // Clones share the session, caches and connection pool; only the telemetry
+    // sink differs, so the counts below are this test's own work.
+    let client = live.client.clone().with_telemetry(counter.clone());
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    // 10 MiB → blocks of 4 MiB, 4 MiB, 2 MiB.
+    let block = 4 * 1024 * 1024u64;
+    let size = (10 * 1024 * 1024) as usize;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761) as u8;
+    }
+
+    let name = format!("rt-reader-{}.bin", common::unique_suffix());
+    let uid = client
+        .upload_file_from(
+            &root.uid,
+            &name,
+            "application/octet-stream",
+            std::io::Cursor::new(payload.clone()),
+            size as i64,
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("upload_file_from");
+
+    let reader = client.open_revision(&uid).await.expect("open_revision");
+
+    assert_eq!(reader.size(), size as u64, "reader size");
+    assert_eq!(
+        reader.block_sizes(),
+        &[block, block, 2 * 1024 * 1024],
+        "reader block sizes"
+    );
+
+    // Everything the reader needs is now resolved. From here on, reads must
+    // only fetch block bodies.
+    counter.reset();
+
+    let total = size as u64;
+    let cases: &[(u64, u64)] = &[
+        (0, 256),                   // start of block 1
+        (block - 128, 256),         // straddles block 1 → block 2
+        (block, 4096),              // exact start of block 2
+        (2 * block - 1, 2),         // straddles block 2 → block 3 (final short block)
+        (2 * block + 1000, 50_000), // interior of final short block
+        (total - 100, 500),         // tail, length past EOF → clamps
+        (block - 10, block + 20),   // spans a full block plus both neighbors
+        (0, total),                 // whole file
+        (total, 4096),              // at EOF → empty
+    ];
+
+    for &(off, len) in cases {
+        let got = reader
+            .read_at(off, len)
+            .await
+            .unwrap_or_else(|e| panic!("read_at({off},{len}): {e}"));
+        let from = (off as usize).min(size);
+        let to = ((off + len) as usize).min(size);
+        let want = &payload[from..to];
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "read_at({off},{len}) length mismatch"
+        );
+        assert_eq!(got, want, "read_at({off},{len}) byte mismatch");
+    }
+
+    assert_eq!(
+        counter.count("http_request"),
+        0,
+        "reads must not re-resolve link details or the revision listing"
+    );
+    assert!(
+        counter.count("storage_download") > 0,
+        "reads must fetch block bodies"
+    );
+
+    cleanup(&client, &[uid]).await;
 }
