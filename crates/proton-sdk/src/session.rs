@@ -10,6 +10,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
+use crate::api::HumanVerificationCredential;
 use crate::config::ProtonClientConfiguration;
 use crate::crypto;
 use crate::error::{ProtonError, Result};
@@ -94,10 +95,30 @@ impl ProtonApiSession {
         username: &str,
         password: &[u8],
     ) -> Result<Self> {
-        let init: SessionInitiationResponse = http::post_unauthenticated(
+        Self::begin_verified(config, username, password, None).await
+    }
+
+    /// [`begin`](Self::begin), replaying a solved human-verification challenge.
+    ///
+    /// When a login is gated, the API answers `auth/v4/info` (or `auth/v4`) with
+    /// `9001` and a [`HumanVerification`](crate::api::HumanVerification)
+    /// challenge rather than a session. The caller presents that challenge,
+    /// collects the resulting token, and calls this — the login is *restarted*
+    /// from scratch with the credential attached, because the SRP handshake from
+    /// the gated attempt never completed and its `srp_session` is spent.
+    ///
+    /// The credential rides on both calls: the gate can be applied at either.
+    pub async fn begin_verified(
+        config: ProtonClientConfiguration,
+        username: &str,
+        password: &[u8],
+        verification: Option<&HumanVerificationCredential>,
+    ) -> Result<Self> {
+        let init: SessionInitiationResponse = http::post_unauthenticated_verified(
             &config,
             "auth/v4/info",
             &SessionInitiationRequest { username },
+            verification,
         )
         .await?;
 
@@ -117,7 +138,7 @@ impl ProtonApiSession {
             crypto::DEFAULT_BIT_LENGTH,
         )?;
 
-        let auth: AuthenticationResponse = http::post_unauthenticated(
+        let auth: AuthenticationResponse = http::post_unauthenticated_verified(
             &config,
             "auth/v4",
             &AuthenticationRequest {
@@ -126,6 +147,7 @@ impl ProtonApiSession {
                 client_proof: BASE64.encode(&proofs.client_proof),
                 srp_session: init.srp_session,
             },
+            verification,
         )
         .await?;
 

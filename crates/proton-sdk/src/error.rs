@@ -1,6 +1,6 @@
 //! Error types for the core SDK.
 
-use crate::api::ResponseCode;
+use crate::api::{HumanVerification, ResponseCode};
 
 pub type Result<T> = std::result::Result<T, ProtonError>;
 
@@ -62,5 +62,22 @@ impl ProtonApiError {
     /// fixes it; the user must authenticate with their password again.
     pub fn is_insufficient_scope(&self) -> bool {
         matches!(self.code, ResponseCode::InsufficientScope)
+    }
+
+    /// The request was gated behind human verification.
+    pub fn is_human_verification_required(&self) -> bool {
+        matches!(self.code, ResponseCode::HumanVerificationRequired)
+    }
+
+    /// The human-verification challenge, when this error carries one.
+    ///
+    /// `None` if the code is something else, or if the server gated the request
+    /// without describing how to satisfy it — which is not recoverable in-app
+    /// and should surface as a plain failure rather than an empty webview.
+    pub fn human_verification(&self) -> Option<HumanVerification> {
+        if !self.is_human_verification_required() {
+            return None;
+        }
+        serde_json::from_value(self.details.clone()?).ok()
     }
 }

@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
-use crate::api::{ApiResponse, ResponseCode};
+use crate::api::{ApiResponse, HumanVerificationCredential, ResponseCode};
 use crate::config::{API_CONTENT_TYPE, ProtonClientConfiguration, RetryPolicy};
 use crate::error::{ProtonApiError, ProtonError, Result};
 use crate::ids::SessionId;
@@ -24,6 +24,8 @@ use crate::telemetry::{NoopTelemetry, Telemetry, TelemetryExt};
 const SESSION_ID_HEADER: &str = "x-pm-uid";
 const APP_VERSION_HEADER: &str = "x-pm-appversion";
 const STORAGE_TOKEN_HEADER: &str = "pm-storage-token";
+const HV_TOKEN_HEADER: &str = "x-pm-human-verification-token";
+const HV_TOKEN_TYPE_HEADER: &str = "x-pm-human-verification-token-type";
 
 /// The mutable authentication tokens for a session, shared between every
 /// request and the refresh path.
@@ -481,6 +483,23 @@ pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T> {
+    post_unauthenticated_verified(config, path, body, None).await
+}
+
+/// [`post_unauthenticated`], optionally replaying a solved human-verification
+/// challenge.
+///
+/// A login from an unfamiliar IP comes back `9001` with a challenge instead of a
+/// session. Once the user has solved it, the *same* request is sent again with
+/// the resulting token in the header pair below — the challenge is not a
+/// separate handshake, it is a precondition attached to the original call, which
+/// is why this takes the credential rather than exposing a "verify" endpoint.
+pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
+    config: &ProtonClientConfiguration,
+    path: &str,
+    body: &B,
+    verification: Option<&HumanVerificationCredential>,
+) -> Result<T> {
     let http = reqwest::Client::builder()
         .timeout(config.request_timeout)
         .gzip(true)
@@ -497,6 +516,11 @@ pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
             .json(body);
         if !config.user_agent.is_empty() {
             request = request.header(reqwest::header::USER_AGENT, &config.user_agent);
+        }
+        if let Some(hv) = verification {
+            request = request
+                .header(HV_TOKEN_HEADER, &hv.token)
+                .header(HV_TOKEN_TYPE_HEADER, &hv.method);
         }
         request
     })
