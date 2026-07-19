@@ -692,11 +692,20 @@ pub struct RevisionCreationIdentity {
     pub revision_id: String,
 }
 
-/// `Details` object attached to an `AlreadyExists` (2500) error from
-/// `POST .../revisions`: the server names the draft revision already open on the
-/// link, and which client left it there. Mirrors C# `RevisionConflict`.
+/// `Details` object attached to an `AlreadyExists` (2500) error from a file
+/// creation (`POST .../files`) or a revision creation (`POST .../revisions`):
+/// the server names the conflicting link, its committed revision (if any) and
+/// the draft revision already open on it, plus which client left that draft.
+/// Mirrors C# `RevisionConflict`.
 #[derive(Debug, Deserialize)]
 pub struct RevisionConflict {
+    /// The link that already carries this name (set on file-creation conflicts).
+    #[serde(rename = "ConflictLinkID", default)]
+    pub link_id: Option<LinkId>,
+    /// The conflicting link's committed (active) revision, if it has one. A
+    /// value here means a real, sealed file — not a recoverable stale draft.
+    #[serde(rename = "ConflictRevisionID", default)]
+    pub revision_id: Option<String>,
     #[serde(rename = "ConflictDraftRevisionID", default)]
     pub draft_revision_id: Option<String>,
     #[serde(rename = "ConflictDraftClientUID", default)]
@@ -1572,4 +1581,150 @@ pub struct ShareUrlDto {
     pub flags: i32,
     #[serde(rename = "NumAccesses", default)]
     pub num_accesses: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Public-link session (consuming someone else's shared link)
+// ---------------------------------------------------------------------------
+
+/// `GET urls/{token}/info` — opens the SRP handshake for a public link.
+///
+/// Callable without any session (TS `SharingPublicSessionAPIService.initPublicLinkSession`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicLinkInfoResponse {
+    /// SRP auth version.
+    #[serde(rename = "Version", default)]
+    pub version: i32,
+    /// The cleartext-signed SRP modulus.
+    #[serde(rename = "Modulus", default)]
+    pub modulus: String,
+    /// base64 server ephemeral `B`.
+    #[serde(rename = "ServerEphemeral", default)]
+    pub server_ephemeral: String,
+    /// base64 SRP salt for the URL password.
+    #[serde(rename = "UrlPasswordSalt", default)]
+    pub url_password_salt: String,
+    #[serde(rename = "SRPSession", default)]
+    pub srp_session: String,
+    /// Bit 0 set = the link also needs a custom password. `0` or `1` alone marks
+    /// a legacy link the SDK no longer supports.
+    #[serde(rename = "Flags", default)]
+    pub flags: i32,
+    /// Non-zero for vendor links (Proton Docs and friends) that belong to
+    /// another app rather than to Drive.
+    #[serde(rename = "VendorType", default)]
+    pub vendor_type: i32,
+}
+
+impl PublicLinkInfoResponse {
+    /// Whether the link needs a custom password on top of the URL fragment.
+    pub fn is_custom_password_protected(&self) -> bool {
+        self.flags & 1 == 1
+    }
+
+    /// Whether this is a legacy link, which neither this SDK nor the upstream
+    /// TypeScript SDK can open (TS: `Flags === 0 || Flags === 1`).
+    pub fn is_legacy(&self) -> bool {
+        self.flags == 0 || self.flags == 1
+    }
+}
+
+/// `POST urls/{token}/auth` — completes the SRP handshake.
+#[derive(Debug, Serialize)]
+pub struct PublicLinkAuthRequest {
+    #[serde(rename = "ClientProof")]
+    pub client_proof: String,
+    #[serde(rename = "ClientEphemeral")]
+    pub client_ephemeral: String,
+    #[serde(rename = "SRPSession")]
+    pub srp_session: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicLinkAuthResponse {
+    /// base64 `M2`, to be checked against the locally computed expectation.
+    #[serde(rename = "ServerProof", default)]
+    pub server_proof: String,
+    /// The session id for subsequent requests (`x-pm-uid`).
+    #[serde(rename = "UID", default)]
+    pub uid: String,
+    /// Bearer token. Absent when the caller already has a Proton session that
+    /// the server accepted instead of minting an anonymous one.
+    #[serde(rename = "AccessToken", default)]
+    pub access_token: Option<String>,
+    #[serde(rename = "Share")]
+    pub share: PublicLinkShareDto,
+}
+
+/// The link's share crypto, returned by the auth handshake.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicLinkShareDto {
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    /// The link id of the shared node — the root of what the visitor can see.
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    /// base64 bcrypt salt for deriving the key password from the link password.
+    #[serde(rename = "SharePasswordSalt", default)]
+    pub share_password_salt: String,
+    /// The armored share private key.
+    #[serde(rename = "ShareKey", default)]
+    pub share_key: String,
+    /// The share key's passphrase, symmetrically encrypted under the derived
+    /// key password.
+    #[serde(rename = "SharePassphrase", default)]
+    pub share_passphrase: String,
+    #[serde(rename = "PublicPermissions", default)]
+    pub public_permissions: Option<i32>,
+}
+
+// ---------------------------------------------------------------------------
+// Revision history
+// ---------------------------------------------------------------------------
+
+/// `GET v2/volumes/{vid}/files/{lid}/revisions` — a file's revision history.
+#[derive(Debug, Deserialize)]
+pub struct RevisionListResponse {
+    #[serde(rename = "Revisions", default)]
+    pub revisions: Vec<RevisionListItemDto>,
+}
+
+/// `GET …/revisions/{rid}?NoBlockUrls=true` — one revision's metadata.
+///
+/// Deliberately reuses [`RevisionListItemDto`], which has no `Blocks` field: with
+/// `NoBlockUrls` the server still emits a `Blocks` array but with null `BareURL`
+/// and `Token`, which [`BlockDto`] rejects. Ignoring the array outright is both
+/// correct for a metadata read and stops a null from breaking it.
+#[derive(Debug, Deserialize)]
+pub struct RevisionMetadataResponse {
+    #[serde(rename = "Revision")]
+    pub revision: RevisionListItemDto,
+}
+
+/// One entry of a revision listing.
+///
+/// Distinct from [`RevisionDto`], which is the *single-revision* response and
+/// carries the block table. The listing omits blocks but adds `State` and
+/// `Size`, since a history view needs to tell active from superseded.
+#[derive(Debug, Deserialize)]
+pub struct RevisionListItemDto {
+    #[serde(rename = "ID")]
+    pub id: String,
+    /// Wire `ApiRevisionState`: 0 draft, 1 active, 2 obsolete/superseded.
+    #[serde(rename = "State", default)]
+    pub state: Option<i32>,
+    #[serde(rename = "CreateTime", default)]
+    pub creation_time: i64,
+    /// Encrypted size on cloud storage.
+    #[serde(rename = "Size", default)]
+    pub size: i64,
+    #[serde(rename = "ManifestSignature", default)]
+    pub manifest_signature: Option<String>,
+    /// Email of the signer; empty/absent means the node key signed.
+    #[serde(rename = "SignatureEmail", default)]
+    pub signature_email: Option<String>,
+    #[serde(rename = "XAttr", default)]
+    pub extended_attributes: Option<String>,
+    #[serde(rename = "Thumbnails", default)]
+    pub thumbnails: Vec<ThumbnailDto>,
 }

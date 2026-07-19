@@ -1,6 +1,6 @@
 //! The high-level Drive client and its read operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -57,9 +57,10 @@ use crate::dtos::{
     MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
     RenameLinkRequest, RevisionConflict, RevisionCreationRequest, RevisionCreationResponse,
-    RevisionDto, RevisionResponse, RevisionUpdateRequest, ShareInvitationDto,
-    ShareInvitationsResponse, ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto,
-    ShareUrlsResponse, SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
+    RevisionDto, RevisionListItemDto, RevisionListResponse, RevisionMetadataResponse,
+    RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
+    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
+    SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
     ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
     UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
     VolumeTrashResponse,
@@ -68,7 +69,7 @@ use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
 use crate::revision::{
-    MAX_CONCURRENT_BLOCK_DOWNLOADS, RevisionReader, digest_and_decrypt_block_blocking,
+    MAX_CONCURRENT_BLOCK_DOWNLOADS, Revision, RevisionReader, digest_and_decrypt_block_blocking,
 };
 use crate::sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
@@ -218,6 +219,22 @@ impl Default for DriveCache {
             shared_with_me_shares: None,
         }
     }
+}
+
+/// What a fresh-file draft should describe: where it goes, what it claims to
+/// be, and which of the upload variants it takes. Inputs to
+/// [`ProtonDriveClient::create_file_draft`].
+struct FileDraftSpec<'a> {
+    parent_uid: &'a NodeUid,
+    name: &'a str,
+    media_type: &'a str,
+    intended_upload_size: i64,
+    /// Encrypt blocks as SEIPDv2/AEAD rather than legacy SEIPDv1.
+    aead: bool,
+    /// Route the draft through the photos volume/share instead of My Files.
+    for_photos: bool,
+    /// Replace an existing draft at the same name instead of failing on it.
+    override_existing_draft: bool,
 }
 
 /// An open revision draft ready to receive content blocks: the target revision
@@ -540,6 +557,185 @@ impl ProtonDriveClient {
         Ok(nodes)
     }
 
+    /// The chain of nodes from the tree root down to `uid`, inclusive.
+    ///
+    /// The first element is the root (the node with no parent — My Files, a
+    /// device root, or a share root); the last is `uid` itself. Mirrors JS
+    /// `nodesAccess.getNodeHierarchy` and C# `TraversalOperations.FindRootForNode`,
+    /// which walks `ParentUid` upwards and rejects cycles.
+    ///
+    /// Returns `Ok(None)` when `uid` itself does not exist. A missing *ancestor*
+    /// is an error, not a truncated chain: a node whose parent cannot be read is
+    /// not placeable in the tree.
+    pub async fn get_node_hierarchy(&self, uid: &NodeUid) -> Result<Option<Vec<Node>>> {
+        let mut timer = self.telemetry.start("get_node_hierarchy");
+
+        let Some(node) = self.get_node(uid).await? else {
+            timer.success();
+            return Ok(None);
+        };
+
+        // Leaf-first while walking, reversed to root-first before returning.
+        let mut chain = vec![node];
+        let mut visited: HashSet<NodeUid> = HashSet::new();
+        visited.insert(uid.clone());
+
+        while let Some(parent_uid) = chain.last().and_then(|n| n.parent_uid.clone()) {
+            // Both upstream SDKs throw on a parent cycle rather than spinning.
+            if !visited.insert(parent_uid.clone()) {
+                return Err(ProtonError::invalid_operation(format!(
+                    "Folder structure loop detected at {parent_uid}"
+                )));
+            }
+            let parent = self.get_node(&parent_uid).await?.ok_or_else(|| {
+                ProtonError::invalid_operation(format!(
+                    "Node hierarchy is broken: parent {parent_uid} does not exist"
+                ))
+            })?;
+            chain.push(parent);
+        }
+
+        chain.reverse();
+        timer.attr("depth", chain.len());
+        timer.success();
+        Ok(Some(chain))
+    }
+
+    /// The absolute path of `uid` within its tree, e.g. `/Documents/report.pdf`.
+    ///
+    /// Built from [`get_node_hierarchy`](Self::get_node_hierarchy) with the root
+    /// dropped — the root's decrypted name is an internal placeholder ("root"),
+    /// not something a user ever sees. The root itself is therefore `/`.
+    ///
+    /// Beyond upstream: neither the C# nor the TypeScript SDK exposes paths.
+    /// Names are not path-safe — a Drive node name may legitimately contain any
+    /// character except `/` — so the result round-trips through
+    /// [`get_node_by_path`](Self::get_node_by_path) but is not a filesystem path.
+    pub async fn get_node_path(&self, uid: &NodeUid) -> Result<Option<String>> {
+        let Some(hierarchy) = self.get_node_hierarchy(uid).await? else {
+            return Ok(None);
+        };
+        Ok(Some(join_node_path(
+            hierarchy.iter().skip(1).map(|node| node.name.as_str()),
+        )))
+    }
+
+    /// Resolve a slash-separated path under `root_uid` to a node.
+    ///
+    /// `path` is matched segment by segment against decrypted child names;
+    /// leading, trailing, and repeated slashes are ignored, so `/a/b/`, `a/b`,
+    /// and `//a//b` are the same lookup. An empty path resolves to the root.
+    /// Returns `Ok(None)` as soon as a segment has no match.
+    ///
+    /// Beyond upstream. Node names are encrypted server-side and there is no
+    /// name-query endpoint, so this necessarily lists and decrypts one directory
+    /// level per segment. It uses
+    /// [`enumerate_nodes_light`](Self::enumerate_nodes_light) — only the name and
+    /// kind matter here, so the per-file node-key unlock is skipped — then
+    /// re-reads the final node in full so the returned [`Node`] carries complete
+    /// metadata.
+    ///
+    /// Matching is exact and case-sensitive (Drive names are case-sensitive).
+    /// When a folder holds several children of the same name — which the API
+    /// permits — the first in listing order wins.
+    pub async fn get_node_by_path(&self, root_uid: &NodeUid, path: &str) -> Result<Option<Node>> {
+        let mut timer = self.telemetry.start("get_node_by_path");
+
+        let mut current = root_uid.clone();
+        let mut descended = false;
+
+        for segment in path_segments(path) {
+            let Some(child) = self.find_child_by_name(&current, segment).await? else {
+                timer.success();
+                return Ok(None);
+            };
+            current = child;
+            descended = true;
+        }
+
+        // The walk only ever knew names and uids; fetch the target in full.
+        let node = if descended {
+            self.get_node(&current).await?
+        } else {
+            self.get_node(root_uid).await?
+        };
+        timer.success();
+        Ok(node)
+    }
+
+    /// Create every missing folder along `path` under `root_uid` (`mkdir -p`).
+    ///
+    /// Returns the uid of the deepest folder. Segments that already exist are
+    /// reused — including when they were created concurrently, in which case the
+    /// losing `create_folder` is retried as a lookup. A segment that exists but
+    /// is a *file* is an error: the path cannot be extended through it.
+    ///
+    /// Beyond upstream.
+    pub async fn create_folder_path(&self, root_uid: &NodeUid, path: &str) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("create_folder_path");
+        let mut current = root_uid.clone();
+
+        for segment in path_segments(path) {
+            if let Some(existing) = self.find_existing_folder(&current, segment).await? {
+                current = existing;
+                continue;
+            }
+
+            match self.create_folder(&current, segment, None).await {
+                Ok(uid) => current = uid,
+                // Lost a race against another writer (or the name was taken
+                // between the lookup and the create) — adopt the winner.
+                Err(err) => {
+                    let Some(existing) = self.find_existing_folder(&current, segment).await? else {
+                        return Err(err);
+                    };
+                    current = existing;
+                }
+            }
+        }
+
+        timer.success();
+        Ok(current)
+    }
+
+    /// Resolve one path segment to a child uid by decrypted name.
+    async fn find_child_by_name(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+    ) -> Result<Option<NodeUid>> {
+        let child_uids = self.enumerate_folder_children_node_uids(parent_uid).await?;
+        if child_uids.is_empty() {
+            return Ok(None);
+        }
+        let children = self.enumerate_nodes_light(&child_uids).await?;
+        Ok(children
+            .into_iter()
+            .find(|child| child.name == name)
+            .map(|child| child.uid))
+    }
+
+    /// As [`find_child_by_name`](Self::find_child_by_name), but demands a folder.
+    async fn find_existing_folder(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+    ) -> Result<Option<NodeUid>> {
+        let child_uids = self.enumerate_folder_children_node_uids(parent_uid).await?;
+        if child_uids.is_empty() {
+            return Ok(None);
+        }
+        let children = self.enumerate_nodes_light(&child_uids).await?;
+        match children.into_iter().find(|child| child.name == name) {
+            Some(child) if child.is_folder() => Ok(Some(child.uid)),
+            Some(child) => Err(ProtonError::invalid_operation(format!(
+                "Cannot create folder path: {name} exists as a file ({})",
+                child.uid
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Enumerate the [`NodeUid`]s of the main volume's trashed nodes.
     ///
     /// Mirrors C# `VolumeOperations.EnumerateTrashAsync` (renamed to
@@ -796,6 +992,16 @@ impl ProtonDriveClient {
     /// The reader is pinned to the revision that is active now; it does not
     /// follow later revisions of the same file.
     pub async fn open_revision(&self, uid: &NodeUid) -> Result<RevisionReader> {
+        self.open_revision_inner(uid, None).await
+    }
+
+    /// Open a reader on `revision_id`, or on the file's active revision when it
+    /// is `None`.
+    async fn open_revision_inner(
+        &self,
+        uid: &NodeUid,
+        revision_id: Option<&str>,
+    ) -> Result<RevisionReader> {
         let mut timer = self.telemetry.start("open_revision");
 
         let details = self
@@ -818,10 +1024,14 @@ impl ProtonDriveClient {
         let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
             ProtonError::invalid_operation(format!("decode content key packet: {e}"))
         })?;
-        let revision_id = file
-            .active_revision
-            .map(|r| r.id)
-            .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?;
+        // An explicit revision wins; otherwise pin whatever is active now.
+        let revision_id = match revision_id {
+            Some(id) => id.to_string(),
+            None => file
+                .active_revision
+                .map(|r| r.id)
+                .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?,
+        };
 
         let parent_key = self.resolve_parent_key(&uid.volume_id, &link).await?;
         let node_key = decrypt_link(&parent_key, &link)?.node_key;
@@ -834,7 +1044,7 @@ impl ProtonDriveClient {
 
         let block_sizes = self
             .resolve_block_sizes(&node_key, &revision, blocks.len())
-            .await;
+            .await?;
 
         timer.success();
         Ok(RevisionReader::new(
@@ -871,46 +1081,333 @@ impl ProtonDriveClient {
         Ok(out)
     }
 
+    /// List a file's revision history, newest state first as the server orders it.
+    ///
+    /// Mirrors TS `NodesRevisons.iterateRevisions`
+    /// (`GET v2/volumes/{vid}/files/{lid}/revisions`). Only **active** and
+    /// **superseded** revisions are returned: the listing also carries drafts —
+    /// in-flight uploads that have no readable content — and TS filters them out
+    /// the same way. A file always has exactly one active revision unless an
+    /// upload is mid-flight.
+    ///
+    /// Each revision's extended attributes are decrypted with the file's node
+    /// key to fill the `claimed_*` fields; a revision whose `XAttr` is absent or
+    /// unreadable is still returned, with those fields `None`.
+    pub async fn enumerate_revisions(&self, file_uid: &NodeUid) -> Result<Vec<Revision>> {
+        let mut timer = self.telemetry.start("enumerate_revisions");
+
+        let node_key = self.file_node_key(file_uid).await?;
+        let path = format!(
+            "v2/volumes/{}/files/{}/revisions",
+            file_uid.volume_id, file_uid.link_id
+        );
+        let response: RevisionListResponse = self.http.get(&path).await?;
+
+        let mut revisions = Vec::new();
+        for item in response.revisions {
+            if !is_listable_revision_state(item.state) {
+                continue;
+            }
+            revisions.push(self.build_revision(file_uid, &node_key, item).await);
+        }
+
+        timer.attr("revision_count", revisions.len());
+        timer.success();
+        Ok(revisions)
+    }
+
+    /// Fetch one revision's metadata by id.
+    ///
+    /// Mirrors TS `NodesRevisons.getRevision`. `NoBlockUrls=true`: this is a
+    /// metadata read, and asking for block URLs would make the server mint
+    /// short-lived storage tokens nothing here uses.
+    pub async fn get_revision(
+        &self,
+        file_uid: &NodeUid,
+        revision_id: &str,
+    ) -> Result<Option<Revision>> {
+        let node_key = self.file_node_key(file_uid).await?;
+        let path = format!(
+            "v2/volumes/{}/files/{}/revisions/{}?NoBlockUrls=true",
+            file_uid.volume_id, file_uid.link_id, revision_id
+        );
+        let response: RevisionMetadataResponse = match self.http.get(&path).await {
+            Ok(response) => response,
+            // A revision that is not there is a successful lookup, not an error.
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        Ok(Some(
+            self.build_revision(file_uid, &node_key, response.revision)
+                .await,
+        ))
+    }
+
+    /// Make an older revision current again.
+    ///
+    /// Mirrors TS `NodesRevisons.restoreRevision`
+    /// (`POST …/revisions/{rid}/restore`). The server does **not** move the
+    /// pointer in place: restoring creates a *new* active revision with the old
+    /// content, so the revision that was active before stays in the history as
+    /// superseded and `revision_id` keeps identifying the one restored *from*.
+    ///
+    /// **The restore is asynchronous.** The server answers HTTP 202 and applies
+    /// it in the background, so a read issued straight afterwards may still see
+    /// the previous active revision. Poll
+    /// [`enumerate_revisions`](Self::enumerate_revisions) (or re-read the file)
+    /// until the new revision appears rather than assuming it is live on return.
+    ///
+    /// The file's cached entry is dropped, since its active revision — and with
+    /// it the size and modification time a caller just read — has changed.
+    pub async fn restore_revision(&self, file_uid: &NodeUid, revision_id: &str) -> Result<()> {
+        let mut timer = self.telemetry.start("restore_revision");
+        let path = format!(
+            "v2/volumes/{}/files/{}/revisions/{}/restore",
+            file_uid.volume_id, file_uid.link_id, revision_id
+        );
+        // An empty *object*, not `()`: serde renders the unit type as `null`,
+        // which the API rejects with "JSON parsing of request body failed".
+        let result: Result<proton_sdk::api::ApiResponse> =
+            self.http.post(&path, &serde_json::json!({})).await;
+
+        match result {
+            Ok(_) => {}
+            // Restore is processed asynchronously: the server answers HTTP 202
+            // with an envelope whose code is not `1000`, which the generic
+            // response parser reports as an error. The request was accepted, so
+            // treat it as success — the new active revision appears once the
+            // server finishes, which a subsequent read observes.
+            Err(ProtonError::Api(e)) if e.http_status == 202 => {}
+            Err(e) => return Err(e),
+        }
+
+        self.entities.remove_node(file_uid).await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Permanently delete one revision from a file's history.
+    ///
+    /// Mirrors TS `NodesRevisons.deleteRevision`. The content is unrecoverable.
+    /// Deleting the *active* revision is rejected by the server — restore a
+    /// different one first, or delete the file itself.
+    pub async fn delete_revision(&self, file_uid: &NodeUid, revision_id: &str) -> Result<()> {
+        let mut timer = self.telemetry.start("delete_revision");
+        self.delete_revision_by_ids(&file_uid.volume_id, &file_uid.link_id, revision_id)
+            .await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Open a reader on a *specific* revision rather than the active one.
+    ///
+    /// The counterpart of [`open_revision`](Self::open_revision), which always
+    /// pins the active revision. Use it to read a superseded revision's content
+    /// — previewing a version before deciding whether to
+    /// [`restore_revision`](Self::restore_revision) it.
+    pub async fn open_revision_at(
+        &self,
+        file_uid: &NodeUid,
+        revision_id: &str,
+    ) -> Result<RevisionReader> {
+        self.open_revision_inner(file_uid, Some(revision_id)).await
+    }
+
+    /// Download a specific revision's plaintext.
+    ///
+    /// As with [`download_range`](Self::download_range), the content manifest is
+    /// not verified — see [`download_file_to`](Self::download_file_to) for the
+    /// verified whole-file path on the active revision.
+    pub async fn download_revision(
+        &self,
+        file_uid: &NodeUid,
+        revision_id: &str,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.download_revision_to(file_uid, revision_id, &mut out)
+            .await?;
+        Ok(out)
+    }
+
+    /// As [`download_revision`](Self::download_revision), streaming into `writer`.
+    pub async fn download_revision_to<W: std::io::Write>(
+        &self,
+        file_uid: &NodeUid,
+        revision_id: &str,
+        writer: &mut W,
+    ) -> Result<()> {
+        let mut timer = self.telemetry.start("download_revision");
+        let reader = self.open_revision_at(file_uid, revision_id).await?;
+
+        // Read block-aligned so each block is fetched and decrypted exactly once.
+        let mut offset = 0_u64;
+        let size = reader.size();
+        while offset < size {
+            let chunk = reader.read_at(offset, DEFAULT_BLOCK_SIZE as u64).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            offset += chunk.len() as u64;
+            writer
+                .write_all(&chunk)
+                .map_err(|e| ProtonError::invalid_operation(format!("write revision: {e}")))?;
+        }
+
+        timer.success();
+        Ok(())
+    }
+
+    /// Turn a listing entry into a public [`Revision`], decrypting its extended
+    /// attributes for the `claimed_*` fields.
+    ///
+    /// Infallible by construction: unreadable attributes are logged and leave
+    /// the claimed fields `None`, because a revision the caller cannot describe
+    /// in full is still one they may want to restore or delete.
+    async fn build_revision(
+        &self,
+        file_uid: &NodeUid,
+        node_key: &PrivateKey,
+        item: RevisionListItemDto,
+    ) -> Revision {
+        let common = match &item.extended_attributes {
+            Some(xattr) => match decrypt_extended_attributes_verified(
+                &self.account,
+                node_key,
+                item.signature_email.as_deref(),
+                xattr,
+            )
+            .await
+            {
+                Ok((attrs, _status)) => attrs.common,
+                Err(e) => {
+                    tracing::debug!(
+                        revision_id = %item.id,
+                        error = %e,
+                        "revision extended attributes did not decrypt"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        Revision {
+            file_uid: file_uid.clone(),
+            revision_id: item.id,
+            state: RevisionState::from_raw(item.state),
+            creation_time: item.creation_time,
+            size_on_storage: item.size,
+            claimed_size: common.as_ref().and_then(|c| c.size),
+            claimed_modification_time: common.as_ref().and_then(|c| c.modification_time.clone()),
+            claimed_sha1: common
+                .as_ref()
+                .and_then(|c| c.digests.as_ref())
+                .and_then(|d| d.sha1.clone()),
+            signature_email: item.signature_email.filter(|email| !email.is_empty()),
+            has_thumbnails: !item.thumbnails.is_empty(),
+        }
+    }
+
+    /// Resolve a file's own node key, unlocking it via its parent.
+    async fn file_node_key(&self, file_uid: &NodeUid) -> Result<PrivateKey> {
+        let details = self
+            .get_link_details(&file_uid.volume_id, std::slice::from_ref(&file_uid.link_id))
+            .await?;
+        let detail =
+            details.links.into_iter().next().ok_or_else(|| {
+                ProtonError::invalid_operation(format!("file {file_uid} not found"))
+            })?;
+        let parent_key = self
+            .resolve_parent_key(&file_uid.volume_id, &detail.link)
+            .await?;
+        Ok(decrypt_link(&parent_key, &detail.link)?.node_key)
+    }
+
     /// Plaintext size of each content block, in block order.
     ///
-    /// Prefers `Common.BlockSizes` from the revision's extended attributes (the
-    /// authoritative value written by the uploading client). When that is
-    /// absent, malformed, or the wrong length, assumes every block is
-    /// [`DEFAULT_BLOCK_SIZE`] with a final short block sized from `Common.Size`,
-    /// falling back to all-full blocks when even the total size is unknown.
+    /// These sizes are not merely descriptive: [`RevisionReader`] accumulates
+    /// them to derive where each block *starts* in the plaintext. A vector that
+    /// overstates any block but the last therefore shifts every block after it,
+    /// and the reader splices those blocks at the wrong offsets — returning
+    /// full-length reads of the wrong bytes, with no error to notice. See
+    /// `revision.rs::padded_block_sizes_shift_later_blocks`, which pins that
+    /// consequence.
+    ///
+    /// So the sources are ranked by how much they can be trusted, and the
+    /// function refuses rather than guesses when none of them holds:
+    ///
+    /// 1. `Common.BlockSizes` from the revision's extended attributes — the
+    ///    authoritative value, written by the uploading client.
+    /// 2. `Common.Size` — the total, from which all-but-last full blocks and a
+    ///    final short block follow by subtraction. Sound for the standard
+    ///    layout the uploader produces.
+    /// 3. Nothing usable. A single-block file cannot be misaligned (there is no
+    ///    later block to shift), so it is assumed full-size and only its
+    ///    reported length can be wrong. A multi-block file is an error: serving
+    ///    it would mean serving misplaced bytes.
     async fn resolve_block_sizes(
         &self,
         node_key: &PrivateKey,
         revision: &RevisionDto,
         block_count: usize,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>> {
         let common = match &revision.extended_attributes {
-            Some(xattr) => decrypt_extended_attributes_verified(
+            Some(xattr) => match decrypt_extended_attributes_verified(
                 &self.account,
                 node_key,
                 revision.signature_email.as_deref(),
                 xattr,
             )
             .await
-            .ok()
-            .and_then(|(attrs, _status)| attrs.common),
+            {
+                Ok((attrs, _status)) => attrs.common,
+                // Distinguished from "absent" on purpose: xattrs that are
+                // present but unreadable mean either a key/signature problem or
+                // a schema we do not know, and both are worth seeing in a log
+                // before the size falls back to inference.
+                Err(e) => {
+                    tracing::debug!(error = %e, "revision extended attributes did not decrypt");
+                    None
+                }
+            },
             None => None,
         };
+
+        let block = DEFAULT_BLOCK_SIZE as u64;
 
         if let Some(sizes) = common.as_ref().and_then(|c| c.block_sizes.as_ref())
             && sizes.len() == block_count
         {
-            return sizes.iter().map(|&n| n.max(0) as u64).collect();
+            // A non-positive entry is as corrupting as a padded one — a
+            // zero-length block in the middle shifts everything after it — so a
+            // malformed vector is rejected outright rather than clamped.
+            if let Some(bad) = sizes.iter().position(|&n| n <= 0) {
+                return Err(ProtonError::invalid_operation(format!(
+                    "revision {} records a non-positive size for block {bad}",
+                    revision.id
+                )));
+            }
+            return Ok(sizes.iter().map(|&n| n as u64).collect());
         }
 
-        let block = DEFAULT_BLOCK_SIZE as u64;
         if let Some(total) = common.and_then(|c| c.size).filter(|&n| n >= 0) {
             let total = total as u64;
-            return (0..block_count)
+            return Ok((0..block_count)
                 .map(|i| total.saturating_sub(block * i as u64).min(block))
-                .collect();
+                .collect());
         }
-        vec![block; block_count]
+
+        if block_count <= 1 {
+            return Ok(vec![block; block_count]);
+        }
+
+        Err(ProtonError::invalid_operation(format!(
+            "revision {} has {block_count} blocks but no usable size information \
+             (no BlockSizes, no Size); refusing to guess, since a wrong block \
+             layout would serve misaligned content",
+            revision.id
+        )))
     }
 
     /// Download and decrypt a file's thumbnail of the given type, if it has one.
@@ -1235,10 +1732,80 @@ impl ProtonDriveClient {
         last_modification_time: Option<i64>,
         aead: bool,
     ) -> Result<NodeUid> {
+        self.upload_file_from_inner(
+            parent_uid,
+            name,
+            media_type,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+            aead,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`upload_file_from`](Self::upload_file_from) but recovers a name
+    /// collision with *any* client's unsealed draft, not only our own: if a draft
+    /// of this name is already open, delete it and retry. Use only where the local
+    /// copy is authoritative and a leftover draft is expected to be a stale
+    /// interrupted upload — e.g. a mirror-sync push resuming across a daemon
+    /// restart, which rotates the client uid so our own prior draft would otherwise
+    /// look like a stranger's. A committed file of the same name is still a hard
+    /// conflict and is never overwritten. Mirrors C# `NewFileDraftProvider` with
+    /// `overrideExistingDraftByOtherClient: true`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_file_replacing_draft_from<R: Read + Send>(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        media_type: &str,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+        aead: bool,
+    ) -> Result<NodeUid> {
+        self.upload_file_from_inner(
+            parent_uid,
+            name,
+            media_type,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+            aead,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_file_from_inner<R: Read + Send>(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        media_type: &str,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+        aead: bool,
+        override_existing_draft: bool,
+    ) -> Result<NodeUid> {
         let mut timer = self.telemetry.start("upload_file");
         timer.attr("aead", aead);
         let draft = self
-            .create_file_draft(parent_uid, name, media_type, intended_size, aead, false)
+            .create_file_draft(FileDraftSpec {
+                parent_uid,
+                name,
+                media_type,
+                intended_upload_size: intended_size,
+                aead,
+                for_photos: false,
+                override_existing_draft,
+            })
             .await?;
         let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
 
@@ -1328,7 +1895,15 @@ impl ProtonDriveClient {
             .expect("ensure_photos populated the photos root");
 
         let draft = self
-            .create_file_draft(&parent_uid, name, media_type, intended_size, aead, true)
+            .create_file_draft(FileDraftSpec {
+                parent_uid: &parent_uid,
+                name,
+                media_type,
+                intended_upload_size: intended_size,
+                aead,
+                for_photos: true,
+                override_existing_draft: false,
+            })
             .await?;
         let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
 
@@ -2958,15 +3533,16 @@ impl ProtonDriveClient {
     /// Create a fresh-file draft: generate a node key + content key, encrypt the
     /// name/passphrase/content-key-packet to the parent, and POST the draft.
     /// Mirrors C# `NewFileDraftProvider`.
-    async fn create_file_draft(
-        &self,
-        parent_uid: &NodeUid,
-        name: &str,
-        media_type: &str,
-        intended_upload_size: i64,
-        aead: bool,
-        for_photos: bool,
-    ) -> Result<RevisionDraft> {
+    async fn create_file_draft(&self, spec: FileDraftSpec<'_>) -> Result<RevisionDraft> {
+        let FileDraftSpec {
+            parent_uid,
+            name,
+            media_type,
+            intended_upload_size,
+            aead,
+            for_photos,
+            override_existing_draft,
+        } = spec;
         let volume_id = parent_uid.volume_id.clone();
 
         // Resolve the parent folder key + hash key and the membership address.
@@ -3014,7 +3590,66 @@ impl ProtonDriveClient {
         };
 
         let create_path = format!("v2/volumes/{volume_id}/files");
-        let created: FileCreationResponse = self.http.post(&create_path, &create_request).await?;
+        let client_uid = self.http.session_id().to_string();
+
+        // An upload interrupted after the draft node was created but before it was
+        // sealed (e.g. a transport error on the blocks endpoint) leaves an unsealed
+        // draft file of this name in the parent, and every later attempt to create
+        // the same name then `AlreadyExists` (422) forever. When the conflicting
+        // link is an unsealed draft — a `ConflictDraftRevisionID` with no committed
+        // `ConflictRevisionID` — delete that draft node and retry. By default only
+        // our own client's draft (matching client uid) is cleared; with
+        // `override_existing_draft` any client's stale draft is (a draft holds no
+        // committed content, so this only forfeits an in-flight upload that will
+        // re-create on its next attempt — needed to recover across a daemon restart,
+        // which rotates our client uid). A committed file of this name is never
+        // touched: that is a real name collision the caller must resolve. Mirrors C#
+        // `NewFileDraftProvider.CreateDraftAsync` + `overrideExistingDraftByOtherClient`.
+        const MAX_DRAFT_ATTEMPTS: usize = 3;
+        let mut created: Option<FileCreationResponse> = None;
+        for _ in 0..MAX_DRAFT_ATTEMPTS {
+            match self
+                .http
+                .post::<_, FileCreationResponse>(&create_path, &create_request)
+                .await
+            {
+                Ok(response) => {
+                    created = Some(response);
+                    break;
+                }
+                Err(ProtonError::Api(e)) if e.code == ResponseCode::AlreadyExists => {
+                    let conflict = e
+                        .details
+                        .as_ref()
+                        .and_then(|d| serde_json::from_value::<RevisionConflict>(d.clone()).ok());
+                    match conflict {
+                        Some(RevisionConflict {
+                            link_id: Some(link_id),
+                            revision_id: None,
+                            draft_revision_id: Some(_),
+                            draft_client_uid,
+                        }) if override_existing_draft
+                            || draft_client_uid.as_deref() == Some(client_uid.as_str()) =>
+                        {
+                            tracing::warn!(
+                                %volume_id, %link_id, override_existing_draft,
+                                "deleting stale draft file node, then retrying create"
+                            );
+                            self.delete_draft_nodes(&volume_id, std::slice::from_ref(&link_id))
+                                .await?;
+                        }
+                        // A committed file of this name, or a draft owned by another
+                        // client we were not told to override — surface the original
+                        // conflict unchanged.
+                        _ => return Err(ProtonError::Api(e)),
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        let created = created.ok_or_else(|| {
+            ProtonError::invalid_operation("file draft creation kept conflicting after retries")
+        })?;
 
         Ok(RevisionDraft {
             volume_id,
@@ -3107,6 +3742,7 @@ impl ProtonDriveClient {
                     let Some(RevisionConflict {
                         draft_revision_id: Some(draft_id),
                         draft_client_uid: Some(owner),
+                        ..
                     }) = conflict
                     else {
                         // No detail, or a draft we can't attribute — do not delete
@@ -3121,7 +3757,7 @@ impl ProtonDriveClient {
                         ));
                     }
                     tracing::warn!(%file_uid, draft_id, "deleting our stale draft revision, then retrying");
-                    self.delete_revision(&volume_id, &file_uid.link_id, &draft_id)
+                    self.delete_revision_by_ids(&volume_id, &file_uid.link_id, &draft_id)
                         .await?;
                 }
                 Err(other) => return Err(other),
@@ -3148,7 +3784,7 @@ impl ProtonDriveClient {
     /// Used to clear an abandoned draft revision left by an interrupted upload;
     /// the server permits a writer to delete its own drafts. Mirrors C#
     /// `FilesApiClient.DeleteRevisionAsync`.
-    async fn delete_revision(
+    async fn delete_revision_by_ids(
         &self,
         volume_id: &VolumeId,
         link_id: &LinkId,
@@ -3157,6 +3793,35 @@ impl ProtonDriveClient {
         let path = format!("v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}");
         let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
         Ok(())
+    }
+
+    /// Permanently delete unsealed draft file nodes by link id via
+    /// `POST v2/volumes/{vid}/delete_multiple`. Unlike [`delete_nodes`], this does
+    /// not route through the trash — a never-sealed draft is not trashed, so the
+    /// trash-delete path does not apply. A per-link `DoesNotExist` is tolerated
+    /// (the draft may already be gone). Mirrors C# `LinksApiClient.DeleteMultipleAsync`
+    /// as used by `NewFileDraftProvider`.
+    async fn delete_draft_nodes(&self, volume_id: &VolumeId, link_ids: &[LinkId]) -> Result<()> {
+        let path = format!("v2/volumes/{volume_id}/delete_multiple");
+        let body = MultipleLinksRequest { link_ids };
+        let response: AggregateLinksResponse = self.http.post(&path, &body).await?;
+        let failures: Vec<String> = response
+            .responses
+            .iter()
+            .filter(|pair| {
+                !pair.response.is_success() && pair.response.code != ResponseCode::DoesNotExist
+            })
+            .map(|pair| format!("{} ({:?})", pair.link_id, pair.response.code))
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtonError::invalid_operation(format!(
+                "delete draft failed for {} link(s): {}",
+                failures.len(),
+                failures.join(", ")
+            )))
+        }
     }
 
     /// Encrypt, sign, verify and upload every content block of a draft revision,
@@ -3591,7 +4256,7 @@ impl ProtonDriveClient {
         // the volume, then re-read it through the normal path to populate caches.
         let response: MyFilesShareResponse = match self.http.get("v2/shares/my-files").await {
             Ok(response) => response,
-            Err(e) if is_my_files_missing(&e) => {
+            Err(e) if is_not_found(&e) => {
                 self.create_volume().await?;
                 self.http.get("v2/shares/my-files").await?
             }
@@ -4411,7 +5076,26 @@ fn read_full_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
 /// yet (and so one must be created). C# catches [`ResponseCode::DoesNotExist`];
 /// in practice a fresh account's lookup also surfaces as a bare HTTP 404, so
 /// both are treated as "missing".
-fn is_my_files_missing(error: &ProtonError) -> bool {
+/// Whether a listed revision is one a history view should show.
+///
+/// Only active (1) and superseded (2) qualify — TS
+/// `NodeAPIService.getRevisions` filters the same pair. Drafts (0) are
+/// in-flight uploads with no readable content, and an absent state cannot be
+/// vouched for.
+///
+/// This deliberately inspects the **wire** value rather than mapping through
+/// [`RevisionState::from_raw`] first: that mapping folds draft and unknown into
+/// `Active`, which is correct for a link's *active* revision (where the state is
+/// often omitted) but would silently promote a draft here.
+fn is_listable_revision_state(state: Option<i32>) -> bool {
+    matches!(state, Some(1) | Some(2))
+}
+
+/// Whether an API error means the requested entity simply is not there.
+///
+/// Both `DoesNotExist` in the envelope and a bare HTTP 404 occur in the wild for
+/// the same condition, depending on the endpoint.
+fn is_not_found(error: &ProtonError) -> bool {
     matches!(
         error,
         ProtonError::Api(e)
@@ -4478,16 +5162,24 @@ fn external_invitation_from_dto(
 /// Split a public-link URL (`https://drive.proton.me/urls/{token}#{password}`)
 /// into its token and password. Mirrors JS `getTokenAndPasswordFromUrl`: the
 /// token is the last path segment, the password the fragment after `#`.
-fn parse_public_link_url(url: &str) -> Result<(String, String)> {
+/// Split a public share URL into its token and secret fragment.
+///
+/// The format is `https://drive.proton.me/urls/{token}#{password}`
+/// (TS `getTokenAndPasswordFromUrl`). Both halves are required: a URL with no
+/// fragment carries no secret and opens nothing.
+///
+/// The token is taken as the segment *after* `/urls/` rather than as the last
+/// path segment, so a URL with an empty token (`…/urls/#password`) is rejected
+/// instead of silently yielding the container segment `"urls"` as the token.
+pub(crate) fn parse_public_link_url(url: &str) -> Result<(String, String)> {
+    const CONTAINER: &str = "/urls/";
     let invalid = || ProtonError::invalid_operation("invalid public link url");
+
     let (before_hash, password) = url.split_once('#').ok_or_else(invalid)?;
-    let token = before_hash
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(invalid)?;
-    if password.is_empty() {
+    let (_, after_container) = before_hash.rsplit_once(CONTAINER).ok_or_else(invalid)?;
+    let token = after_container.trim_end_matches('/');
+
+    if token.is_empty() || token.contains('/') || password.is_empty() {
         return Err(invalid());
     }
     Ok((token.to_string(), password.to_string()))
@@ -4525,6 +5217,28 @@ fn epoch_to_iso8601(secs: i64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Split a caller-supplied path into its non-empty segments.
+///
+/// Leading, trailing, and repeated separators are ignored, so `/a/b/`, `a/b`,
+/// and `//a//b` all yield `["a", "b"]`, and `""` / `"/"` yield nothing (the
+/// root itself).
+fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|segment| !segment.is_empty())
+}
+
+/// Join node names into an absolute path. The empty chain is the root, `/`.
+fn join_node_path<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut path = String::new();
+    for name in names {
+        path.push('/');
+        path.push_str(name);
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    path
 }
 
 fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
@@ -4650,10 +5364,51 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 mod tests {
     use super::{
         DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, alternate_names, epoch_to_iso8601,
-        to_drive_event,
+        is_listable_revision_state, join_node_path, path_segments, to_drive_event,
     };
     use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
+    use crate::node::RevisionState;
     use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
+
+    #[test]
+    fn only_sealed_revisions_are_listable() {
+        assert!(is_listable_revision_state(Some(1)), "active");
+        assert!(is_listable_revision_state(Some(2)), "superseded");
+        // A draft has no readable content, and `RevisionState::from_raw` would
+        // map it to Active — the exact trap this predicate exists to avoid.
+        assert!(!is_listable_revision_state(Some(0)), "draft");
+        assert!(!is_listable_revision_state(None), "unstated");
+        assert!(!is_listable_revision_state(Some(99)), "unknown");
+        assert_eq!(RevisionState::from_raw(Some(0)), RevisionState::Active);
+    }
+
+    #[test]
+    fn path_segments_ignores_separator_noise() {
+        let split = |p| path_segments(p).collect::<Vec<_>>();
+        assert_eq!(split("a/b"), ["a", "b"]);
+        assert_eq!(split("/a/b"), ["a", "b"]);
+        assert_eq!(split("/a/b/"), ["a", "b"]);
+        assert_eq!(split("//a///b//"), ["a", "b"]);
+        // The root is reachable as any of these, and must not yield a segment.
+        assert!(split("").is_empty());
+        assert!(split("/").is_empty());
+        assert!(split("///").is_empty());
+    }
+
+    #[test]
+    fn join_node_path_round_trips_through_path_segments() {
+        // A name may hold any character but `/`, so joining then re-splitting
+        // must recover exactly the names `get_node_by_path` will match on.
+        let names = ["Documents", "a b", "weird: name?", "trailing "];
+        let path = join_node_path(names.iter().copied());
+        assert_eq!(path, "/Documents/a b/weird: name?/trailing ");
+        assert_eq!(path_segments(&path).collect::<Vec<_>>(), names);
+    }
+
+    #[test]
+    fn join_node_path_of_the_root_is_a_bare_slash() {
+        assert_eq!(join_node_path(std::iter::empty()), "/");
+    }
 
     #[test]
     fn folder_key_cache_is_bounded() {

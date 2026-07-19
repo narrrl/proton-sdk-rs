@@ -18,7 +18,7 @@
 
 mod common;
 
-use proton_drive_rs::{MemberRole, ProtonDriveClient};
+use proton_drive_rs::{MemberRole, ProtonDriveClient, ProtonDrivePublicLinkClient};
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given node; best-effort, logs on failure.
@@ -249,4 +249,162 @@ async fn shared_with_me_and_incoming_invitations_read() {
         .await
         .expect("list_incoming_invitations must not error");
     eprintln!("[info] incoming invitations count: {}", incoming.len());
+}
+
+// ---------------------------------------------------------------------------
+// Public link — consuming a link as an anonymous visitor
+// ---------------------------------------------------------------------------
+
+/// Full loop: upload a file, publish a link on its folder, then open that link
+/// with [`ProtonDrivePublicLinkClient`] — no session — and read the file back.
+///
+/// This is the only test that exercises both halves of the public-link feature
+/// against each other, so a break in either the mint or the consume side shows
+/// up here.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn public_link_round_trips_through_the_visitor_client() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-visit").await;
+
+    let contents = b"public link visitor payload".to_vec();
+    let name = format!("shared-{}.txt", common::unique_suffix());
+    let file = client
+        .upload_file(&folder, &name, "text/plain", &contents)
+        .await
+        .expect("upload_file");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+
+    // Pre-auth metadata: a link with no custom password must say so, or a caller
+    // would prompt for one that does not exist.
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let info = ProtonDrivePublicLinkClient::info(common::config(), &url)
+        .await
+        .expect("public link info");
+    assert!(
+        !info.is_legacy,
+        "a freshly minted link must not read as legacy"
+    );
+    assert!(
+        !info.is_custom_password_protected,
+        "no custom password was set"
+    );
+
+    // Open it as a visitor — no session, only the URL.
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    assert_eq!(
+        visitor.public_role(),
+        MemberRole::Viewer,
+        "the link was minted read-only"
+    );
+
+    let root = visitor.get_root_node().await.expect("visitor root node");
+    assert_eq!(root.uid, folder, "the link points at the shared folder");
+    assert!(root.is_folder(), "the shared node is a folder");
+
+    // The shared subtree lists and decrypts with the share key alone.
+    let child_uids = visitor
+        .enumerate_folder_children_node_uids(&folder)
+        .await
+        .expect("visitor lists children");
+    assert!(
+        child_uids.contains(&file),
+        "the uploaded file must appear in the shared listing"
+    );
+
+    let children = visitor
+        .enumerate_nodes(&child_uids)
+        .await
+        .expect("visitor decrypts children");
+    let shared_file = children
+        .iter()
+        .find(|node| node.uid == file)
+        .expect("the uploaded file must decrypt for the visitor");
+    assert_eq!(
+        shared_file.name, name,
+        "the name must decrypt to what was uploaded"
+    );
+
+    // The payload itself: content key unwrapped from the node key, blocks pulled
+    // from storage with the anonymous session.
+    let downloaded = visitor
+        .download_file(&file)
+        .await
+        .expect("visitor download");
+    assert_eq!(
+        downloaded, contents,
+        "the visitor must read back exactly what was uploaded"
+    );
+
+    // Revoking the link must actually close the door.
+    client
+        .remove_public_link(&link)
+        .await
+        .expect("remove_public_link");
+    assert!(
+        ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+            .await
+            .is_err(),
+        "a revoked link must no longer open"
+    );
+
+    cleanup(client, &folder).await;
+}
+
+/// A custom-password link must advertise the requirement and refuse to open
+/// without it.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn custom_password_link_requires_the_password() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-custompw").await;
+    let custom = "s3cr3t!";
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, Some(custom), None)
+        .await
+        .expect("create_public_link with custom password");
+
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let info = ProtonDrivePublicLinkClient::info(common::config(), &url)
+        .await
+        .expect("public link info");
+    assert!(
+        info.is_custom_password_protected,
+        "the link must advertise that a custom password is needed"
+    );
+
+    // Without the custom password the SRP handshake itself fails — the server
+    // never hands over the encrypted share key.
+    assert!(
+        ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+            .await
+            .is_err(),
+        "opening without the custom password must fail"
+    );
+
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, Some(custom))
+        .await
+        .expect("open with the custom password");
+    let root = visitor.get_root_node().await.expect("visitor root node");
+    assert_eq!(root.uid, folder);
+
+    cleanup(client, &folder).await;
 }

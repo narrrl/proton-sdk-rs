@@ -24,6 +24,7 @@ pub use encrypt::{
 };
 pub use errors::CryptoError;
 pub use keys::{PrivateKey, decrypt_armored_with_keys};
+pub use messages::decrypt_armored_with_password;
 pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, SrpVerifier, generate_proofs, generate_verifier};
 pub use verify::{PublicKey, VerificationKeyRing, VerificationStatus, verify_detached};
 

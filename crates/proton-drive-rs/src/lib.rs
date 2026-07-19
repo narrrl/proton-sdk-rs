@@ -41,6 +41,7 @@ mod event_manager;
 mod events;
 mod node;
 mod photos;
+mod public_link;
 mod revision;
 mod sharing;
 
@@ -56,7 +57,8 @@ pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
 pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
 pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
-pub use revision::RevisionReader;
+pub use public_link::{ProtonDrivePublicLinkClient, PublicLinkInfo};
+pub use revision::{Revision, RevisionReader};
 pub use sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
     PublicLink, ShareInvitation, ShareMember,

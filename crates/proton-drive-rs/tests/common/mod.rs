@@ -23,8 +23,18 @@ use sha1::Sha1;
 
 // Must follow Proton's required shape (sdk/README.md "Operational requirements").
 // A malformed channel fails honest-identification → 422 "unusual activity".
-const APP_VERSION: &str = "external-drive-rust@0.1.0-alpha";
-const USER_AGENT: &str = "external-drive-rust/0.1.0";
+pub const APP_VERSION: &str = "external-drive-rust@0.1.0-alpha";
+pub const USER_AGENT: &str = "external-drive-rust/0.1.0";
+
+/// A fresh, unauthenticated client configuration — what the public-link client
+/// takes, since a visitor has no session to borrow one from.
+///
+/// `allow(dead_code)`: `common` is compiled into every live-test binary, and
+/// only `live_sharing` needs this one.
+#[allow(dead_code)]
+pub fn config() -> ProtonClientConfiguration {
+    ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT)
+}
 
 /// An authenticated Drive client plus the data password it was built with.
 pub struct LiveClient {

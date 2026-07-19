@@ -9,6 +9,8 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use proton_sdk::crypto::ContentKey;
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::ids::NodeUid;
+
+use crate::node::RevisionState;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock};
 
@@ -70,6 +72,45 @@ async fn join_decrypt<T>(
         .await
         .map_err(|e| ProtonError::invalid_operation(format!("block decrypt task failed: {e}")))?
         .map_err(Into::into)
+}
+
+/// One entry of a file's revision history.
+///
+/// Mirrors C# `Proton.Drive.Sdk.Nodes.Revision` and the TypeScript SDK's
+/// `DecryptedRevision`. The `claimed_*` fields come from the revision's
+/// decrypted extended attributes — they are what the *uploader* asserted, not
+/// something the server computed, hence the name (C# `ClaimedSize` /
+/// `ClaimedModificationTime`). They are `None` when the revision carries no
+/// `XAttr` or it failed to decrypt.
+#[derive(Debug, Clone)]
+pub struct Revision {
+    /// The file this revision belongs to.
+    pub file_uid: NodeUid,
+    /// Server-assigned revision id, unique within the file.
+    pub revision_id: String,
+    pub state: RevisionState,
+    /// Creation time, epoch seconds.
+    pub creation_time: i64,
+    /// Encrypted size on cloud storage, in bytes.
+    pub size_on_storage: i64,
+    /// Plaintext size as claimed by the uploader.
+    pub claimed_size: Option<i64>,
+    /// ISO-8601 modification time as claimed by the uploader, verbatim.
+    pub claimed_modification_time: Option<String>,
+    /// Lowercase-hex SHA-1 of the full plaintext, as claimed by the uploader.
+    pub claimed_sha1: Option<String>,
+    /// Email that signed the revision manifest; `None`/empty means the node key
+    /// signed it anonymously.
+    pub signature_email: Option<String>,
+    /// Whether the revision carries any thumbnails.
+    pub has_thumbnails: bool,
+}
+
+impl Revision {
+    /// Whether this is the file's current revision.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, RevisionState::Active)
+    }
 }
 
 /// The block table, versioned so a refresh can be deduplicated: a caller that
@@ -173,18 +214,7 @@ impl RevisionReader {
 
         // Which blocks overlap the range, and where each one starts in the
         // plaintext — resolved up front so the fetches can run concurrently.
-        let mut wanted: Vec<(usize, u64)> = Vec::new();
-        let mut block_start: u64 = 0;
-        for (index, &block_size) in self.block_sizes.iter().enumerate() {
-            if block_start >= end {
-                break;
-            }
-            let block_end = block_start + block_size;
-            if block_end > offset {
-                wanted.push((index, block_start));
-            }
-            block_start = block_end;
-        }
+        let wanted = plan_blocks(&self.block_sizes, offset, end);
 
         // `buffered` yields in input order, so the slices append in block order.
         // The closure takes the index *by value*: a closure taking a reference
@@ -202,11 +232,7 @@ impl RevisionReader {
             let (_, block_start) = wanted[next];
             next += 1;
 
-            let from = offset.saturating_sub(block_start) as usize;
-            let to = ((end - block_start) as usize).min(plaintext.len());
-            if from < to {
-                out.extend_from_slice(&plaintext[from..to]);
-            }
+            splice_block(&mut out, &plaintext, block_start, offset, end);
         }
 
         Ok(out)
@@ -294,6 +320,42 @@ impl RevisionReader {
     }
 }
 
+/// Which blocks overlap the plaintext range `[offset, end)`, paired with where
+/// each one starts in the plaintext.
+///
+/// A block's start is the running sum of the *preceding* blocks' sizes, so this
+/// is only correct if `block_sizes` describes the revision truthfully. A vector
+/// that pads a short block up to the full block size does not merely misreport
+/// the file's length — it shifts the computed start of every block after it, and
+/// the caller then splices those blocks at the wrong plaintext offsets. See
+/// `padded_block_sizes_shift_later_blocks` below, and the guarantee
+/// `ProtonDriveClient::resolve_block_sizes` has to uphold to make this sound.
+fn plan_blocks(block_sizes: &[u64], offset: u64, end: u64) -> Vec<(usize, u64)> {
+    let mut wanted = Vec::new();
+    let mut block_start: u64 = 0;
+    for (index, &block_size) in block_sizes.iter().enumerate() {
+        if block_start >= end {
+            break;
+        }
+        let block_end = block_start + block_size;
+        if block_end > offset {
+            wanted.push((index, block_start));
+        }
+        block_start = block_end;
+    }
+    wanted
+}
+
+/// Append the part of `plaintext` — a block beginning at `block_start` in the
+/// file — that falls inside the requested range `[offset, end)`.
+fn splice_block(out: &mut Vec<u8>, plaintext: &[u8], block_start: u64, offset: u64, end: u64) {
+    let from = offset.saturating_sub(block_start) as usize;
+    let to = ((end - block_start) as usize).min(plaintext.len());
+    if from < to {
+        out.extend_from_slice(&plaintext[from..to]);
+    }
+}
+
 /// Whether a storage fetch failed in a way that an expired block URL would
 /// produce. Block URLs carry their own authorization and are handed out with a
 /// server-side lifetime we neither control nor are told, so recovery is
@@ -303,4 +365,101 @@ fn is_expired_block_url(error: &ProtonError) -> bool {
         error,
         ProtonError::Api(e) if matches!(e.http_status, 401 | 403 | 404)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assemble a read exactly as [`RevisionReader::read_at`] does: plan the
+    /// blocks from what the reader *believes* the sizes are, then splice the
+    /// blocks the server *actually* returns. Splitting belief from reality is
+    /// the whole point — that gap is the bug.
+    fn read_as_reader_would(
+        believed_sizes: &[u64],
+        actual_blocks: &[Vec<u8>],
+        offset: u64,
+        length: u64,
+    ) -> Vec<u8> {
+        let file_size: u64 = believed_sizes.iter().sum();
+        if length == 0 || offset >= file_size {
+            return Vec::new();
+        }
+        let end = offset.saturating_add(length).min(file_size);
+        let mut out = Vec::new();
+        for (index, block_start) in plan_blocks(believed_sizes, offset, end) {
+            splice_block(&mut out, &actual_blocks[index], block_start, offset, end);
+        }
+        out
+    }
+
+    /// The file used throughout: two genuinely 3 MiB blocks, 6 MiB total, with
+    /// every byte carrying its own offset so a misplaced slice is identifiable
+    /// rather than just unequal.
+    fn short_block_file() -> (Vec<u64>, Vec<Vec<u8>>) {
+        const SHORT: usize = 3 << 20;
+        let truthful = vec![SHORT as u64, SHORT as u64];
+        let blocks: Vec<Vec<u8>> = (0..2)
+            .map(|b| (0..SHORT).map(|i| ((b * SHORT + i) % 251) as u8).collect())
+            .collect();
+        (truthful, blocks)
+    }
+
+    /// The whole file's plaintext, for comparison.
+    fn flatten(blocks: &[Vec<u8>]) -> Vec<u8> {
+        blocks.iter().flatten().copied().collect()
+    }
+
+    /// Truthful block sizes read the file correctly — the control.
+    #[test]
+    fn truthful_block_sizes_read_correctly() {
+        let (truthful, blocks) = short_block_file();
+        let whole = flatten(&blocks);
+        for (offset, length) in [(0, 1 << 20), (3 << 20, 1 << 20), (4 << 20, 1 << 20)] {
+            let got = read_as_reader_would(&truthful, &blocks, offset, length);
+            let want = &whole[offset as usize..(offset + length) as usize];
+            assert_eq!(got, want, "offset={offset} length={length}");
+        }
+    }
+
+    /// **The A1 reproduce.** `resolve_block_sizes`'s terminal fallback pads every
+    /// block to the full 4 MiB. For a file whose blocks are actually shorter,
+    /// that shifts each later block's computed start and the reader serves bytes
+    /// from the wrong part of the file — silently, with no error and no short
+    /// read to hint at it.
+    #[test]
+    fn padded_block_sizes_shift_later_blocks() {
+        let (_, blocks) = short_block_file();
+        let whole = flatten(&blocks);
+        // What the fallback would produce for a 2-block file: `vec![4 MiB; 2]`.
+        let padded = [4u64 << 20; 2];
+
+        // Read 1 MiB at 4 MiB. Block 1 truly starts at 3 MiB, but the padded
+        // sizes place it at 4 MiB, so the splice is off by exactly 1 MiB.
+        let got = read_as_reader_would(&padded, &blocks, 4 << 20, 1 << 20);
+        let want = &whole[(4 << 20)..(5 << 20)];
+        let shifted = &whole[(3 << 20)..(4 << 20)];
+
+        assert_eq!(
+            got.len(),
+            1 << 20,
+            "full length returned: nothing looks wrong"
+        );
+        assert_eq!(got, shifted, "bytes come from 1 MiB earlier than requested");
+        assert_ne!(got, want, "and they are not the bytes that were asked for");
+    }
+
+    /// The same padding also inflates the reported file size, so a read wholly
+    /// past the real EOF returns bytes instead of nothing.
+    #[test]
+    fn padded_block_sizes_inflate_file_size() {
+        let (truthful, _) = short_block_file();
+        let padded = [4u64 << 20; 2];
+        assert_eq!(truthful.iter().sum::<u64>(), 6 << 20, "the real size");
+        assert_eq!(
+            padded.iter().sum::<u64>(),
+            8 << 20,
+            "the size stat would show"
+        );
+    }
 }

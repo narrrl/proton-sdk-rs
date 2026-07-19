@@ -395,3 +395,202 @@ async fn open_revision_reader_reuses_resolved_metadata() {
 
     cleanup(&client, &[uid]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Revision history
+// ---------------------------------------------------------------------------
+
+/// Upload a file, replace it twice, then walk the history: list → read an old
+/// revision → restore it → delete a superseded one.
+///
+/// This is the only test that exercises revisions as a *history* rather than as
+/// upload plumbing, so it covers `enumerate_revisions`, `get_revision`,
+/// `download_revision`, `restore_revision` and `delete_revision` together.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn revision_history_lists_reads_restores_and_deletes() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let name = format!("revisions-{}.txt", common::unique_suffix());
+    let v1 = b"first revision contents".to_vec();
+    let v2 = b"second revision contents, longer than the first".to_vec();
+    let v3 = b"third".to_vec();
+
+    let file = client
+        .upload_file(&root.uid, &name, "text/plain", &v1)
+        .await
+        .expect("upload_file");
+    client
+        .upload_new_revision(&file, &v2)
+        .await
+        .expect("upload second revision");
+    client
+        .upload_new_revision(&file, &v3)
+        .await
+        .expect("upload third revision");
+
+    // Three sealed revisions, exactly one of them active.
+    let revisions = client
+        .enumerate_revisions(&file)
+        .await
+        .expect("enumerate_revisions");
+    assert_eq!(revisions.len(), 3, "three uploads means three revisions");
+    let active: Vec<_> = revisions.iter().filter(|r| r.is_active()).collect();
+    assert_eq!(active.len(), 1, "exactly one revision may be active");
+
+    // The active one must describe the newest upload. `claimed_size` is the
+    // uploader's plaintext size, so it is comparable to what we wrote —
+    // `size_on_storage` is the ciphertext and is not.
+    let active = active[0];
+    assert_eq!(
+        active.claimed_size,
+        Some(v3.len() as i64),
+        "the active revision must claim the newest payload's size"
+    );
+    assert!(
+        active.size_on_storage > 0,
+        "a sealed revision occupies storage"
+    );
+
+    // Fetching one by id must agree with the listing.
+    let fetched = client
+        .get_revision(&file, &active.revision_id)
+        .await
+        .expect("get_revision")
+        .expect("the active revision must exist");
+    assert_eq!(fetched.revision_id, active.revision_id);
+    assert!(fetched.is_active());
+    assert_eq!(fetched.claimed_size, active.claimed_size);
+
+    // A malformed id is a caller bug, not a missing entity: the server rejects
+    // it with 400 `InvalidEncryptedIdFormat` and that must surface as an error,
+    // not be flattened into `None`. (The genuine not-found path is checked
+    // against a deleted-but-well-formed id at the end of this test.)
+    assert!(
+        client.get_revision(&file, "does-not-exist").await.is_err(),
+        "a malformed revision id must error rather than read as absent"
+    );
+
+    // Superseded revisions, oldest first, are the two earlier uploads.
+    let mut superseded: Vec<_> = revisions.iter().filter(|r| !r.is_active()).collect();
+    superseded.sort_by_key(|r| r.creation_time);
+    assert_eq!(superseded.len(), 2);
+
+    let oldest = superseded[0];
+    assert_eq!(
+        oldest.claimed_size,
+        Some(v1.len() as i64),
+        "the oldest revision must still claim the first payload's size"
+    );
+
+    // Reading a superseded revision must give back its own content, not the
+    // active one's — the whole point of keeping history.
+    let old_bytes = client
+        .download_revision(&file, &oldest.revision_id)
+        .await
+        .expect("download_revision");
+    assert_eq!(
+        old_bytes, v1,
+        "a superseded revision must read back verbatim"
+    );
+    assert_eq!(
+        client.download_file(&file).await.expect("download_file"),
+        v3,
+        "the file itself must still serve the active revision"
+    );
+
+    // Restoring does not move the pointer in place: it mints a *new* active
+    // revision carrying the old content. The server applies it asynchronously
+    // (HTTP 202), so poll rather than assume it is live on return.
+    client
+        .restore_revision(&file, &oldest.revision_id)
+        .await
+        .expect("restore_revision");
+
+    let mut restored = false;
+    for _ in 0..30 {
+        if client
+            .download_file(&file)
+            .await
+            .expect("download after restore")
+            == v1
+        {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(
+        restored,
+        "after restore the file must serve the restored content within 30s"
+    );
+
+    let after_restore = client
+        .enumerate_revisions(&file)
+        .await
+        .expect("enumerate after restore");
+    assert!(
+        after_restore.len() >= 3,
+        "restoring must not drop history, got {}",
+        after_restore.len()
+    );
+    assert_eq!(
+        after_restore.iter().filter(|r| r.is_active()).count(),
+        1,
+        "still exactly one active revision after restore"
+    );
+
+    // Deleting a superseded revision removes it and leaves the rest alone.
+    let victim = after_restore
+        .iter()
+        .find(|r| !r.is_active())
+        .expect("a superseded revision to delete");
+    client
+        .delete_revision(&file, &victim.revision_id)
+        .await
+        .expect("delete_revision");
+
+    let after_delete = client
+        .enumerate_revisions(&file)
+        .await
+        .expect("enumerate after delete");
+    assert_eq!(
+        after_delete.len(),
+        after_restore.len() - 1,
+        "exactly one revision must disappear"
+    );
+    assert!(
+        !after_delete
+            .iter()
+            .any(|r| r.revision_id == victim.revision_id),
+        "the deleted revision must be gone from the history"
+    );
+    assert_eq!(
+        client
+            .download_file(&file)
+            .await
+            .expect("download after delete"),
+        v1,
+        "deleting a superseded revision must not disturb the active one"
+    );
+
+    // Now the real not-found path: a well-formed id whose revision is gone.
+    assert!(
+        client
+            .get_revision(&file, &victim.revision_id)
+            .await
+            .expect("a deleted revision must not error")
+            .is_none(),
+        "a deleted revision must resolve to None"
+    );
+
+    cleanup(client, &[file]).await;
+}

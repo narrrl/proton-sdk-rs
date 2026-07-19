@@ -331,3 +331,109 @@ async fn verification_folder_fully_verified() {
 
     cleanup(client, &[uid]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Hierarchy & path helpers
+// ---------------------------------------------------------------------------
+
+/// `create_folder_path` → `get_node_by_path` → `get_node_hierarchy` →
+/// `get_node_path`, asserting the four agree on the same nested tree.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn folder_path_helpers_round_trip() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let top = format!("path-ops-{}", common::unique_suffix());
+    let path = format!("{top}/nested/deep");
+
+    // mkdir -p
+    let deep = client
+        .create_folder_path(&root.uid, &path)
+        .await
+        .expect("create_folder_path");
+
+    // Idempotent: a second call adopts the existing folders, same uid.
+    let again = client
+        .create_folder_path(&root.uid, &path)
+        .await
+        .expect("create_folder_path is idempotent");
+    assert_eq!(again, deep, "re-creating a path must reuse the folders");
+
+    // Lookup by path, tolerating separator noise.
+    for variant in [path.as_str(), &format!("/{path}"), &format!("//{path}//")] {
+        let found = client
+            .get_node_by_path(&root.uid, variant)
+            .await
+            .unwrap_or_else(|e| panic!("get_node_by_path({variant}) errored: {e}"))
+            .unwrap_or_else(|| panic!("get_node_by_path({variant}) returned None"));
+        assert_eq!(found.uid, deep, "path {variant} must resolve to the folder");
+    }
+
+    // An empty path is the root itself.
+    let at_root = client
+        .get_node_by_path(&root.uid, "/")
+        .await
+        .expect("get_node_by_path(/)")
+        .expect("root must resolve");
+    assert_eq!(at_root.uid, root.uid, "empty path is the root");
+
+    // A missing segment resolves to None, not an error.
+    assert!(
+        client
+            .get_node_by_path(&root.uid, &format!("{top}/nope"))
+            .await
+            .expect("missing path must not error")
+            .is_none(),
+        "a missing segment must resolve to None"
+    );
+
+    // Hierarchy is root-first and ends at the queried node.
+    let hierarchy = client
+        .get_node_hierarchy(&deep)
+        .await
+        .expect("get_node_hierarchy")
+        .expect("hierarchy for an existing node");
+    assert_eq!(
+        hierarchy.first().map(|n| &n.uid),
+        Some(&root.uid),
+        "hierarchy must start at the tree root"
+    );
+    assert_eq!(
+        hierarchy.last().map(|n| &n.uid),
+        Some(&deep),
+        "hierarchy must end at the queried node"
+    );
+    let names: Vec<&str> = hierarchy.iter().skip(1).map(|n| n.name.as_str()).collect();
+    assert_eq!(names, [top.as_str(), "nested", "deep"]);
+
+    // The rendered path round-trips back through the path lookup.
+    let rendered = client
+        .get_node_path(&deep)
+        .await
+        .expect("get_node_path")
+        .expect("path for an existing node");
+    assert_eq!(rendered, format!("/{path}"));
+    let reresolved = client
+        .get_node_by_path(&root.uid, &rendered)
+        .await
+        .expect("re-resolve rendered path")
+        .expect("rendered path must resolve");
+    assert_eq!(reresolved.uid, deep, "rendered path must round-trip");
+
+    // Only the top folder needs cleaning — delete cascades to its children.
+    let top_uid = client
+        .get_node_by_path(&root.uid, &top)
+        .await
+        .expect("locate top folder")
+        .expect("top folder must exist")
+        .uid;
+    cleanup(client, &[top_uid]).await;
+}

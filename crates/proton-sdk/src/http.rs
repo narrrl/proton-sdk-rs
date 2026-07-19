@@ -444,6 +444,38 @@ struct SessionRefreshResponse {
 /// Used by the SRP login flow (`auth/v4/info`, `auth/v4`), which runs before a
 /// session exists. Mirrors the C# SDK's `BeginAsync`, which issues these calls
 /// on a session-less `HttpClient`.
+/// Issue a GET with no session, for endpoints reachable before authentication.
+///
+/// The public-link flow needs this: `drive/urls/{token}/info` opens the SRP
+/// handshake and is by definition callable by a visitor who has no Proton
+/// session at all.
+pub async fn get_unauthenticated<T: DeserializeOwned>(
+    config: &ProtonClientConfiguration,
+    path: &str,
+) -> Result<T> {
+    let http = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .gzip(true)
+        .build()?;
+
+    let base_url = ensure_trailing_slash(&config.base_url);
+    let url = format!("{}{}", base_url, path.trim_start_matches('/'));
+
+    let response = send_retrying(&config.retry_policy, || {
+        let mut request = http
+            .get(&url)
+            .header(APP_VERSION_HEADER, &config.app_version)
+            .header(reqwest::header::ACCEPT, API_CONTENT_TYPE);
+        if !config.user_agent.is_empty() {
+            request = request.header(reqwest::header::USER_AGENT, &config.user_agent);
+        }
+        request
+    })
+    .await?;
+
+    parse_response(response).await
+}
+
 pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
     config: &ProtonClientConfiguration,
     path: &str,
