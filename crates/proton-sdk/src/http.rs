@@ -439,12 +439,7 @@ struct SessionRefreshResponse {
     refresh_token: String,
 }
 
-/// `POST {path}` without a session: no `x-pm-uid` and no bearer token.
-///
-/// Used by the SRP login flow (`auth/v4/info`, `auth/v4`), which runs before a
-/// session exists. Mirrors the C# SDK's `BeginAsync`, which issues these calls
-/// on a session-less `HttpClient`.
-/// Issue a GET with no session, for endpoints reachable before authentication.
+/// `GET {path}` without a session: no `x-pm-uid` and no bearer token.
 ///
 /// The public-link flow needs this: `drive/urls/{token}/info` opens the SRP
 /// handshake and is by definition callable by a visitor who has no Proton
@@ -476,6 +471,11 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     parse_response(response).await
 }
 
+/// `POST {path}` without a session: no `x-pm-uid` and no bearer token.
+///
+/// Used by the SRP login flow (`auth/v4/info`, `auth/v4`), which runs before a
+/// session exists. Mirrors the C# SDK's `BeginAsync`, which issues these calls
+/// on a session-less `HttpClient`.
 pub async fn post_unauthenticated<B: Serialize, T: DeserializeOwned>(
     config: &ProtonClientConfiguration,
     path: &str,

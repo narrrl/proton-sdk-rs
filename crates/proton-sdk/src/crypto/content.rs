@@ -484,15 +484,6 @@ impl PrivateKey {
 }
 
 impl PrivateKey {
-    /// Re-encrypt the key packet of `armored_message` — a PGP message currently
-    /// addressed to this key — to `destination`, preserving the encrypted data
-    /// packet (and thus the plaintext and any *detached* signature over it).
-    ///
-    /// This is the session-key rewrap a node **move** performs on a node
-    /// passphrase: the secret stays identical, only its recipient changes (old
-    /// parent → new parent), so the locked node key still unlocks and the node's
-    /// `NodePassphraseSignature` need not be reissued. Mirrors C# move's
-    /// `destinationKey.EncryptSessionKey(currentKey.DecryptSessionKey(passphrase))`.
     /// Recover the session key of an armored PGP message addressed to this key.
     ///
     /// De-armors the message and decrypts its leading PKESK to recover the
@@ -510,6 +501,15 @@ impl PrivateKey {
         self.decrypt_content_key(&raw)
     }
 
+    /// Re-encrypt the key packet of `armored_message` — a PGP message currently
+    /// addressed to this key — to `destination`, preserving the encrypted data
+    /// packet (and thus the plaintext and any *detached* signature over it).
+    ///
+    /// This is the session-key rewrap a node **move** performs on a node
+    /// passphrase: the secret stays identical, only its recipient changes (old
+    /// parent → new parent), so the locked node key still unlocks and the node's
+    /// `NodePassphraseSignature` need not be reissued. Mirrors C# move's
+    /// `destinationKey.EncryptSessionKey(currentKey.DecryptSessionKey(passphrase))`.
     pub fn rewrap_message_to(
         &self,
         armored_message: &str,

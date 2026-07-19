@@ -12,7 +12,10 @@
 //! layers.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use lru::LruCache;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -56,29 +59,111 @@ pub async fn set_untagged(repo: &dyn CacheRepository, key: &str, value: &str) ->
     repo.set(key, value, &[]).await
 }
 
+/// Default entry ceiling for [`InMemoryCacheRepository`].
+///
+/// Generous: eviction here is always safe — a miss re-fetches — so the cost of
+/// being too small is a network round trip, while the cost of being unbounded
+/// is unbounded. Sized to cover a working set of a few thousand nodes (a deep
+/// browse, a sync pass) with room to spare, at a few MiB of JSON.
+pub const DEFAULT_CACHE_CAPACITY: usize = 8192;
+
 /// Thread-safe in-memory [`CacheRepository`]. Mirrors C#
-/// `InMemoryCacheRepository`.
-#[derive(Default)]
+/// `InMemoryCacheRepository`, with an LRU bound the C# version does not have.
+///
+/// The bound matters because the SDK's consumers are long-running: the entity
+/// cache is written through on every node built, so an unbounded map retains
+/// every node the process has ever seen. Entries are evicted least-recently-used
+/// once [`DEFAULT_CACHE_CAPACITY`] (or the capacity passed to
+/// [`with_capacity`](Self::with_capacity)) is reached.
 pub struct InMemoryCacheRepository {
     state: Mutex<InMemoryState>,
 }
 
-#[derive(Default)]
+impl Default for InMemoryCacheRepository {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CACHE_CAPACITY)
+    }
+}
+
 struct InMemoryState {
-    entries: HashMap<String, String>,
+    /// Bounded, so this cache cannot become a leak. Every removal from here
+    /// must go through [`InMemoryCacheRepository::clear_tags_for_key`] — an
+    /// evicted key left behind in `tag_to_keys` would leak exactly what the
+    /// bound is meant to prevent, and would make `get_by_tags` name keys that
+    /// are no longer held.
+    entries: LruCache<String, String>,
     key_to_tags: HashMap<String, HashSet<String>>,
     tag_to_keys: HashMap<String, HashSet<String>>,
 }
 
 impl InMemoryCacheRepository {
-    /// Create an empty in-memory cache.
+    /// Create an empty in-memory cache holding up to [`DEFAULT_CACHE_CAPACITY`]
+    /// entries.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty in-memory cache holding up to `capacity` entries. A
+    /// `capacity` of zero is raised to one: a cache that can hold nothing would
+    /// turn every read into a fetch while still paying the bookkeeping.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            state: Mutex::new(InMemoryState {
+                entries: LruCache::new(capacity),
+                key_to_tags: HashMap::new(),
+                tag_to_keys: HashMap::new(),
+            }),
+        }
     }
 
     /// Wrap a new in-memory cache in an [`Arc`] behind the trait object.
     pub fn shared() -> Arc<dyn CacheRepository> {
         Arc::new(Self::new())
+    }
+
+    /// Wrap a new capacity-bounded in-memory cache behind the trait object.
+    pub fn shared_with_capacity(capacity: usize) -> Arc<dyn CacheRepository> {
+        Arc::new(Self::with_capacity(capacity))
+    }
+
+    /// Number of entries currently held. Diagnostic — and what the bound test
+    /// asserts on.
+    pub fn len(&self) -> usize {
+        self.state().entries.len()
+    }
+
+    /// Whether the cache holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of keys the tag index knows about. Should track [`len`](Self::len);
+    /// a divergence is the leak this bound exists to prevent.
+    pub fn tag_index_len(&self) -> usize {
+        self.state().key_to_tags.len()
+    }
+
+    /// Take the state lock, tolerating poisoning.
+    ///
+    /// Every access goes through here, and none of them use `.lock().unwrap()`.
+    /// That is the point: a `std::sync::Mutex` poisons when a thread panics
+    /// while holding it, and thereafter *every* acquisition panics — so one
+    /// panic anywhere near this cache would break it for the process lifetime.
+    ///
+    /// `pdfs-fuse`'s worker pool deliberately catches a panicking job and keeps
+    /// the worker alive, which assumes shared state survives a panic. Poisoning
+    /// would silently break that assumption across the crate boundary, turning a
+    /// recoverable EIO into a permanently broken client.
+    ///
+    /// Recovering the guard is sound here because the invariant this lock
+    /// protects — that `entries` and the two tag indexes agree — is restored by
+    /// the next write, and the worst case of reading a half-updated index is a
+    /// spurious cache miss. A miss re-fetches. There is nothing to corrupt.
+    ///
+    /// See `a_panic_holding_the_lock_does_not_break_the_cache`.
+    fn state(&self) -> std::sync::MutexGuard<'_, InMemoryState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn clear_tags_for_key(state: &mut InMemoryState, key: &str) {
@@ -98,9 +183,16 @@ impl InMemoryCacheRepository {
 #[async_trait]
 impl CacheRepository for InMemoryCacheRepository {
     async fn set(&self, key: &str, value: &str, tags: &[String]) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         Self::clear_tags_for_key(&mut state, key);
-        state.entries.insert(key.to_owned(), value.to_owned());
+        // `push` returns the entry evicted to make room, if any. Its tags must
+        // be dropped here — this is the only place the LRU discards a key on its
+        // own, so it is the only place the two indexes could drift apart.
+        if let Some((evicted, _)) = state.entries.push(key.to_owned(), value.to_owned())
+            && evicted != *key
+        {
+            Self::clear_tags_for_key(&mut state, &evicted);
+        }
         let tag_set: HashSet<String> = tags.iter().cloned().collect();
         for tag in &tag_set {
             state
@@ -114,33 +206,38 @@ impl CacheRepository for InMemoryCacheRepository {
     }
 
     async fn get(&self, key: &str) -> Result<Option<String>> {
-        let state = self.state.lock().unwrap();
+        // `LruCache::get` promotes the entry to most-recently-used, which is why
+        // this takes the lock mutably: a read is use, and a cache that evicted
+        // the entry it is being asked for most often would be worse than none.
+        let mut state = self.state();
         Ok(state.entries.get(key).cloned())
     }
 
     async fn remove(&self, key: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        state.entries.remove(key);
+        let mut state = self.state();
+        state.entries.pop(key);
         Self::clear_tags_for_key(&mut state, key);
         Ok(())
     }
 
     async fn remove_by_tag(&self, tag: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         let keys: Vec<String> = state
             .tag_to_keys
             .get(tag)
             .map(|keys| keys.iter().cloned().collect())
             .unwrap_or_default();
         for key in keys {
-            state.entries.remove(&key);
+            // The entry may already have been evicted; `pop` on an absent key is
+            // a no-op, so invalidation and eviction do not fight.
+            state.entries.pop(&key);
             Self::clear_tags_for_key(&mut state, &key);
         }
         Ok(())
     }
 
     async fn clear(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.entries.clear();
         state.key_to_tags.clear();
         state.tag_to_keys.clear();
@@ -151,7 +248,7 @@ impl CacheRepository for InMemoryCacheRepository {
         if tags.is_empty() {
             return Ok(Vec::new());
         }
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         let mut candidates: Option<HashSet<String>> = None;
         for tag in tags {
             match state.tag_to_keys.get(tag) {
@@ -168,9 +265,12 @@ impl CacheRepository for InMemoryCacheRepository {
             }
         }
         let candidates = candidates.unwrap_or_default();
+        // `peek` rather than `get`: a tag sweep is bookkeeping, not use, and
+        // promoting every tagged entry would let one bulk query reorder the
+        // whole cache.
         Ok(candidates
             .into_iter()
-            .filter_map(|key| state.entries.get(&key).map(|v| (key.clone(), v.clone())))
+            .filter_map(|key| state.entries.peek(&key).map(|v| (key.clone(), v.clone())))
             .collect())
     }
 }
@@ -386,6 +486,115 @@ mod tests {
         assert_eq!(cache.get("b").await.unwrap().as_deref(), Some("2"));
         // The tag index is cleaned up too: re-querying yields nothing.
         assert!(cache.get_by_tags(&tags(&["x"])).await.unwrap().is_empty());
+    }
+
+    /// **C8.** The entity cache is a cache, not a ledger. Every node the daemon
+    /// touches is written through to it as a JSON string, so an unbounded map
+    /// means a full tree walk of a large account is retained for the process
+    /// lifetime — the daemon is long-running, and nothing ever removes an entry
+    /// that is merely old.
+    ///
+    /// The tag indexes have to be bounded with it: an evicted entry whose key
+    /// stayed in `tag_to_keys` would leak just as surely, and would make
+    /// `get_by_tags` report keys that are no longer there.
+    #[tokio::test]
+    async fn in_memory_is_bounded() {
+        let cache = InMemoryCacheRepository::with_capacity(64);
+        for i in 0..10_000 {
+            cache
+                .set(&format!("node:{i}"), "{}", &tags(&["volume:1"]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            cache.len(),
+            64,
+            "entries bounded by the configured capacity"
+        );
+        assert_eq!(
+            cache.tag_index_len(),
+            64,
+            "the tag index is bounded with the entries, not left to grow"
+        );
+        // The most recent writes survived; the oldest were evicted.
+        assert!(cache.get("node:9999").await.unwrap().is_some());
+        assert!(cache.get("node:0").await.unwrap().is_none());
+        // And a tag query reports exactly what is still held.
+        assert_eq!(
+            cache.get_by_tags(&tags(&["volume:1"])).await.unwrap().len(),
+            64
+        );
+    }
+
+    /// Eviction must not fight invalidation: removing a tag whose keys have
+    /// already been evicted is a no-op, not an error. The daemon's event loop
+    /// calls `remove_by_tag` on every server event.
+    #[tokio::test]
+    async fn evicted_entries_can_still_be_invalidated() {
+        let cache = InMemoryCacheRepository::with_capacity(4);
+        for i in 0..64 {
+            cache
+                .set(&format!("k{i}"), "v", &tags(&["share:1"]))
+                .await
+                .unwrap();
+        }
+        cache.remove_by_tag("share:1").await.unwrap();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.tag_index_len(), 0);
+        // Invalidating again, and invalidating a tag never seen, are both fine.
+        cache.remove_by_tag("share:1").await.unwrap();
+        cache.remove_by_tag("share:never").await.unwrap();
+    }
+
+    /// A read counts as use. Without this the bound would be a FIFO: the node
+    /// being walked repeatedly would be evicted while a one-off lookup stayed.
+    #[tokio::test]
+    async fn reads_keep_an_entry_alive() {
+        let cache = InMemoryCacheRepository::with_capacity(2);
+        cache.set("a", "1", &[]).await.unwrap();
+        cache.set("b", "2", &[]).await.unwrap();
+        assert!(cache.get("a").await.unwrap().is_some()); // `b` is now the LRU
+        cache.set("c", "3", &[]).await.unwrap();
+        assert!(cache.get("a").await.unwrap().is_some(), "recently read");
+        assert!(
+            cache.get("b").await.unwrap().is_none(),
+            "least recently used"
+        );
+        assert!(cache.get("c").await.unwrap().is_some(), "just written");
+    }
+
+    /// **The D9 reproduce.** A panic while the cache lock is held poisons it,
+    /// and every later acquisition panics for the process lifetime.
+    ///
+    /// This matters because `pdfs-fuse`'s worker pool `catch_unwind`s a
+    /// panicking job and keeps the worker alive — a design that assumes shared
+    /// state survives a panic. A poisoned lock turns one recoverable EIO into a
+    /// permanently broken client, which is exactly what the rescue exists to
+    /// prevent.
+    #[test]
+    fn a_panic_holding_the_lock_does_not_break_the_cache() {
+        let cache = Arc::new(InMemoryCacheRepository::with_capacity(8));
+
+        // Panic with the guard alive, as a worker would if it unwound inside a
+        // critical section.
+        let poisoner = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let _guard = cache.state.lock();
+                panic!("worker panicked mid-cache-update");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the thread really did panic");
+
+        // The cache must still work.
+        assert_eq!(cache.len(), 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            cache.set("k", "v", &[]).await.unwrap();
+            assert_eq!(cache.get("k").await.unwrap().as_deref(), Some("v"));
+        });
     }
 
     #[tokio::test]

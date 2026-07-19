@@ -5070,12 +5070,6 @@ fn read_full_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// Group node uids by volume, preserving order, so each volume's links are
-/// batched into a single request family (C# groups by `VolumeId`).
-/// Whether a `v2/shares/my-files` error means the account has no My Files volume
-/// yet (and so one must be created). C# catches [`ResponseCode::DoesNotExist`];
-/// in practice a fresh account's lookup also surfaces as a bare HTTP 404, so
-/// both are treated as "missing".
 /// Whether a listed revision is one a history view should show.
 ///
 /// Only active (1) and superseded (2) qualify — TS
@@ -5241,6 +5235,8 @@ fn join_node_path<'a>(names: impl Iterator<Item = &'a str>) -> String {
     path
 }
 
+/// Group node uids by volume, preserving order, so each volume's links are
+/// batched into a single request family (C# groups by `VolumeId`).
 fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
     let mut groups: Vec<(VolumeId, Vec<LinkId>)> = Vec::new();
     for uid in uids {
