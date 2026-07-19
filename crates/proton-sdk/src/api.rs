@@ -248,7 +248,9 @@ mod tests {
 
     #[test]
     fn the_challenge_is_read_off_the_details_object() {
-        let hv = gated_error().human_verification().expect("challenge present");
+        let hv = gated_error()
+            .human_verification()
+            .expect("challenge present");
         assert_eq!(hv.token, "abc-123_XYZ");
         assert_eq!(hv.methods, ["captcha", "email", "sms"]);
         assert!(hv.supports_captcha());
