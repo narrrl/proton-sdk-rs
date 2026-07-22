@@ -62,6 +62,35 @@ pub struct TimelinePhotoListResponse {
     pub photos: Vec<TimelinePhotoDto>,
 }
 
+/// `POST volumes/{vid}/photos/duplicates` request.
+#[derive(Debug, Serialize)]
+pub struct FindPhotoDuplicatesRequest {
+    #[serde(rename = "NameHashes")]
+    pub name_hashes: Vec<String>,
+}
+
+/// `POST volumes/{vid}/photos/duplicates` response.
+#[derive(Debug, Deserialize)]
+pub struct FindPhotoDuplicatesResponse {
+    #[serde(rename = "DuplicateHashes", default)]
+    pub duplicate_hashes: Vec<FoundPhotoDuplicateDto>,
+}
+
+/// One server-side photo duplicate candidate.
+#[derive(Debug, Deserialize)]
+pub struct FoundPhotoDuplicateDto {
+    #[serde(rename = "Hash", default)]
+    pub name_hash: String,
+    #[serde(rename = "ContentHash", default)]
+    pub content_hash: String,
+    #[serde(rename = "LinkState")]
+    pub link_state: Option<i32>,
+    #[serde(rename = "ClientUID")]
+    pub client_uid: Option<String>,
+    #[serde(rename = "LinkID")]
+    pub link_id: Option<LinkId>,
+}
+
 /// One timeline entry (C# `TimelinePhotoDto`). Only the id + capture time are
 /// consumed; the remaining fields are kept for wire fidelity.
 #[derive(Debug, Deserialize)]
@@ -446,6 +475,72 @@ pub struct FileCreationResponse {
 #[derive(Debug, Deserialize)]
 pub struct FileCreationIdentifiers {
     #[serde(rename = "ID")]
+    pub link_id: LinkId,
+    #[serde(rename = "RevisionID")]
+    pub revision_id: String,
+}
+
+/// JSON metadata part of `POST v2/volumes/{vid}/files/small`.
+#[derive(Debug, Serialize)]
+pub struct SmallFileUploadMetadataRequest {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NameHash")]
+    pub name_hash: String,
+    #[serde(rename = "ParentLinkID")]
+    pub parent_link_id: LinkId,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "NodePassphraseSignature")]
+    pub passphrase_signature: String,
+    #[serde(rename = "NodeKey")]
+    pub key: String,
+    #[serde(rename = "MIMEType")]
+    pub media_type: String,
+    #[serde(rename = "ContentKeyPacket")]
+    pub content_key_packet: String,
+    #[serde(rename = "ContentKeyPacketSignature")]
+    pub content_key_signature: String,
+    #[serde(rename = "ManifestSignature")]
+    pub manifest_signature: String,
+    #[serde(rename = "ChecksumVerified")]
+    pub checksum_verified: bool,
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: String,
+    #[serde(rename = "ContentBlockVerificationToken")]
+    pub content_block_verification_token: Option<String>,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: String,
+    #[serde(rename = "Photo")]
+    pub photo: Option<PhotosAttributesDto>,
+    #[serde(rename = "ContentBlockEncSignature")]
+    pub content_block_encrypted_signature: Option<String>,
+}
+
+/// JSON metadata part of
+/// `POST v2/volumes/{vid}/files/{lid}/revisions/small`.
+#[derive(Debug, Serialize)]
+pub struct SmallRevisionUploadMetadataRequest {
+    #[serde(rename = "CurrentRevisionID")]
+    pub current_revision_id: String,
+    #[serde(rename = "ManifestSignature")]
+    pub manifest_signature: String,
+    #[serde(rename = "ChecksumVerified")]
+    pub checksum_verified: bool,
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: String,
+    #[serde(rename = "ContentBlockEncSignature")]
+    pub content_block_encrypted_signature: Option<String>,
+    #[serde(rename = "ContentBlockVerificationToken")]
+    pub content_block_verification_token: Option<String>,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: String,
+}
+
+/// Response from either atomic small-upload endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SmallUploadResponse {
+    #[serde(rename = "LinkID")]
     pub link_id: LinkId,
     #[serde(rename = "RevisionID")]
     pub revision_id: String,

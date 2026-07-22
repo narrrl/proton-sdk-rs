@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -49,18 +50,20 @@ use crate::dtos::{
     DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest,
     DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
     ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
-    FolderChildrenResponse, FolderCreationRequest, FolderCreationResponse,
-    InvitationDetailsResponse, InvitationsListResponse, InviteEmailDetailsDto,
-    InviteExternalUserRequest, InviteExternalUserResponse, InviteProtonUserInvitationDto,
-    InviteProtonUserRequest, InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto,
-    LinkDetailsRequest, LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
+    FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
+    FolderCreationRequest, FolderCreationResponse, InvitationDetailsResponse,
+    InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
+    InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
+    InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
+    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
     MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
     RenameLinkRequest, RevisionConflict, RevisionCreationRequest, RevisionCreationResponse,
     RevisionDto, RevisionListItemDto, RevisionListResponse, RevisionMetadataResponse,
     RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
     ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
-    SharedByMeResponse, SharedWithMeResponse, ThumbnailBlockListRequest,
+    SharedByMeResponse, SharedWithMeResponse, SmallFileUploadMetadataRequest,
+    SmallRevisionUploadMetadataRequest, SmallUploadResponse, ThumbnailBlockListRequest,
     ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
     UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
     VolumeTrashResponse,
@@ -78,6 +81,9 @@ use crate::sharing::{
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
 const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
+
+/// Maximum encrypted multipart size accepted by the atomic upload endpoint.
+const SMALL_UPLOAD_SIZE_LIMIT: usize = 128 * 1024;
 
 /// Maximum links per batch trash/restore/delete request (C#
 /// `NodeOperations.MaximumBatchCount`).
@@ -152,6 +158,8 @@ pub struct ProtonDriveClient {
     /// Shared across clones, which is the point: the bound is per host, not per
     /// download.
     block_slots: Arc<Semaphore>,
+    /// Explicit substitute for upstream's `DriveSmallFileUpload` remote flag.
+    small_file_upload: Arc<AtomicBool>,
     /// Serializes the My Files and Photos bootstraps against themselves.
     ///
     /// [`ensure_my_files`](ProtonDriveClient::ensure_my_files) and
@@ -302,6 +310,7 @@ impl ProtonDriveClient {
             entities: DriveEntityCache::new(entity_repository),
             telemetry: NoopTelemetry::shared(),
             block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
+            small_file_upload: Arc::new(AtomicBool::new(false)),
             bootstrap: Arc::new(Bootstrap::default()),
         }
     }
@@ -327,6 +336,7 @@ impl ProtonDriveClient {
             entities: DriveEntityCache::new(InMemoryCacheRepository::shared()),
             telemetry: NoopTelemetry::shared(),
             block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
+            small_file_upload: Arc::new(AtomicBool::new(false)),
             bootstrap: Arc::new(Bootstrap::default()),
         }
     }
@@ -380,6 +390,16 @@ impl ProtonDriveClient {
     /// already taken keep the previous cap (they share the previous semaphore).
     pub fn with_max_inflight_blocks(mut self, blocks: usize) -> Self {
         self.block_slots = Arc::new(Semaphore::new(blocks.max(1)));
+        self
+    }
+
+    /// Enable or disable the atomic small-file upload endpoint.
+    ///
+    /// Disabled by default because upstream protects the endpoint with the
+    /// `DriveSmallFileUpload` remote feature flag, which this crate does not
+    /// currently fetch. The setting is shared by all clones.
+    pub fn with_small_file_upload(self, enabled: bool) -> Self {
+        self.small_file_upload.store(enabled, Ordering::Relaxed);
         self
     }
 
@@ -1690,6 +1710,16 @@ impl ProtonDriveClient {
         media_type: &str,
         contents: &[u8],
     ) -> Result<NodeUid> {
+        // Upstream budgets roughly 10% encryption overhead. This convenience
+        // method already owns a seekable in-memory slice, so it is the safe
+        // place to select the one-request backend without changing streaming
+        // reader bounds or buffering arbitrary inputs.
+        if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
+        {
+            return self
+                .upload_small_file(parent_uid, name, media_type, contents)
+                .await;
+        }
         self.upload_file_from(
             parent_uid,
             name,
@@ -1701,6 +1731,91 @@ impl ProtonDriveClient {
             false,
         )
         .await
+    }
+
+    async fn upload_small_file(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        media_type: &str,
+        contents: &[u8],
+    ) -> Result<NodeUid> {
+        let parent_key = self.folder_node_key(parent_uid).await?;
+        let parent_hash_key = self.parent_hash_key(parent_uid, &parent_key).await?;
+        let (_address_id, email, signing_key) = self.membership_address().await?;
+        let node = generate_node_key()?;
+        let content_key = ContentKey::generate();
+
+        let encrypted_name =
+            parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
+        let name_hash = hex::encode(hmac_sha256(&parent_hash_key, name.as_bytes()));
+        let passphrase = parent_key.encrypt(&node.passphrase)?;
+        let passphrase_signature = signing_key.sign_detached(&node.passphrase)?;
+        let content_key_packet = content_key.to_packet(&node.key)?;
+        let content_key_signature = node.key.sign_detached(&content_key.export()?)?;
+
+        let mut manifest = Vec::new();
+        let mut binary_parts = Vec::new();
+        let (block_sizes, encrypted_signature, verification_token) = if contents.is_empty() {
+            (Vec::new(), None, None)
+        } else {
+            let ciphertext = content_key.encrypt_block(contents)?;
+            manifest.extend_from_slice(&Sha256::digest(&ciphertext));
+            let encrypted_signature = node
+                .key
+                .encrypt(signing_key.sign_detached(contents)?.as_bytes())?;
+            let code_start = content_key_packet.len().checked_sub(32).ok_or_else(|| {
+                ProtonError::invalid_operation("content key packet has no verification code")
+            })?;
+            let token = verification_token(&content_key_packet[code_start..], &ciphertext);
+            binary_parts.push(("ContentBlock".to_owned(), ciphertext));
+            (
+                vec![contents.len() as i32],
+                Some(encrypted_signature),
+                Some(BASE64.encode(token)),
+            )
+        };
+
+        let sha1_hex = hex::encode(Sha1::digest(contents));
+        let manifest_signature = signing_key.sign_detached(&manifest)?;
+        let extended_attributes = ExtendedAttributes {
+            common: CommonExtendedAttributes {
+                size: Some(contents.len() as i64),
+                modification_time: None,
+                block_sizes: Some(block_sizes),
+                digests: Some(FileContentDigests { sha1: sha1_hex }),
+            },
+        };
+        let encrypted_xattr = node.key.encrypt_and_sign(
+            &signing_key,
+            &serde_json::to_vec(&extended_attributes)?,
+            false,
+            true,
+        )?;
+        let metadata = SmallFileUploadMetadataRequest {
+            name: encrypted_name,
+            name_hash,
+            parent_link_id: parent_uid.link_id.clone(),
+            passphrase,
+            passphrase_signature,
+            key: node.locked_armored,
+            media_type: media_type.to_owned(),
+            content_key_packet: BASE64.encode(content_key_packet),
+            content_key_signature,
+            manifest_signature,
+            checksum_verified: false,
+            signature_email: email,
+            content_block_verification_token: verification_token,
+            extended_attributes: encrypted_xattr,
+            photo: None,
+            content_block_encrypted_signature: encrypted_signature,
+        };
+        let path = format!("v2/volumes/{}/files/small", parent_uid.volume_id);
+        let response: SmallUploadResponse = self
+            .http
+            .post_multipart(&path, &metadata, &binary_parts)
+            .await?;
+        Ok(NodeUid::new(parent_uid.volume_id.clone(), response.link_id))
     }
 
     /// Streaming variant of [`upload_file`]: read the plaintext from `reader`
@@ -1826,6 +1941,10 @@ impl ProtonDriveClient {
     /// revision based on the active one, then write blocks and seal exactly as a
     /// fresh upload. The new revision becomes active once sealed.
     pub async fn upload_new_revision(&self, file_uid: &NodeUid, contents: &[u8]) -> Result<()> {
+        if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
+        {
+            return self.upload_small_revision(file_uid, contents, None).await;
+        }
         self.upload_new_revision_from(
             file_uid,
             Cursor::new(contents),
@@ -1834,6 +1953,100 @@ impl ProtonDriveClient {
             None,
         )
         .await
+    }
+
+    async fn upload_small_revision(
+        &self,
+        file_uid: &NodeUid,
+        contents: &[u8],
+        modification_time: Option<i64>,
+    ) -> Result<()> {
+        let details = self
+            .get_link_details(&file_uid.volume_id, std::slice::from_ref(&file_uid.link_id))
+            .await?;
+        let detail =
+            details.links.into_iter().next().ok_or_else(|| {
+                ProtonError::invalid_operation(format!("file {file_uid} not found"))
+            })?;
+        let file = detail.file.ok_or_else(|| {
+            ProtonError::invalid_operation(format!("node {file_uid} is not a file"))
+        })?;
+        let packet = BASE64
+            .decode(
+                file.content_key_packet
+                    .ok_or_else(|| {
+                        ProtonError::invalid_operation("file is missing its content key packet")
+                    })?
+                    .trim(),
+            )
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("decode content key packet: {e}"))
+            })?;
+        let current_revision_id = file
+            .active_revision
+            .map(|revision| revision.id)
+            .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?;
+        let parent_key = self
+            .resolve_parent_key(&file_uid.volume_id, &detail.link)
+            .await?;
+        let node_key = decrypt_link(&parent_key, &detail.link)?.node_key;
+        let content_key = node_key.decrypt_content_key(&packet)?;
+        let (_address_id, email, signing_key) = self.membership_address().await?;
+
+        let mut manifest = Vec::new();
+        let mut binary_parts = Vec::new();
+        let (block_sizes, encrypted_signature, verification_token) = if contents.is_empty() {
+            (Vec::new(), None, None)
+        } else {
+            let ciphertext = content_key.encrypt_block(contents)?;
+            manifest.extend_from_slice(&Sha256::digest(&ciphertext));
+            let encrypted_signature =
+                node_key.encrypt(signing_key.sign_detached(contents)?.as_bytes())?;
+            let code_start = packet.len().checked_sub(32).ok_or_else(|| {
+                ProtonError::invalid_operation("content key packet has no verification code")
+            })?;
+            let token = verification_token(&packet[code_start..], &ciphertext);
+            binary_parts.push(("ContentBlock".to_owned(), ciphertext));
+            (
+                vec![contents.len() as i32],
+                Some(encrypted_signature),
+                Some(BASE64.encode(token)),
+            )
+        };
+        let extended_attributes = ExtendedAttributes {
+            common: CommonExtendedAttributes {
+                size: Some(contents.len() as i64),
+                modification_time: modification_time.map(epoch_to_iso8601),
+                block_sizes: Some(block_sizes),
+                digests: Some(FileContentDigests {
+                    sha1: hex::encode(Sha1::digest(contents)),
+                }),
+            },
+        };
+        let encrypted_xattr = node_key.encrypt_and_sign(
+            &signing_key,
+            &serde_json::to_vec(&extended_attributes)?,
+            false,
+            true,
+        )?;
+        let metadata = SmallRevisionUploadMetadataRequest {
+            current_revision_id,
+            manifest_signature: signing_key.sign_detached(&manifest)?,
+            checksum_verified: false,
+            signature_email: email,
+            content_block_encrypted_signature: encrypted_signature,
+            content_block_verification_token: verification_token,
+            extended_attributes: encrypted_xattr,
+        };
+        let path = format!(
+            "v2/volumes/{}/files/{}/revisions/small",
+            file_uid.volume_id, file_uid.link_id
+        );
+        let _: SmallUploadResponse = self
+            .http
+            .post_multipart(&path, &metadata, &binary_parts)
+            .await?;
+        Ok(())
     }
 
     /// Streaming variant of [`upload_new_revision`]: read the plaintext from
@@ -4597,6 +4810,74 @@ impl ProtonDriveClient {
         Ok(items)
     }
 
+    /// Find active photos whose encrypted name and plaintext content both match.
+    pub(crate) async fn find_photo_duplicates(
+        &self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Vec<NodeUid>> {
+        const ACTIVE_LINK_STATE: i32 = 1;
+
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
+        }
+        let photos_root = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+        let root_key = self.folder_node_key(&photos_root).await?;
+        let hash_key = self
+            .parent_hash_key_ctx(&photos_root, &root_key, true)
+            .await?;
+        let name_hash = hex::encode(hmac_sha256(&hash_key, name.as_bytes()));
+
+        let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
+        let response: FindPhotoDuplicatesResponse = self
+            .http
+            .post(
+                &path,
+                &FindPhotoDuplicatesRequest {
+                    name_hashes: vec![name_hash.clone()],
+                },
+            )
+            .await?;
+
+        let candidates: Vec<_> = response
+            .duplicate_hashes
+            .into_iter()
+            .filter(|duplicate| {
+                duplicate.link_id.is_some()
+                    && duplicate.link_state == Some(ACTIVE_LINK_STATE)
+                    && !duplicate.name_hash.is_empty()
+                    && !duplicate.content_hash.is_empty()
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sha1_hex = hex::encode(Sha1::digest(contents));
+        let content_hash = hex::encode(hmac_sha256(&hash_key, sha1_hex.as_bytes()));
+        Ok(candidates
+            .into_iter()
+            .filter(|duplicate| {
+                duplicate.name_hash.eq_ignore_ascii_case(&name_hash)
+                    && duplicate.content_hash.eq_ignore_ascii_case(&content_hash)
+            })
+            .map(|duplicate| {
+                NodeUid::new(
+                    photos_root.volume_id.clone(),
+                    duplicate.link_id.expect("candidate link id checked above"),
+                )
+            })
+            .collect())
+    }
+
     /// Download and decrypt a photo's active revision into `output` (photos
     /// routing). C# `PhotosFileDownloader`: the node is resolved via the photos
     /// endpoint; blocks are fetched from their absolute storage URLs exactly as
@@ -5346,6 +5627,11 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Upstream's 10% encryption-overhead budget for the 128 KiB endpoint limit.
+fn small_upload_applicable(plaintext_size: usize) -> bool {
+    plaintext_size.saturating_mul(11) < SMALL_UPLOAD_SIZE_LIMIT * 10
+}
+
 /// Block verification token: `verificationCode XOR ciphertextPrefix`, with the
 /// ciphertext prefix zero-padded or truncated to the code length. Mirrors C#
 /// `VerificationToken.Create`.
@@ -5360,7 +5646,8 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 mod tests {
     use super::{
         DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, alternate_names, epoch_to_iso8601,
-        is_listable_revision_state, join_node_path, path_segments, to_drive_event,
+        is_listable_revision_state, join_node_path, path_segments, small_upload_applicable,
+        to_drive_event,
     };
     use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
     use crate::node::RevisionState;
@@ -5376,6 +5663,14 @@ mod tests {
         assert!(!is_listable_revision_state(None), "unstated");
         assert!(!is_listable_revision_state(Some(99)), "unknown");
         assert_eq!(RevisionState::from_raw(Some(0)), RevisionState::Active);
+    }
+
+    #[test]
+    fn small_upload_respects_encryption_overhead_budget() {
+        assert!(small_upload_applicable(0));
+        assert!(small_upload_applicable(119_156));
+        assert!(!small_upload_applicable(119_157));
+        assert!(!small_upload_applicable(usize::MAX));
     }
 
     #[test]

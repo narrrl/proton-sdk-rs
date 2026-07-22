@@ -265,6 +265,43 @@ impl ApiHttpClient {
         self.send::<B, T>(Method::POST, path, Some(body)).await
     }
 
+    /// `POST {path}` as multipart form data with a JSON `Metadata` part and
+    /// zero or more binary parts. Used by Drive's atomic small-upload endpoints.
+    pub async fn post_multipart<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        metadata: &B,
+        binary_parts: &[(String, Vec<u8>)],
+    ) -> Result<T> {
+        let metadata = serde_json::to_vec(metadata)?;
+        let mut timer = self.telemetry().start("http_request");
+        timer.attr("method", "POST");
+        let rejected_token = self.inner.tokens.lock().await.access_token.clone();
+        let response = self
+            .send_multipart_with_token(path, &metadata, binary_parts, &rejected_token)
+            .await?;
+        let response = if response.status() == StatusCode::UNAUTHORIZED {
+            let bytes = response.bytes().await?;
+            if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes)
+                && matches!(
+                    envelope.code,
+                    ResponseCode::AccountDeleted | ResponseCode::AccountDisabled
+                )
+            {
+                return Err(api_error(StatusCode::UNAUTHORIZED, &bytes));
+            }
+            let token = self.refresh_access_token(&rejected_token).await?;
+            self.send_multipart_with_token(path, &metadata, binary_parts, &token)
+                .await?
+        } else {
+            response
+        };
+        timer.attr("status", response.status().as_u16());
+        let parsed = parse_response(response).await?;
+        timer.success();
+        Ok(parsed)
+    }
+
     /// `PUT {path}` with a JSON body, returning a typed success body.
     pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         self.send::<B, T>(Method::PUT, path, Some(body)).await
@@ -360,6 +397,51 @@ impl ApiHttpClient {
                 request = request.json(body);
             }
 
+            request
+        })
+        .await
+    }
+
+    async fn send_multipart_with_token(
+        &self,
+        path: &str,
+        metadata: &[u8],
+        binary_parts: &[(String, Vec<u8>)],
+        access_token: &str,
+    ) -> Result<reqwest::Response> {
+        let url = format!(
+            "{}{}{}",
+            self.inner.base_url,
+            self.route_prefix,
+            path.trim_start_matches('/')
+        );
+        send_retrying(&self.inner.config.retry_policy, || {
+            let metadata_part = reqwest::multipart::Part::bytes(metadata.to_vec())
+                .file_name("Metadata")
+                .mime_str("application/json")
+                .expect("application/json is a valid MIME type");
+            let mut form = reqwest::multipart::Form::new().part("Metadata", metadata_part);
+            for (name, bytes) in binary_parts {
+                let part = reqwest::multipart::Part::bytes(bytes.clone())
+                    .file_name(name.clone())
+                    .mime_str("application/octet-stream")
+                    .expect("octet-stream is a valid MIME type");
+                form = form.part(name.clone(), part);
+            }
+            let mut request = self
+                .inner
+                .http
+                .post(&url)
+                .timeout(self.inner.config.storage_timeout)
+                .header(SESSION_ID_HEADER, self.inner.session_id.as_str())
+                .header(APP_VERSION_HEADER, &self.inner.config.app_version)
+                .header(reqwest::header::ACCEPT, API_CONTENT_TYPE)
+                .bearer_auth(access_token)
+                .multipart(form);
+            if !self.inner.config.user_agent.is_empty() {
+                request =
+                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+            }
             request
         })
         .await

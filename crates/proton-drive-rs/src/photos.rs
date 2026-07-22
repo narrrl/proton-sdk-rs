@@ -7,14 +7,14 @@
 //! downloading photo content and **uploading** photos
 //! ([`upload_photo`](ProtonPhotosClient::upload_photo)). Photos-volume
 //! **creation** reuses the (large) volume-create crypto and is not yet ported;
-//! [`find_duplicates`](ProtonPhotosClient::find_duplicates) is unimplemented
-//! upstream (C# throws `NotImplementedException`) and mirrors that here.
+//! Duplicate detection compares both the encrypted-name digest and the
+//! content SHA-1 through [`find_duplicates`](ProtonPhotosClient::find_duplicates).
 
 use std::io::{Cursor, Read};
 
 use serde::{Deserialize, Serialize};
 
-use proton_sdk::error::{ProtonError, Result};
+use proton_sdk::error::Result;
 use proton_sdk::ids::NodeUid;
 use proton_sdk::session::ProtonApiSession;
 
@@ -207,22 +207,16 @@ impl ProtonPhotosClient {
             .await
     }
 
-    /// Find existing photos that duplicate `name` (server-side name-hash match).
-    ///
-    /// **Unimplemented**, mirroring the upstream C# `FindDuplicatesAsync`, which
-    /// throws `NotImplementedException`. Kept on the public surface so callers
-    /// can compile against it once the duplicate-find endpoint is ported.
-    pub async fn find_duplicates(&self, _name: &str) -> Result<Vec<String>> {
-        Err(ProtonError::invalid_operation(
-            "find_duplicates is not implemented (parity with C# FindDuplicatesAsync)",
-        ))
+    /// Find active photos with the same name and plaintext SHA-1 digest.
+    pub async fn find_duplicates(&self, name: &str, contents: &[u8]) -> Result<Vec<NodeUid>> {
+        self.drive.find_photo_duplicates(name, contents).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dtos::TimelinePhotoListResponse;
+    use crate::dtos::{FindPhotoDuplicatesResponse, TimelinePhotoListResponse};
     use proton_sdk::ids::VolumeId;
 
     #[test]
@@ -258,5 +252,24 @@ mod tests {
         assert_eq!(parsed.photos[0].id.to_string(), "abc");
         assert_eq!(parsed.photos[0].capture_time, 1_700_000_000);
         assert_eq!(parsed.photos[1].content_hash.as_deref(), Some("ff"));
+    }
+
+    #[test]
+    fn duplicate_response_deserializes_server_shape() {
+        let raw = r#"{
+            "DuplicateHashes": [{
+                "Hash": "deadbeef",
+                "ContentHash": "cafe",
+                "LinkState": 1,
+                "ClientUID": "client",
+                "LinkID": "photo-1"
+            }]
+        }"#;
+        let parsed: FindPhotoDuplicatesResponse = serde_json::from_str(raw).unwrap();
+        let duplicate = &parsed.duplicate_hashes[0];
+        assert_eq!(duplicate.name_hash, "deadbeef");
+        assert_eq!(duplicate.content_hash, "cafe");
+        assert_eq!(duplicate.link_state, Some(1));
+        assert_eq!(duplicate.link_id.as_ref().unwrap().to_string(), "photo-1");
     }
 }
