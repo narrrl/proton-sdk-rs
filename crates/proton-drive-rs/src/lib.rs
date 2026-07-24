@@ -44,6 +44,7 @@ mod photos;
 mod public_link;
 mod revision;
 mod sharing;
+mod single_flight;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;

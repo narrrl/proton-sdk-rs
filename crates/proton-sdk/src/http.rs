@@ -206,16 +206,24 @@ impl ApiHttpClient {
     /// (filename `blob`, `application/octet-stream`) on the storage host,
     /// authorized by the per-block `pm-storage-token` header rather than the
     /// session bearer. The response is the usual JSON envelope.
-    pub async fn post_storage_blob(&self, url: &str, token: &str, blob: Vec<u8>) -> Result<()> {
+    ///
+    /// Takes [`Bytes`] rather than `Vec<u8>` because the multipart body has to be
+    /// rebuilt per attempt (a stream body can't be cloned) and a block is up to
+    /// 4 MiB: cloning `Bytes` bumps a refcount where cloning the `Vec` copied the
+    /// whole block on *every* attempt, first one included. The part is built with
+    /// an explicit length so the request still carries a `Content-Length`.
+    pub async fn post_storage_blob(&self, url: &str, token: &str, blob: Bytes) -> Result<()> {
         // Validate the part once up front; the multipart body itself is rebuilt
-        // per attempt inside the retry closure (a stream body can't be cloned).
+        // per attempt inside the retry closure.
         reqwest::multipart::Part::bytes(Vec::new())
             .mime_str("application/octet-stream")
             .map_err(ProtonError::from)?;
 
+        let blob_len = blob.len() as u64;
         let mut timer = self.telemetry().start("storage_upload");
         let response = send_retrying(&self.inner.config.retry_policy, || {
-            let part = reqwest::multipart::Part::bytes(blob.clone())
+            let body = reqwest::Body::from(blob.clone());
+            let part = reqwest::multipart::Part::stream_with_length(body, blob_len)
                 .file_name("blob")
                 .mime_str("application/octet-stream")
                 .expect("octet-stream is a valid MIME type");

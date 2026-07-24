@@ -11,7 +11,7 @@ mod common;
 
 use proton_drive_rs::proton_sdk::crypto::VerificationStatus;
 use proton_drive_rs::{Node, NodeKind};
-use proton_sdk::ids::NodeUid;
+use proton_sdk::ids::{LinkId, NodeUid};
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
 async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
@@ -224,10 +224,17 @@ async fn move_nodes_batch() {
         .await
         .expect("create c2");
 
-    client
+    let outcomes = client
         .move_nodes(&[c1.clone(), c2.clone()], &dst)
         .await
         .expect("move_nodes");
+
+    assert_eq!(outcomes.len(), 2, "one outcome per requested node");
+    for (uid, outcome) in &outcomes {
+        outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("move of {uid} must succeed: {e}"));
+    }
 
     assert_eq!(
         get(client, &c1, "c1 after move").await.parent_uid.as_ref(),
@@ -241,6 +248,66 @@ async fn move_nodes_batch() {
     );
 
     cleanup(client, &[c1, c2, dst]).await;
+}
+
+/// One bad node must not sink the batch: `move_nodes` reports per-node outcomes
+/// (C# `MoveNodesAsync`'s result map), so a bogus link id fails alone while its
+/// neighbour still moves.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn move_nodes_partial_failure() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+    let suffix = common::unique_suffix();
+
+    let dst = client
+        .create_folder(&root.uid, &format!("partial-dst-{suffix}"), None)
+        .await
+        .expect("create dst");
+    let good = client
+        .create_folder(&root.uid, &format!("partial-good-{suffix}"), None)
+        .await
+        .expect("create good");
+    let bogus = NodeUid::new(
+        dst.volume_id.clone(),
+        LinkId::new(format!("nonexistent-link-{suffix}")),
+    );
+
+    let outcomes = client
+        .move_nodes(&[good.clone(), bogus.clone()], &dst)
+        .await
+        .expect("move_nodes must not fail as a whole");
+
+    assert_eq!(outcomes.len(), 2, "one outcome per requested node");
+    assert_eq!(outcomes[0].0, good, "outcomes keep the input order");
+    outcomes[0]
+        .1
+        .as_ref()
+        .expect("the real node must still move");
+    assert_eq!(outcomes[1].0, bogus);
+    let e = outcomes[1]
+        .1
+        .as_ref()
+        .expect_err("the bogus node must report its own failure");
+    eprintln!("[info] bogus node outcome: {e}");
+
+    assert_eq!(
+        get(client, &good, "good after move")
+            .await
+            .parent_uid
+            .as_ref(),
+        Some(&dst),
+        "the real node must be under dst"
+    );
+
+    cleanup(client, &[good, dst]).await;
 }
 
 // ---------------------------------------------------------------------------

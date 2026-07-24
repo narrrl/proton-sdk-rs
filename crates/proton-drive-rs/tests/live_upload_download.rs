@@ -594,3 +594,135 @@ async fn revision_history_lists_reads_restores_and_deletes() {
 
     cleanup(client, &[file]).await;
 }
+
+/// Multi-block upload carrying thumbnails: their tokens now ride the first
+/// block-token request instead of being prepared and stored one request each,
+/// so the manifest layout (thumbnail digests first, in type order) has to
+/// survive a pipeline that stores blocks out of order.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn upload_download_multiblock_with_thumbnails_roundtrip() {
+    use proton_drive_rs::{Thumbnail, ThumbnailType};
+
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    // 10 MiB → 3 content blocks, plus both thumbnail types.
+    let size = 10 * 1024 * 1024;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761) as u8;
+    }
+    let small = b"small-thumbnail-bytes".to_vec();
+    let preview = b"preview-thumbnail-bytes-which-are-longer".to_vec();
+
+    let name = format!("rt-thumbs-{}.bin", common::unique_suffix());
+    let uid = client
+        .upload_file_from(
+            &root.uid,
+            &name,
+            "application/octet-stream",
+            std::io::Cursor::new(payload.clone()),
+            size as i64,
+            vec![
+                // Deliberately out of type order: the uploader sorts.
+                Thumbnail::new(ThumbnailType::Preview, preview.clone()).expect("preview thumbnail"),
+                Thumbnail::new(ThumbnailType::Thumbnail, small.clone()).expect("small thumbnail"),
+            ],
+            None,  // last_modification_time
+            false, // aead
+        )
+        .await
+        .expect("upload_file_from with thumbnails");
+
+    assert_eq!(
+        client.download_file(&uid).await.expect("download_file"),
+        payload,
+        "content must round-trip alongside thumbnails"
+    );
+    assert_eq!(
+        client
+            .download_thumbnail(&uid, ThumbnailType::Thumbnail)
+            .await
+            .expect("download small thumbnail"),
+        Some(small),
+    );
+    assert_eq!(
+        client
+            .download_thumbnail(&uid, ThumbnailType::Preview)
+            .await
+            .expect("download preview thumbnail"),
+        Some(preview),
+    );
+
+    cleanup(client, &[uid]).await;
+}
+
+/// Upload throughput, pipelined vs. serial — the measurement behind PERF_PLAN's
+/// upload item, and the same methodology its download counterpart used.
+///
+/// `with_max_inflight_blocks(1)` reproduces the pre-pipeline behavior exactly:
+/// one block is read, encrypted and stored before the next one starts. The
+/// default client keeps several blocks in flight. Both figures are printed
+/// rather than asserted on — this is a benchmark, and a shared link's capacity
+/// is not something a test can pin down.
+#[tokio::test]
+#[ignore = "live: benchmark, needs test-account credentials"]
+async fn upload_throughput_pipelined_vs_serial() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    // 40 MiB → 10 blocks, matching the download measurement's payload.
+    let size = 40 * 1024 * 1024;
+    let mut payload = vec![0u8; size];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761) as u8;
+    }
+
+    let serial = live.client.clone().with_max_inflight_blocks(1);
+    let mut uploaded = Vec::new();
+
+    for round in 1..=3 {
+        for (label, client) in [("serial", &serial), ("pipelined", client)] {
+            let name = format!("bench-{label}-{round}-{}.bin", common::unique_suffix());
+            let started = std::time::Instant::now();
+            let uid = client
+                .upload_file_from(
+                    &root.uid,
+                    &name,
+                    "application/octet-stream",
+                    std::io::Cursor::new(payload.clone()),
+                    size as i64,
+                    Vec::new(),
+                    None,
+                    false,
+                )
+                .await
+                .expect("upload_file_from");
+            let elapsed = started.elapsed();
+
+            eprintln!(
+                "[upload {label} round {round}] {:.1}s, {:.2} MiB/s",
+                elapsed.as_secs_f64(),
+                (size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+            );
+            uploaded.push(uid);
+        }
+    }
+
+    cleanup(client, &uploaded).await;
+}

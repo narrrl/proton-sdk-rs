@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::api::ResponseCode;
@@ -23,7 +24,7 @@ use proton_sdk::crypto::{
     derive_key_passphrase, encrypt_external_invitation, encrypt_invitation, generate_node_hash_key,
     generate_node_key, generate_node_key_aead, generate_verifier, verify_detached,
 };
-use proton_sdk::error::{ProtonError, Result};
+use proton_sdk::error::{ProtonApiError, ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
 use proton_sdk::ids::{
     AddressId, AddressKeyId, DeviceUid, DriveEventId, LinkId, NodeUid, ShareId, ShareMembershipId,
@@ -43,30 +44,30 @@ use crate::crypto::{
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
     AcceptInvitationRequest, AggregateLinksResponse, BlockCreationRequest, BlockDto,
-    BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockVerificationInputResponse,
-    BlockVerifier, BookmarkShareUrlDto, BookmarksResponse, CommonExtendedAttributes,
-    CreateBookmarkRequest, CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest,
-    CreateShareResponse, DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest,
-    DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest,
-    DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
-    ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
-    FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
-    FolderCreationRequest, FolderCreationResponse, InvitationDetailsResponse,
-    InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
-    InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
-    InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
-    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
-    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
-    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotosAttributesDto,
-    RenameLinkRequest, RevisionConflict, RevisionCreationRequest, RevisionCreationResponse,
-    RevisionDto, RevisionListItemDto, RevisionListResponse, RevisionMetadataResponse,
-    RevisionResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
-    ShareMembersResponse, ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse,
-    SharedByMeResponse, SharedWithMeResponse, SmallFileUploadMetadataRequest,
-    SmallRevisionUploadMetadataRequest, SmallUploadResponse, ThumbnailBlockListRequest,
-    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
-    UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
-    VolumeTrashResponse,
+    BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
+    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
+    CommonExtendedAttributes, CreateBookmarkRequest, CreatePublicLinkRequest,
+    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
+    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
+    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
+    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
+    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
+    FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
+    FolderCreationResponse, InvitationDetailsResponse, InvitationsListResponse,
+    InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
+    InviteProtonUserInvitationDto, InviteProtonUserRequest, InviteProtonUserResponse,
+    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
+    LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
+    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
+    NodeNameAvailabilityResponse, PhotosAttributesDto, RenameLinkRequest, RevisionConflict,
+    RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
+    RevisionListResponse, RevisionMetadataResponse, RevisionResponse, RevisionUpdateRequest,
+    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareResponse,
+    ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedByMeResponse, SharedWithMeResponse,
+    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
+    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
+    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
+    VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
@@ -78,6 +79,7 @@ use crate::sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
     PublicLink, ShareInvitation, ShareMember,
 };
+use crate::single_flight::SingleFlight;
 
 /// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
 const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
@@ -89,18 +91,50 @@ const SMALL_UPLOAD_SIZE_LIMIT: usize = 128 * 1024;
 /// `NodeOperations.MaximumBatchCount`).
 const MAX_BATCH_COUNT: usize = 150;
 
-/// Content blocks a client keeps in memory at once, across every download it is
-/// running.
+/// Link-detail batches fetched at once, per volume, when enumerating nodes.
+const MAX_CONCURRENT_DETAIL_FETCHES: usize = 4;
+
+/// Nodes decrypted at once within one batch of link details.
 ///
-/// [`MAX_CONCURRENT_BLOCK_DOWNLOADS`] bounds one file; nothing bounded the host,
-/// so N concurrent downloads cost N times that — a mount pinning a handful of
-/// large files could hold hundreds of MiB of block buffers. This is the missing
-/// global ceiling (TypeScript caps concurrent *files* instead, in
-/// `internal/download/queue.ts`; capping blocks bounds the memory directly).
+/// Each build runs its PGP work on the blocking pool (`crypto::decrypt_link_*`),
+/// so this is what spreads a folder listing's per-node S2K derivations over
+/// several cores; the author-key lookups it also overlaps are the smaller half.
+const MAX_CONCURRENT_NODE_BUILDS: usize = 8;
+
+/// Content blocks a client keeps in memory at once, across every transfer it is
+/// running — downloads and uploads alike.
 ///
-/// Sized a little above one file's concurrency so a lone download still
-/// saturates its pipeline and a second one is not starved.
-const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 12;
+/// [`MAX_CONCURRENT_BLOCK_DOWNLOADS`] and [`MAX_CONCURRENT_BLOCK_UPLOADS`] bound
+/// one file; nothing bounded the host, so N concurrent transfers cost N times
+/// that — a mount pinning a handful of large files could hold hundreds of MiB of
+/// block buffers. This is the missing global ceiling (TypeScript caps concurrent
+/// *files* instead, in `internal/download/queue.ts`; capping blocks bounds the
+/// memory directly).
+///
+/// Sized a little above one file's pipeline (an upload holds up to
+/// `MAX_BUFFERED_UPLOAD_BLOCKS + MAX_CONCURRENT_BLOCK_UPLOADS + 1` permits) so a
+/// lone transfer still saturates it and a second one is not starved.
+const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 16;
+
+/// Content blocks uploaded concurrently within a single file.
+///
+/// Matches the TypeScript SDK's `MAX_UPLOADING_BLOCKS`
+/// (`internal/upload/streamUploader.ts`); C#'s shared transfer queue depth is 6
+/// (`ProtonDriveClient.DefaultDegreeOfBlockTransferParallelism`).
+const MAX_CONCURRENT_BLOCK_UPLOADS: usize = 5;
+
+/// Encrypted blocks allowed to wait between the encryptor and the uploader.
+///
+/// TypeScript buffers 15 (`MAX_BUFFERED_BLOCKS`); ours is much lower because a
+/// buffered block also holds one of the client-wide in-flight block permits,
+/// which are shared with downloads.
+const MAX_BUFFERED_UPLOAD_BLOCKS: usize = 4;
+
+/// Attempts per block upload before the whole upload fails (TS
+/// `MAX_BLOCK_UPLOAD_RETRIES`). Retries here are *above* the HTTP client's own
+/// retry policy: they cover an expired upload token, which can only be fixed by
+/// re-preparing the block.
+const MAX_BLOCK_UPLOAD_ATTEMPTS: usize = 3;
 
 /// Trashed links requested per page when enumerating the trash (C#
 /// `VolumeOperations.TrashPageSize`).
@@ -170,6 +204,15 @@ pub struct ProtonDriveClient {
     /// because it guards nothing else — `cache` stays free for every other
     /// caller — and the loser re-checks and finds the work already done.
     bootstrap: Arc<Bootstrap>,
+    /// In-flight [`get_node`](ProtonDriveClient::get_node) loads. Concurrent
+    /// lookups of the same node used to issue one link-details request and one
+    /// S2K each; now the first runs and the rest wait on it.
+    node_loads: Arc<SingleFlight<NodeUid, Option<Node>>>,
+    /// In-flight parent-key resolutions, keyed by the ancestor being resolved
+    /// *from* and the photos routing flag. Siblings enumerated concurrently all
+    /// want the same folder key, and resolving it walks (and decrypts) the whole
+    /// ancestor chain.
+    parent_key_loads: Arc<SingleFlight<(NodeUid, bool), PrivateKey>>,
 }
 
 /// The one-time-per-account setup that [`ProtonDriveClient`] single-flights.
@@ -275,6 +318,69 @@ struct BlockWriteResult {
     sha1_hex: String,
 }
 
+/// One encrypted content block on its way to storage, as handed from the
+/// encryptor to the uploader.
+///
+/// It carries its own [`BlockCreationRequest`] because that is what re-minting
+/// an expired upload token needs, and the client-wide in-flight block permit,
+/// which is released only once the ciphertext has been stored.
+struct PreparedBlock {
+    ciphertext: Bytes,
+    /// SHA-256 of the ciphertext — this block's manifest entry.
+    digest: [u8; 32],
+    request: BlockCreationRequest,
+    permit: OwnedSemaphorePermit,
+}
+
+/// A thumbnail encrypted and ready to ride the first block-token request.
+struct EncryptedThumbnail {
+    thumbnail_type: i32,
+    ciphertext: Bytes,
+    /// SHA-256 of the ciphertext — this thumbnail's manifest entry.
+    digest: [u8; 32],
+    request: ThumbnailCreationRequest,
+}
+
+/// One blob to store: a content block or a thumbnail, with the target the
+/// server issued for it.
+struct UploadJob {
+    /// Block index, or `None` for a thumbnail (thumbnails contribute their
+    /// digest to the manifest up front, not through the upload result).
+    index: Option<i32>,
+    ciphertext: Bytes,
+    digest: [u8; 32],
+    /// The block's creation request, for re-minting an expired token. `None` for
+    /// thumbnails: the API only issues their tokens with the first block
+    /// request, so there is nothing to re-request them with (TS says the same).
+    request: Option<BlockCreationRequest>,
+    target: BlockUploadTarget,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+/// The ids a block upload needs to (re-)prepare a block.
+///
+/// Owned rather than borrowed from the [`RevisionDraft`] so an upload future
+/// never carries a lifetime — a borrowed one would make callers of
+/// `upload_file_from` unspawnable (see `tests/spawnable.rs`).
+#[derive(Clone)]
+struct UploadContext {
+    address_id: AddressId,
+    volume_id: VolumeId,
+    link_id: LinkId,
+    revision_id: String,
+}
+
+impl UploadContext {
+    fn from_draft(draft: &RevisionDraft) -> Self {
+        Self {
+            address_id: draft.address_id.clone(),
+            volume_id: draft.volume_id.clone(),
+            link_id: draft.link_id.clone(),
+            revision_id: draft.revision_id.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ShareKey {
     share_id: ShareId,
@@ -312,6 +418,8 @@ impl ProtonDriveClient {
             block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
             small_file_upload: Arc::new(AtomicBool::new(false)),
             bootstrap: Arc::new(Bootstrap::default()),
+            node_loads: Arc::new(SingleFlight::default()),
+            parent_key_loads: Arc::new(SingleFlight::default()),
         }
     }
 
@@ -338,6 +446,8 @@ impl ProtonDriveClient {
             block_slots: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_BLOCKS)),
             small_file_upload: Arc::new(AtomicBool::new(false)),
             bootstrap: Arc::new(Bootstrap::default()),
+            node_loads: Arc::new(SingleFlight::default()),
+            parent_key_loads: Arc::new(SingleFlight::default()),
         }
     }
 
@@ -378,13 +488,18 @@ impl ProtonDriveClient {
     }
 
     /// Cap the content blocks this client holds in memory at once, across every
-    /// download it is running. Defaults to [`DEFAULT_MAX_INFLIGHT_BLOCKS`].
+    /// transfer it is running — downloads *and* uploads. Defaults to
+    /// [`DEFAULT_MAX_INFLIGHT_BLOCKS`].
     ///
     /// A permit is held from the moment a block's fetch starts until its
-    /// plaintext is consumed, so `blocks * BLOCK_SIZE` is roughly the ceiling on
-    /// resident block memory — the knob to turn down on a memory-constrained
-    /// host, at the cost of download throughput. Must be non-zero; a zero cap
-    /// would deadlock every download, so it is clamped to 1.
+    /// plaintext is consumed (download), or from the moment its plaintext is
+    /// read until its ciphertext has been stored (upload), so
+    /// `blocks * BLOCK_SIZE` is roughly the ceiling on resident block memory —
+    /// the knob to turn down on a memory-constrained host, at the cost of
+    /// transfer throughput. Must be non-zero; a zero cap would deadlock every
+    /// transfer, so it is clamped to 1. Setting it to 1 serializes block
+    /// transfers entirely, which is what the throughput comparison in
+    /// `PERF_PLAN.md` uses to reproduce the pre-pipeline behavior.
     ///
     /// Applies to this client and every clone made from it *afterwards*; clones
     /// already taken keep the previous cap (they share the previous semaphore).
@@ -403,8 +518,8 @@ impl ProtonDriveClient {
         self
     }
 
-    /// The global in-flight block permits, for [`RevisionReader`] and the
-    /// whole-file download path to acquire against.
+    /// The global in-flight block permits, for [`RevisionReader`], the
+    /// whole-file download path and the upload pipeline to acquire against.
     pub(crate) fn block_slots(&self) -> Arc<Semaphore> {
         self.block_slots.clone()
     }
@@ -443,12 +558,28 @@ impl ProtonDriveClient {
             timer.success();
             return Ok(Some(info.node));
         }
+
+        // Concurrent callers asking for the same node share one load: the fetch
+        // *and* the node-key S2K behind it.
+        let client = self.clone();
+        let target = uid.clone();
+        let node = self
+            .node_loads
+            .run(uid.clone(), async move { client.load_node(&target).await })
+            .await?;
+
+        timer.success();
+        Ok(node)
+    }
+
+    /// The network half of [`get_node`](Self::get_node): link details, parent
+    /// key, decrypt. Runs behind [`ProtonDriveClient::node_loads`].
+    async fn load_node(&self, uid: &NodeUid) -> Result<Option<Node>> {
         let response = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
         let Some(details) = response.links.into_iter().next() else {
             // Not found is a successful lookup, not a failure.
-            timer.success();
             return Ok(None);
         };
 
@@ -458,7 +589,6 @@ impl ProtonDriveClient {
         let node = self
             .build_node(&uid.volume_id, &details, &parent_key, NodeDetail::Full)
             .await?;
-        timer.success();
         Ok(Some(node))
     }
 
@@ -540,6 +670,20 @@ impl ProtonDriveClient {
         self.enumerate_nodes_detail(uids, NodeDetail::Light).await
     }
 
+    /// The shared body of [`enumerate_nodes`](Self::enumerate_nodes) and
+    /// [`enumerate_nodes_light`](Self::enumerate_nodes_light).
+    ///
+    /// Three things happen concurrently where they used to be strictly serial:
+    /// the per-volume batches are fetched [`MAX_CONCURRENT_DETAIL_FETCHES`] at a
+    /// time, and within a batch the nodes are decrypted
+    /// [`MAX_CONCURRENT_NODE_BUILDS`] at a time — which, now that the link crypto
+    /// runs on the blocking pool, spreads the per-node S2K over several cores.
+    /// Parent keys are still resolved *before* that fan-out, one per distinct
+    /// parent: siblings share a parent, and resolving concurrently would walk and
+    /// decrypt the same ancestor chain many times over.
+    ///
+    /// Order is preserved (`buffered`, not `buffer_unordered`), as is the
+    /// skip-and-warn behavior for a node whose parent key or own crypto fails.
     async fn enumerate_nodes_detail(
         &self,
         uids: &[NodeUid],
@@ -548,28 +692,63 @@ impl ProtonDriveClient {
         let mut nodes = Vec::new();
 
         for (volume_id, link_ids) in group_by_volume(uids) {
-            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
-                let details = self.get_link_details(&volume_id, chunk).await?;
+            let chunks: Vec<Vec<LinkId>> = link_ids
+                .chunks(MAX_BATCH_COUNT)
+                .map(<[LinkId]>::to_vec)
+                .collect();
+
+            let mut fetches = stream::iter(chunks.into_iter().map(|chunk| {
+                let client = self.clone();
+                let volume_id = volume_id.clone();
+                async move { client.get_link_details(&volume_id, &chunk).await }
+            }))
+            .buffered(MAX_CONCURRENT_DETAIL_FETCHES);
+
+            while let Some(details) = fetches.try_next().await? {
+                let mut parent_keys: HashMap<Option<LinkId>, PrivateKey> = HashMap::new();
                 for link_details in &details.links {
-                    let parent_key = match self
+                    let parent_id = link_details.link.parent_id.clone();
+                    if parent_keys.contains_key(&parent_id) {
+                        continue;
+                    }
+                    match self
                         .resolve_parent_key(&volume_id, &link_details.link)
                         .await
                     {
-                        Ok(key) => key,
+                        Ok(key) => {
+                            parent_keys.insert(parent_id, key);
+                        }
                         Err(e) => {
                             tracing::warn!(link_id = %link_details.link.id, error = %e, "skipping node: parent key unavailable");
-                            continue;
-                        }
-                    };
-                    match self
-                        .build_node(&volume_id, link_details, &parent_key, detail)
-                        .await
-                    {
-                        Ok(node) => nodes.push(node),
-                        Err(e) => {
-                            tracing::warn!(link_id = %link_details.link.id, error = %e, "skipping undecryptable node");
                         }
                     }
+                }
+
+                let buildable = details.links.into_iter().filter_map(|link_details| {
+                    let parent_key = parent_keys.get(&link_details.link.parent_id)?.clone();
+                    Some((link_details, parent_key))
+                });
+                let mut built = stream::iter(buildable.map(|(link_details, parent_key)| {
+                    let client = self.clone();
+                    let volume_id = volume_id.clone();
+                    async move {
+                        let link_id = link_details.link.id.clone();
+                        match client
+                            .build_node(&volume_id, &link_details, &parent_key, detail)
+                            .await
+                        {
+                            Ok(node) => Some(node),
+                            Err(e) => {
+                                tracing::warn!(link_id = %link_id, error = %e, "skipping undecryptable node");
+                                None
+                            }
+                        }
+                    }
+                }))
+                .buffered(MAX_CONCURRENT_NODE_BUILDS);
+
+                while let Some(node) = built.next().await {
+                    nodes.extend(node);
                 }
             }
         }
@@ -2390,76 +2569,191 @@ impl ProtonDriveClient {
     /// Move several nodes under a single destination parent in one batched
     /// request. Mirrors C# `ProtonDriveClient.MoveNodesAsync` /
     /// `NodeOperations.MoveMultipleAsync` (`PUT volumes/{vid}/links/move-multiple`,
-    /// note: no `v2/` prefix). Same-volume only — cross-volume is rejected,
-    /// matching the C# batch path, which also throws for differing volumes. Each
-    /// node's passphrase is rewrapped to the destination key and its name
-    /// re-encrypted + signed, exactly as the single [`move_node`]. Batched in
-    /// chunks of [`MAX_BATCH_COUNT`]; per-link failures surface via the aggregate
-    /// envelope. Live validation pending.
-    pub async fn move_nodes(&self, uids: &[NodeUid], new_parent: &NodeUid) -> Result<()> {
+    /// note: no `v2/` prefix — upstream still runs a per-node loop here and
+    /// FIXMEs the batch endpoint we already use). Same-volume only — cross-volume
+    /// is rejected, matching the C# batch path, which also throws for differing
+    /// volumes. Each node's passphrase is rewrapped to the destination key and its
+    /// name re-encrypted + signed, exactly as the single [`move_node`]. Batched in
+    /// chunks of [`MAX_BATCH_COUNT`]. Live validation pending.
+    ///
+    /// One outcome per input uid, in input order, like C#'s
+    /// `IReadOnlyDictionary<NodeUid, Result<Exception>>`: a node that fails —
+    /// cross-volume, unknown link, crypto, or a per-link error code in the batch
+    /// envelope — does not stop the others. The outer `Err` is reserved for
+    /// failures that make the whole call impossible (destination key, hash key,
+    /// signing address, link lookup).
+    pub async fn move_nodes(
+        &self,
+        uids: &[NodeUid],
+        new_parent: &NodeUid,
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
         let mut timer = self.telemetry.start("move_nodes");
         timer.attr("node_count", uids.len());
         if uids.is_empty() {
             timer.success();
-            return Ok(());
+            return Ok(Vec::new());
         }
-        for uid in uids {
-            if uid.volume_id != new_parent.volume_id {
-                return Err(ProtonError::invalid_operation(
-                    "cross-volume move is not supported",
-                ));
+
+        // Cross-volume nodes never reach the request — C# `MoveSingleAsync` throws
+        // for them, and here that throw is one node's outcome, not the call's.
+        let cross_volume: Vec<bool> = uids
+            .iter()
+            .map(|uid| uid.volume_id != new_parent.volume_id)
+            .collect();
+
+        // Each remaining link is moved once even if the caller listed it twice;
+        // every position sharing it reports the same outcome below.
+        let mut seen: HashSet<LinkId> = HashSet::with_capacity(uids.len());
+        let mut targets: Vec<LinkId> = Vec::with_capacity(uids.len());
+        for (uid, &skip) in uids.iter().zip(&cross_volume) {
+            if !skip && seen.insert(uid.link_id.clone()) {
+                targets.push(uid.link_id.clone());
             }
         }
 
-        let dest_parent_key = self.folder_node_key(new_parent).await?;
-        let dest_hash_key = self.parent_hash_key(new_parent, &dest_parent_key).await?;
-        let (_address_id, email, signing_key) = self.membership_address().await?;
+        let mut link_outcomes: HashMap<LinkId, Result<()>> = HashMap::with_capacity(targets.len());
+        if !targets.is_empty() {
+            let dest_parent_key = self.folder_node_key(new_parent).await?;
+            let dest_hash_key = self.parent_hash_key(new_parent, &dest_parent_key).await?;
+            let (_address_id, email, signing_key) = self.membership_address().await?;
 
-        // Resolve every node's link details once (all share the destination
-        // volume), keyed by link id so each chunk can look its node up.
-        let link_ids: Vec<LinkId> = uids.iter().map(|u| u.link_id.clone()).collect();
-        let mut links: std::collections::HashMap<LinkId, LinkDto> =
-            std::collections::HashMap::with_capacity(uids.len());
-        for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
-            let details = self.get_link_details(&new_parent.volume_id, chunk).await?;
-            for detail in details.links {
-                links.insert(detail.link.id.clone(), detail.link);
+            // Resolve every node's link details once (all share the destination
+            // volume), keyed by link id so each chunk can look its node up.
+            let mut links: HashMap<LinkId, LinkDto> = HashMap::with_capacity(targets.len());
+            for chunk in targets.chunks(MAX_BATCH_COUNT) {
+                let details = self.get_link_details(&new_parent.volume_id, chunk).await?;
+                for detail in details.links {
+                    links.insert(detail.link.id.clone(), detail.link);
+                }
+            }
+
+            for chunk in targets.chunks(MAX_BATCH_COUNT) {
+                let mut items = Vec::with_capacity(chunk.len());
+                // The links this request actually carries, so the per-link
+                // responses can be routed back.
+                let mut sent: Vec<LinkId> = Vec::with_capacity(chunk.len());
+                for link_id in chunk {
+                    let uid = NodeUid::new(new_parent.volume_id.clone(), link_id.clone());
+                    let Some(link) = links.get(link_id) else {
+                        link_outcomes.insert(
+                            link_id.clone(),
+                            Err(ProtonError::invalid_operation(format!(
+                                "node {uid} not found"
+                            ))),
+                        );
+                        continue;
+                    };
+                    let parts = match self
+                        .build_move_parts(
+                            &uid,
+                            link,
+                            &dest_parent_key,
+                            &dest_hash_key,
+                            &signing_key,
+                        )
+                        .await
+                    {
+                        Ok(parts) => parts,
+                        Err(e) => {
+                            link_outcomes.insert(link_id.clone(), Err(e));
+                            continue;
+                        }
+                    };
+                    items.push(MoveMultipleLinksItem {
+                        link_id: link_id.clone(),
+                        name: parts.encrypted_name,
+                        passphrase: parts.passphrase,
+                        name_hash: parts.name_hash,
+                        original_hash: parts.original_hash,
+                        // The rewrap preserves the plaintext; the existing detached
+                        // passphrase signature stays valid, so none is re-sent (C#
+                        // omits it for non-anonymous nodes).
+                        passphrase_signature: None,
+                    });
+                    sent.push(link_id.clone());
+                }
+                if items.is_empty() {
+                    continue;
+                }
+
+                let request = MoveMultipleLinksRequest {
+                    parent_link_id: new_parent.link_id.clone(),
+                    links: items,
+                    name_signature_email: email.clone(),
+                    signature_email: None,
+                };
+                let path = format!("volumes/{}/links/move-multiple", new_parent.volume_id);
+                let response: AggregateLinksResponse = match self.http.put(&path, &request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        // The chunk failed as a whole; charge it to every node it
+                        // carried and keep going with the remaining chunks, so one
+                        // bad chunk cannot mask the rest (C#'s per-node loop never
+                        // stops early either).
+                        let message = e.to_string();
+                        for link_id in sent {
+                            link_outcomes.insert(
+                                link_id,
+                                Err(ProtonError::invalid_operation(message.clone())),
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                let mut per_link: HashMap<LinkId, Result<()>> =
+                    aggregate_outcomes(response).into_iter().collect();
+                for link_id in sent {
+                    let outcome = per_link.remove(&link_id).unwrap_or_else(|| {
+                        Err(ProtonError::invalid_operation(format!(
+                            "move returned no response for link {link_id}"
+                        )))
+                    });
+                    link_outcomes.insert(link_id, outcome);
+                }
             }
         }
 
-        for chunk in uids.chunks(MAX_BATCH_COUNT) {
-            let mut items = Vec::with_capacity(chunk.len());
-            for uid in chunk {
-                let link = links.get(&uid.link_id).ok_or_else(|| {
-                    ProtonError::invalid_operation(format!("node {uid} not found"))
-                })?;
-                let parts = self
-                    .build_move_parts(uid, link, &dest_parent_key, &dest_hash_key, &signing_key)
-                    .await?;
-                items.push(MoveMultipleLinksItem {
-                    link_id: uid.link_id.clone(),
-                    name: parts.encrypted_name,
-                    passphrase: parts.passphrase,
-                    name_hash: parts.name_hash,
-                    original_hash: parts.original_hash,
-                    // The rewrap preserves the plaintext; the existing detached
-                    // passphrase signature stays valid, so none is re-sent (C#
-                    // omits it for non-anonymous nodes).
-                    passphrase_signature: None,
-                });
-            }
-            let request = MoveMultipleLinksRequest {
-                parent_link_id: new_parent.link_id.clone(),
-                links: items,
-                name_signature_email: email.clone(),
-                signature_email: None,
-            };
-            let path = format!("volumes/{}/links/move-multiple", new_parent.volume_id);
-            let response: AggregateLinksResponse = self.http.put(&path, &request).await?;
-            check_aggregate("move", response)?;
-        }
+        // A repeated uid cannot take the owned `Result` twice, so keep each
+        // link's error text to rebuild the outcome for its later positions.
+        let repeats: HashMap<LinkId, Option<String>> = link_outcomes
+            .iter()
+            .map(|(link_id, outcome)| {
+                (
+                    link_id.clone(),
+                    outcome.as_ref().err().map(|e| e.to_string()),
+                )
+            })
+            .collect();
+
+        let results: Vec<(NodeUid, Result<()>)> = uids
+            .iter()
+            .zip(&cross_volume)
+            .map(|(uid, &skip)| {
+                let outcome = if skip {
+                    Err(ProtonError::invalid_operation(
+                        "cross-volume move is not supported",
+                    ))
+                } else if let Some(outcome) = link_outcomes.remove(&uid.link_id) {
+                    outcome
+                } else {
+                    match repeats.get(&uid.link_id) {
+                        Some(None) => Ok(()),
+                        Some(Some(message)) => Err(ProtonError::invalid_operation(message.clone())),
+                        None => Err(ProtonError::invalid_operation(format!(
+                            "move produced no outcome for node {uid}"
+                        ))),
+                    }
+                };
+                (uid.clone(), outcome)
+            })
+            .collect();
+        timer.attr(
+            "failed_count",
+            results.iter().filter(|(_, r)| r.is_err()).count(),
+        );
         timer.success();
-        Ok(())
+        Ok(results)
     }
 
     /// Build the per-node move crypto shared by [`move_node`] and [`move_nodes`]:
@@ -2651,6 +2945,45 @@ impl ProtonDriveClient {
     pub async fn enumerate_shared_by_me_node_uids(&self) -> Result<Vec<NodeUid>> {
         let mut timer = self.telemetry.start("enumerate_shared_by_me_node_uids");
         let volume_id = self.main_volume_id().await?;
+        let uids = self.page_shared_by_me(&volume_id).await?;
+        timer.success();
+        Ok(uids)
+    }
+
+    /// The photos I have shared with others, as [`NodeUid`]s — the same listing
+    /// as [`enumerate_shared_by_me_node_uids`](Self::enumerate_shared_by_me_node_uids)
+    /// but resolved against the photos volume, mirroring C#
+    /// `ProtonPhotosClient.EnumerateSharedNodeUidsAsync` (which passes
+    /// `VolumeOperations.TryGetPhotosVolumeIdAsync` as the volume resolver).
+    /// Empty when the account has no photos volume — C# yields nothing there
+    /// rather than erroring. Exposed through
+    /// [`ProtonPhotosClient`](crate::ProtonPhotosClient).
+    pub(crate) async fn enumerate_photos_shared_by_me_node_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self
+            .telemetry
+            .start("enumerate_photos_shared_by_me_node_uids");
+        if !self.ensure_photos().await? {
+            timer.success();
+            return Ok(Vec::new());
+        }
+        let volume_id = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root")
+            .volume_id;
+
+        let uids = self.page_shared_by_me(&volume_id).await?;
+        timer.success();
+        Ok(uids)
+    }
+
+    /// Page `GET drive/v2/volumes/{vid}/shares` on its `AnchorID` cursor for one
+    /// volume. Mirrors the loop in C# `SharingOperations.EnumerateSharedNodeUidsAsync`
+    /// once the volume resolver has run.
+    async fn page_shared_by_me(&self, volume_id: &VolumeId) -> Result<Vec<NodeUid>> {
         let mut uids = Vec::new();
         let mut anchor: Option<String> = None;
 
@@ -2673,7 +3006,6 @@ impl ProtonDriveClient {
             }
         }
 
-        timer.success();
         Ok(uids)
     }
 
@@ -4040,14 +4372,28 @@ impl ProtonDriveClient {
     /// Encrypt, sign, verify and upload every content block of a draft revision,
     /// accumulating the content manifest and extended-attribute metadata.
     ///
-    /// Thumbnails (if any) are uploaded first, in `ThumbnailType` order, and
-    /// their ciphertext digests lead the manifest — mirroring C#
-    /// `RevisionWriter.UploadBlocksAsync` (thumbnails then content blocks) and
-    /// the download path's manifest ordering. Then `reader` is streamed one
-    /// [`DEFAULT_BLOCK_SIZE`] block at a time: only a single plaintext block
-    /// (plus its ciphertext) is held in memory, and the SHA-1 digest and
-    /// total-size counter are folded incrementally. An empty reader yields zero
-    /// content blocks (an empty file).
+    /// Two halves run concurrently, mirroring the TypeScript SDK's
+    /// `internal/upload/streamUploader.ts`: an **encryptor** reads the plaintext
+    /// block by block and hands encrypted blocks to an **uploader** over a
+    /// bounded channel; the uploader asks for upload tokens for every block that
+    /// is ready (one `POST blocks` per batch, thumbnails riding the first one)
+    /// and pushes up to [`MAX_CONCURRENT_BLOCK_UPLOADS`] of them at a time.
+    ///
+    /// Both halves stay on *this* task: `reader` is only `Read + Send`, never
+    /// `'static` (`upload_file` hands in a `&[u8]`), so it cannot move into a
+    /// spawned task. Only the CPU-bound per-block crypto is offloaded, via
+    /// `spawn_blocking`.
+    ///
+    /// Unlike TS, which keeps a sliding window, a batch's tokens are requested
+    /// once the previous batch has finished storing. That costs one round-trip
+    /// per batch of overlap and keeps the ordering bookkeeping trivial.
+    ///
+    /// Thumbnail digests lead the manifest in `ThumbnailType` order and content
+    /// digests follow in block-index order — the layout the download path
+    /// verifies, unchanged even though blocks now reach storage out of order
+    /// (each block carries its index on the wire). SHA-1, block sizes and the
+    /// total-size counter are folded by the encryptor, in order. An empty reader
+    /// yields zero content blocks (an empty file).
     async fn write_blocks<R: Read + Send>(
         &self,
         draft: &RevisionDraft,
@@ -4064,123 +4410,244 @@ impl ProtonDriveClient {
             )
             .await?;
 
-        let mut manifest = Vec::new();
-
-        // Thumbnail digests lead the manifest, ordered by thumbnail type to
-        // match the download path's `sort_by_key(thumbnail_type)`.
+        // Thumbnails are encrypted up front, in type order: the API only issues
+        // thumbnail upload tokens with the *first* block-token request (TS
+        // `requestAndInitiateUpload`), and they are tiny enough that encrypting
+        // them inline costs nothing.
         thumbnails.sort_by_key(|t| t.thumbnail_type);
-        for thumbnail in &thumbnails {
-            let digest = self.upload_thumbnail(draft, thumbnail).await?;
-            manifest.extend_from_slice(&digest);
+        let encrypted_thumbnails = thumbnails
+            .iter()
+            .map(|thumbnail| encrypt_thumbnail_block(draft, thumbnail))
+            .collect::<Result<Vec<_>>>()?;
+        let thumbnail_digests: Vec<[u8; 32]> =
+            encrypted_thumbnails.iter().map(|t| t.digest).collect();
+
+        let (tx, rx) = mpsc::channel(MAX_BUFFERED_UPLOAD_BLOCKS);
+        let (written, content_digests) = tokio::try_join!(
+            self.encrypt_content_blocks(draft, &mut reader, &verification_code, tx),
+            self.upload_prepared_blocks(draft, rx, encrypted_thumbnails),
+        )?;
+        let (block_sizes, total_size, sha1_hex) = written;
+
+        if content_digests.len() != block_sizes.len() {
+            return Err(ProtonError::invalid_operation(format!(
+                "upload stored {} of {} content blocks",
+                content_digests.len(),
+                block_sizes.len()
+            )));
         }
 
+        Ok(BlockWriteResult {
+            manifest: assemble_manifest(&thumbnail_digests, content_digests),
+            block_sizes,
+            total_size,
+            sha1_hex,
+        })
+    }
+
+    /// Read `reader` one [`DEFAULT_BLOCK_SIZE`] block at a time, encrypt and sign
+    /// each block off the runtime, and hand it to the uploader over `tx`.
+    ///
+    /// Returns the per-block plaintext sizes, the total plaintext size and the
+    /// hex SHA-1 of the whole plaintext — all folded in block order, which is why
+    /// this half stays sequential. TS `encryptBlocks` is sequential for the same
+    /// reason and relies on buffering, not parallel encryption, to hide the cost.
+    async fn encrypt_content_blocks<R: Read + Send>(
+        &self,
+        draft: &RevisionDraft,
+        reader: &mut R,
+        verification_code: &[u8],
+        tx: mpsc::Sender<PreparedBlock>,
+    ) -> Result<(Vec<i32>, i64, String)> {
         let mut block_sizes = Vec::new();
         let mut sha1 = Sha1::new();
         let mut total_size: i64 = 0;
-        let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE];
 
         // Block indices are 1-based (C# `blockNumber = i + 1`).
         let mut index = 1_i32;
         loop {
-            let n = read_full_block(&mut reader, &mut buf)?;
+            // The client-wide in-flight block permit, held until this block's
+            // ciphertext has been stored.
+            let permit =
+                self.block_slots().acquire_owned().await.map_err(|e| {
+                    ProtonError::invalid_operation(format!("block slots closed: {e}"))
+                })?;
+
+            // A fresh buffer per block rather than one reused across the loop:
+            // the plaintext is moved into the blocking encrypt task, and copying
+            // 4 MiB out of a shared buffer would cost as much as allocating.
+            let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE];
+            let n = read_full_block(reader, &mut buf)?;
             if n == 0 {
                 break;
             }
-            let chunk = &buf[..n];
+            buf.truncate(n);
 
-            sha1.update(chunk);
+            sha1.update(&buf);
             total_size += n as i64;
-
-            let ciphertext = draft.content_key.encrypt_block(chunk)?;
-            let digest = Sha256::digest(&ciphertext);
-            let token = verification_token(&verification_code, &ciphertext);
-
-            // Detached signature over the plaintext, then encrypted to the node key.
-            let plaintext_signature = draft.signing_key.sign_detached(chunk)?;
-            let encrypted_signature = draft.node_key.encrypt(plaintext_signature.as_bytes())?;
-
-            let prepare = BlockUploadPreparationRequest {
-                address_id: draft.address_id.clone(),
-                volume_id: draft.volume_id.clone(),
-                link_id: draft.link_id.clone(),
-                revision_id: draft.revision_id.clone(),
-                blocks: vec![BlockCreationRequest {
-                    index,
-                    size: ciphertext.len() as i32,
-                    encrypted_signature,
-                    hash: BASE64.encode(digest),
-                    verifier: BlockVerifier {
-                        token: BASE64.encode(&token),
-                    },
-                }],
-                thumbnails: Vec::new(),
-            };
-            let prepared: BlockUploadPreparationResponse =
-                self.http.post("blocks", &prepare).await?;
-            let target = prepared.upload_targets.into_iter().next().ok_or_else(|| {
-                ProtonError::invalid_operation("block upload preparation returned no target")
-            })?;
-
-            self.http
-                .post_storage_blob(&target.bare_url, &target.token, ciphertext)
-                .await?;
-
-            manifest.extend_from_slice(&digest);
             block_sizes.push(n as i32);
+
+            let content_key = draft.content_key.clone();
+            let node_key = draft.node_key.clone();
+            let signing_key = draft.signing_key.clone();
+            let code = verification_code.to_vec();
+            let (ciphertext, digest, request) = tokio::task::spawn_blocking(move || {
+                encrypt_content_block(&content_key, &node_key, &signing_key, &code, index, &buf)
+            })
+            .await
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("block encrypt task failed: {e}"))
+            })??;
+
+            let prepared = PreparedBlock {
+                ciphertext,
+                digest,
+                request,
+                permit,
+            };
+            if tx.send(prepared).await.is_err() {
+                // The uploader is gone, which means it failed: `try_join!` will
+                // surface its error rather than anything we could say here.
+                break;
+            }
             index += 1;
         }
 
-        Ok(BlockWriteResult {
-            manifest,
-            block_sizes,
-            total_size,
-            sha1_hex: hex::encode(sha1.finalize()),
-        })
+        Ok((block_sizes, total_size, hex::encode(sha1.finalize())))
     }
 
-    /// Encrypt, hash and upload a single thumbnail block, returning its
-    /// ciphertext SHA-256 digest (a manifest entry).
+    /// Take encrypted blocks off `rx`, request upload targets for each batch and
+    /// store the ciphertext, [`MAX_CONCURRENT_BLOCK_UPLOADS`] blocks at a time.
     ///
-    /// Mirrors C# `BlockUploader.UploadThumbnailAsync`: the thumbnail is
-    /// encrypt-and-inline-signed under the content key, prepared as its own
-    /// upload request (no content blocks), and uploaded to the returned
-    /// thumbnail target.
-    async fn upload_thumbnail(
+    /// Returns `(block index, ciphertext digest)` per stored content block, in
+    /// completion order — the caller sorts. Thumbnails ride the first batch and
+    /// contribute no entries; their digests are already known to the caller.
+    async fn upload_prepared_blocks(
         &self,
         draft: &RevisionDraft,
-        thumbnail: &Thumbnail,
-    ) -> Result<[u8; 32]> {
-        let ciphertext = draft
-            .content_key
-            .encrypt_thumbnail(&draft.signing_key, &thumbnail.content)?;
-        let digest = Sha256::digest(&ciphertext);
+        mut rx: mpsc::Receiver<PreparedBlock>,
+        thumbnails: Vec<EncryptedThumbnail>,
+    ) -> Result<Vec<(i32, [u8; 32])>> {
+        let context = UploadContext::from_draft(draft);
+        // Both are local to this one file's upload: a timeout downshift must not
+        // leak into other transfers (TS `limitUploadCapacity`).
+        let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_BLOCK_UPLOADS));
+        let downshifted = Arc::new(AtomicBool::new(false));
 
-        let prepare = BlockUploadPreparationRequest {
-            address_id: draft.address_id.clone(),
-            volume_id: draft.volume_id.clone(),
-            link_id: draft.link_id.clone(),
-            revision_id: draft.revision_id.clone(),
-            blocks: Vec::new(),
-            thumbnails: vec![ThumbnailCreationRequest {
-                size: ciphertext.len() as i32,
-                thumbnail_type: thumbnail.thumbnail_type.as_i32(),
-                hash: BASE64.encode(digest),
-            }],
-        };
-        let prepared: BlockUploadPreparationResponse = self.http.post("blocks", &prepare).await?;
-        let target = prepared
-            .thumbnail_upload_targets
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                ProtonError::invalid_operation("thumbnail upload preparation returned no target")
-            })?;
+        let mut pending_thumbnails = thumbnails;
+        let mut digests = Vec::new();
+        let mut batch: Vec<PreparedBlock> = Vec::with_capacity(MAX_BUFFERED_UPLOAD_BLOCKS + 1);
 
-        self.http
-            .post_storage_blob(&target.bare_url, &target.token, ciphertext)
+        loop {
+            // Blocks the encryptor has finished so far, however many that is:
+            // one token request per batch instead of one per block.
+            if rx
+                .recv_many(&mut batch, MAX_BUFFERED_UPLOAD_BLOCKS + 1)
+                .await
+                == 0
+            {
+                break;
+            }
+
+            let stored = self
+                .upload_batch(
+                    &context,
+                    &limiter,
+                    &downshifted,
+                    std::mem::take(&mut batch),
+                    std::mem::take(&mut pending_thumbnails),
+                )
+                .await?;
+            digests.extend(stored);
+        }
+
+        // A file with thumbnails but no content at all still has to ship them,
+        // and they never got a batch to ride along with.
+        if !pending_thumbnails.is_empty() {
+            self.upload_batch(
+                &context,
+                &limiter,
+                &downshifted,
+                Vec::new(),
+                pending_thumbnails,
+            )
             .await?;
+        }
 
-        Ok(digest.into())
+        Ok(digests)
+    }
+
+    /// Request upload targets for one batch of encrypted blocks (plus any
+    /// thumbnails still waiting for their first request) and store them,
+    /// [`MAX_CONCURRENT_BLOCK_UPLOADS`] at a time.
+    async fn upload_batch(
+        &self,
+        context: &UploadContext,
+        limiter: &Arc<Semaphore>,
+        downshifted: &Arc<AtomicBool>,
+        batch: Vec<PreparedBlock>,
+        thumbnails: Vec<EncryptedThumbnail>,
+    ) -> Result<Vec<(i32, [u8; 32])>> {
+        let requests: Vec<BlockCreationRequest> =
+            batch.iter().map(|block| block.request.clone()).collect();
+        let thumbnail_requests: Vec<ThumbnailCreationRequest> = thumbnails
+            .iter()
+            .map(|thumbnail| thumbnail.request.clone())
+            .collect();
+        let prepared =
+            request_upload_targets(&self.http, context, requests, thumbnail_requests).await?;
+        let mut block_targets = prepared.upload_targets;
+        let mut thumbnail_targets = prepared.thumbnail_upload_targets;
+
+        let mut jobs = Vec::with_capacity(batch.len() + thumbnails.len());
+        for thumbnail in thumbnails {
+            let target = take_thumbnail_target(&mut thumbnail_targets, thumbnail.thumbnail_type)
+                .ok_or_else(|| {
+                    ProtonError::invalid_operation(format!(
+                        "thumbnail upload preparation returned no target for type {}",
+                        thumbnail.thumbnail_type
+                    ))
+                })?;
+            jobs.push(UploadJob {
+                index: None,
+                ciphertext: thumbnail.ciphertext,
+                digest: thumbnail.digest,
+                request: None,
+                target,
+                permit: None,
+            });
+        }
+        for block in batch {
+            let index = block.request.index;
+            let target = take_block_target(&mut block_targets, index).ok_or_else(|| {
+                ProtonError::invalid_operation(format!(
+                    "block upload preparation returned no target for block {index}"
+                ))
+            })?;
+            jobs.push(UploadJob {
+                index: Some(index),
+                ciphertext: block.ciphertext,
+                digest: block.digest,
+                request: Some(block.request),
+                target,
+                permit: Some(block.permit),
+            });
+        }
+
+        // Each job owns everything it needs; nothing borrows the draft, so this
+        // future stays `tokio::spawn`-able for callers (see `tests/spawnable.rs`).
+        let stored: Vec<Option<(i32, [u8; 32])>> = stream::iter(jobs.into_iter().map(|job| {
+            let http = self.http.clone();
+            let context = context.clone();
+            let limiter = limiter.clone();
+            let downshifted = downshifted.clone();
+            async move { upload_one_block(&http, &context, job, &limiter, &downshifted).await }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_BLOCK_UPLOADS)
+        .try_collect()
+        .await?;
+
+        Ok(stored.into_iter().flatten().collect())
     }
 
     /// Seal a draft revision: PUT a signed content manifest plus encrypted +
@@ -4987,11 +5454,48 @@ impl ProtonDriveClient {
         link: &LinkDto,
         for_photos: bool,
     ) -> Result<PrivateKey> {
+        // An already-decrypted parent key needs neither a walk nor a queue.
+        if let Some(parent_id) = &link.parent_id {
+            let uid = NodeUid::new(volume_id.clone(), parent_id.clone());
+            if let Some(key) = self.cache.lock().await.folder_keys.get(&uid) {
+                return Ok(key.clone());
+            }
+        }
+
+        // Siblings resolved concurrently all want this same key, and getting it
+        // means walking and decrypting the whole ancestor chain — so one of them
+        // does it and the rest wait. Parentless links key on their own id: what
+        // they resolve to is that root's share key.
+        let target = NodeUid::new(
+            volume_id.clone(),
+            link.parent_id.clone().unwrap_or_else(|| link.id.clone()),
+        );
+        let client = self.clone();
+        let volume_id = volume_id.clone();
+        let link = link.clone();
+        self.parent_key_loads
+            .run((target, for_photos), async move {
+                client
+                    .resolve_parent_key_walk(&volume_id, &link, for_photos)
+                    .await
+            })
+            .await
+    }
+
+    /// The ancestor walk behind [`resolve_parent_key_ctx`]: climb to the nearest
+    /// decrypted key (or the root share key) and decrypt downward from there,
+    /// caching every folder key on the way.
+    async fn resolve_parent_key_walk(
+        &self,
+        volume_id: &VolumeId,
+        link: &LinkDto,
+        for_photos: bool,
+    ) -> Result<PrivateKey> {
         let mut ancestry: Vec<LinkDto> = Vec::new();
         let mut current = link.parent_id.clone();
         let mut base_key: Option<PrivateKey> = None;
 
-        while let Some(parent_id) = current {
+        while let Some(parent_id) = current.take() {
             let uid = NodeUid::new(volume_id.clone(), parent_id.clone());
 
             if let Some(key) = self.cache.lock().await.folder_keys.get(&uid) {
@@ -4999,18 +5503,29 @@ impl ProtonDriveClient {
                 break;
             }
 
+            // Walk as far up as the entity cache can take us for free, then
+            // fetch that whole run of ancestors in one request instead of one
+            // request per level.
+            let run = self.cached_ancestor_run(volume_id, &parent_id).await;
             let details = self
-                .get_link_details_ctx(volume_id, std::slice::from_ref(&parent_id), for_photos)
+                .get_link_details_ctx(volume_id, &run, for_photos)
                 .await?;
-            let ancestor = details
+            let mut by_id: HashMap<LinkId, LinkDto> = details
                 .links
                 .into_iter()
-                .next()
-                .ok_or_else(|| ProtonError::invalid_operation(format!("ancestor {uid} not found")))?
-                .link;
+                .map(|details| (details.link.id.clone(), details.link))
+                .collect();
 
-            current = ancestor.parent_id.clone();
-            ancestry.push(ancestor);
+            for ancestor_id in &run {
+                let ancestor = by_id.remove(ancestor_id).ok_or_else(|| {
+                    ProtonError::invalid_operation(format!(
+                        "ancestor {} not found",
+                        NodeUid::new(volume_id.clone(), ancestor_id.clone())
+                    ))
+                })?;
+                current = ancestor.parent_id.clone();
+                ancestry.push(ancestor);
+            }
         }
 
         // Start from the resolved base (cached ancestor key, or the share key
@@ -5041,6 +5556,45 @@ impl ProtonDriveClient {
         }
 
         Ok(key)
+    }
+
+    /// The run of ancestors starting at `first` that the entity cache can name
+    /// without touching the network, so they can be fetched in one batch.
+    ///
+    /// The chain is only walked for *ids* — the cached node carries its
+    /// `parent_uid`, never the encrypted material the key walk needs. It stops
+    /// at the first ancestor the cache does not know, at a root, or at one whose
+    /// folder key is already decrypted (the caller stops there anyway), so the
+    /// returned run never contains an ancestor that would not have been fetched.
+    /// With a cold entity cache it degenerates to `[first]` — exactly the
+    /// one-level-at-a-time walk this replaced.
+    async fn cached_ancestor_run(&self, volume_id: &VolumeId, first: &LinkId) -> Vec<LinkId> {
+        let mut run = vec![first.clone()];
+
+        let mut current = first.clone();
+        while run.len() < MAX_BATCH_COUNT {
+            let uid = NodeUid::new(volume_id.clone(), current.clone());
+            let Ok(Some(info)) = self.entities.try_get_node(&uid).await else {
+                break;
+            };
+            let Some(parent_uid) = info.node.parent_uid else {
+                break;
+            };
+            if self
+                .cache
+                .lock()
+                .await
+                .folder_keys
+                .get(&parent_uid)
+                .is_some()
+            {
+                break;
+            }
+            current = parent_uid.link_id;
+            run.push(current.clone());
+        }
+
+        run
     }
 
     async fn get_link_details(
@@ -5583,12 +6137,40 @@ struct MoveParts {
     original_hash: String,
 }
 
-fn check_aggregate(op: &str, response: AggregateLinksResponse) -> Result<()> {
-    let failures: Vec<String> = response
+/// Split a `1001 MultipleResponses` batch envelope into one outcome per link,
+/// in the order the API listed them. A non-success per-link code becomes a
+/// [`ProtonApiError`] carrying that code — callers that need to branch on
+/// *why* a link failed (C# `MoveNodesAsync`'s per-node result) get the machine
+/// -readable code, not just a message. `http_status` is the batch request's own
+/// 200: the transport succeeded, the individual link did not.
+fn aggregate_outcomes(response: AggregateLinksResponse) -> Vec<(LinkId, Result<()>)> {
+    response
         .responses
-        .iter()
-        .filter(|pair| !pair.response.is_success())
-        .map(|pair| format!("{} ({:?})", pair.link_id, pair.response.code))
+        .into_iter()
+        .map(|pair| {
+            let outcome = if pair.response.is_success() {
+                Ok(())
+            } else {
+                Err(ProtonError::Api(ProtonApiError {
+                    code: pair.response.code,
+                    http_status: 200,
+                    message: pair.response.error_message.unwrap_or_default(),
+                    details: pair.response.details,
+                }))
+            };
+            (pair.link_id, outcome)
+        })
+        .collect()
+}
+
+fn check_aggregate(op: &str, response: AggregateLinksResponse) -> Result<()> {
+    let failures: Vec<String> = aggregate_outcomes(response)
+        .into_iter()
+        .filter_map(|(link_id, outcome)| match outcome {
+            Ok(()) => None,
+            Err(ProtonError::Api(e)) => Some(format!("{link_id} ({:?})", e.code)),
+            Err(e) => Some(format!("{link_id} ({e})")),
+        })
         .collect();
     if failures.is_empty() {
         Ok(())
@@ -5642,16 +6224,298 @@ fn verification_token(code: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Assemble a revision's content manifest: thumbnail digests in `ThumbnailType`
+/// order, then content-block digests in block-index order.
+///
+/// That layout is what the manifest signature covers and what the download path
+/// re-derives when it verifies a revision, so it has to hold regardless of the
+/// order blocks actually reached storage in — which, with the upload pipelined,
+/// is no longer the order they were read in.
+fn assemble_manifest(thumbnails: &[[u8; 32]], mut blocks: Vec<(i32, [u8; 32])>) -> Vec<u8> {
+    blocks.sort_by_key(|(index, _)| *index);
+
+    let mut manifest = Vec::with_capacity((thumbnails.len() + blocks.len()) * 32);
+    for digest in thumbnails {
+        manifest.extend_from_slice(digest);
+    }
+    for (_, digest) in &blocks {
+        manifest.extend_from_slice(digest);
+    }
+    manifest
+}
+
+/// Encrypt, digest and sign one content block, producing everything the upload
+/// and the manifest need.
+///
+/// CPU-bound (PGP over 4 MiB plus a signature), so callers run it on the
+/// blocking pool — the download path offloads its counterpart the same way
+/// (`revision::decrypt_block_blocking`).
+fn encrypt_content_block(
+    content_key: &ContentKey,
+    node_key: &PrivateKey,
+    signing_key: &PrivateKey,
+    verification_code: &[u8],
+    index: i32,
+    plaintext: &[u8],
+) -> Result<(Bytes, [u8; 32], BlockCreationRequest)> {
+    let ciphertext = content_key.encrypt_block(plaintext)?;
+    let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+    let token = verification_token(verification_code, &ciphertext);
+
+    // Detached signature over the plaintext, then encrypted to the node key.
+    let plaintext_signature = signing_key.sign_detached(plaintext)?;
+    let encrypted_signature = node_key.encrypt(plaintext_signature.as_bytes())?;
+
+    let request = BlockCreationRequest {
+        index,
+        size: ciphertext.len() as i32,
+        encrypted_signature,
+        hash: BASE64.encode(digest),
+        verifier: BlockVerifier {
+            token: BASE64.encode(&token),
+        },
+    };
+
+    Ok((Bytes::from(ciphertext), digest, request))
+}
+
+/// Encrypt and inline-sign a thumbnail under the content key, ready to ride the
+/// first block-token request. Mirrors C# `BlockUploader.UploadThumbnailAsync`'s
+/// crypto half.
+fn encrypt_thumbnail_block(
+    draft: &RevisionDraft,
+    thumbnail: &Thumbnail,
+) -> Result<EncryptedThumbnail> {
+    let ciphertext = draft
+        .content_key
+        .encrypt_thumbnail(&draft.signing_key, &thumbnail.content)?;
+    let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+    let thumbnail_type = thumbnail.thumbnail_type.as_i32();
+
+    Ok(EncryptedThumbnail {
+        thumbnail_type,
+        request: ThumbnailCreationRequest {
+            size: ciphertext.len() as i32,
+            thumbnail_type,
+            hash: BASE64.encode(digest),
+        },
+        ciphertext: Bytes::from(ciphertext),
+        digest,
+    })
+}
+
+/// `POST blocks`: ask for upload targets for a batch of encrypted blocks, plus
+/// this upload's thumbnails (only ever on its first request).
+async fn request_upload_targets(
+    http: &ApiHttpClient,
+    context: &UploadContext,
+    blocks: Vec<BlockCreationRequest>,
+    thumbnails: Vec<ThumbnailCreationRequest>,
+) -> Result<BlockUploadPreparationResponse> {
+    let request = BlockUploadPreparationRequest {
+        address_id: context.address_id.clone(),
+        volume_id: context.volume_id.clone(),
+        link_id: context.link_id.clone(),
+        revision_id: context.revision_id.clone(),
+        blocks,
+        thumbnails,
+    };
+    http.post("blocks", &request).await
+}
+
+/// Take the target the server issued for content block `index`, falling back to
+/// request order when the response does not echo indices.
+fn take_block_target(
+    targets: &mut Vec<BlockUploadTarget>,
+    index: i32,
+) -> Option<BlockUploadTarget> {
+    let position = targets
+        .iter()
+        .position(|target| target.index == Some(index))
+        .or_else(|| targets.iter().position(|target| target.index.is_none()))?;
+    Some(targets.remove(position))
+}
+
+/// As [`take_block_target`], for the thumbnail of a given type.
+fn take_thumbnail_target(
+    targets: &mut Vec<BlockUploadTarget>,
+    thumbnail_type: i32,
+) -> Option<BlockUploadTarget> {
+    let position = targets
+        .iter()
+        .position(|target| target.thumbnail_type == Some(thumbnail_type))
+        .or_else(|| {
+            targets
+                .iter()
+                .position(|target| target.thumbnail_type.is_none())
+        })?;
+    Some(targets.remove(position))
+}
+
+/// Store one encrypted blob, returning `(index, digest)` for a content block and
+/// `None` for a thumbnail.
+///
+/// Mirrors TS `streamUploader.uploadBlock`: retry up to
+/// [`MAX_BLOCK_UPLOAD_ATTEMPTS`] times, re-preparing the block when its upload
+/// token has expired and serializing the whole file's uploads after a timeout.
+/// This sits *above* the HTTP client's own retry policy, which already covers
+/// transport failures, 5xx and 429 — what it cannot do is mint a new token,
+/// which needs the block's signature and verifier.
+async fn upload_one_block(
+    http: &ApiHttpClient,
+    context: &UploadContext,
+    job: UploadJob,
+    limiter: &Semaphore,
+    downshifted: &AtomicBool,
+) -> Result<Option<(i32, [u8; 32])>> {
+    let UploadJob {
+        index,
+        ciphertext,
+        digest,
+        request,
+        mut target,
+        permit: _permit,
+    } = job;
+
+    let mut attempt = 0_usize;
+    loop {
+        attempt += 1;
+
+        let outcome = {
+            // Once downshifted, a block takes the entire allowance, which is how
+            // the upload serializes itself for the rest of the file (TS
+            // `limitUploadCapacity` waits for every other block instead).
+            let wanted = if downshifted.load(Ordering::Relaxed) {
+                MAX_CONCURRENT_BLOCK_UPLOADS as u32
+            } else {
+                1
+            };
+            let _slot = limiter.acquire_many(wanted).await.map_err(|e| {
+                ProtonError::invalid_operation(format!("upload limiter closed: {e}"))
+            })?;
+            http.post_storage_blob(&target.bare_url, &target.token, ciphertext.clone())
+                .await
+        };
+
+        let error = match outcome {
+            Ok(()) => return Ok(index.map(|index| (index, digest))),
+            Err(error) => error,
+        };
+        if attempt >= MAX_BLOCK_UPLOAD_ATTEMPTS {
+            return Err(error);
+        }
+
+        if is_upload_timeout(&error) {
+            downshifted.store(true, Ordering::Relaxed);
+        } else if is_expired_upload_token(&error)
+            && let Some(request) = request.as_ref()
+        {
+            // Retrying the same URL can only fail the same way, so re-prepare
+            // the block and aim at the fresh target.
+            let prepared =
+                request_upload_targets(http, context, vec![request.clone()], Vec::new()).await?;
+            target = prepared.upload_targets.into_iter().next().ok_or_else(|| {
+                ProtonError::invalid_operation("block upload preparation returned no target")
+            })?;
+        }
+
+        tracing::warn!(
+            block = ?index,
+            attempt,
+            error = %error,
+            "block upload failed, retrying"
+        );
+    }
+}
+
+/// The storage host no longer knows this upload token — the block has to be
+/// re-prepared before it can be retried (TS `uploadBlock`'s `NOT_FOUND` branch).
+fn is_expired_upload_token(error: &ProtonError) -> bool {
+    matches!(
+        error,
+        ProtonError::Api(e) if e.http_status == 404 || matches!(e.code, ResponseCode::DoesNotExist)
+    )
+}
+
+/// The upload ran out of time rather than failing outright, which TS treats as a
+/// signal that the link cannot carry the current concurrency.
+fn is_upload_timeout(error: &ProtonError) -> bool {
+    matches!(error, ProtonError::Transport(e) if e.is_timeout())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, alternate_names, epoch_to_iso8601,
-        is_listable_revision_state, join_node_path, path_segments, small_upload_applicable,
-        to_drive_event,
+        DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, aggregate_outcomes, alternate_names,
+        assemble_manifest, check_aggregate, epoch_to_iso8601, is_expired_upload_token,
+        is_listable_revision_state, is_upload_timeout, join_node_path, path_segments,
+        small_upload_applicable, take_block_target, take_thumbnail_target, to_drive_event,
     };
-    use crate::dtos::{VolumeEventDto, VolumeEventLinkDto};
+    use crate::dtos::{
+        AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, VolumeEventDto,
+        VolumeEventLinkDto,
+    };
     use crate::node::RevisionState;
+    use proton_sdk::api::{ApiResponse, ResponseCode};
+    use proton_sdk::error::{ProtonApiError, ProtonError};
     use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
+
+    /// A batch envelope with one successful link and one that failed with `code`.
+    fn mixed_aggregate(code: ResponseCode) -> AggregateLinksResponse {
+        AggregateLinksResponse {
+            responses: vec![
+                LinkIdResponsePair {
+                    link_id: LinkId::new("ok-link"),
+                    response: ApiResponse {
+                        code: ResponseCode::Success,
+                        error_message: None,
+                        details: None,
+                    },
+                },
+                LinkIdResponsePair {
+                    link_id: LinkId::new("bad-link"),
+                    response: ApiResponse {
+                        code,
+                        error_message: Some("nope".to_string()),
+                        details: None,
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn aggregate_outcomes_keeps_per_link_codes() {
+        let outcomes = aggregate_outcomes(mixed_aggregate(ResponseCode::DoesNotExist));
+
+        assert_eq!(outcomes.len(), 2, "one outcome per link, in response order");
+        assert_eq!(outcomes[0].0, LinkId::new("ok-link"));
+        assert!(outcomes[0].1.is_ok());
+        assert_eq!(outcomes[1].0, LinkId::new("bad-link"));
+        // A failed link keeps the machine-readable code — the whole point of
+        // reporting per-node move outcomes instead of one formatted message.
+        match outcomes[1].1.as_ref().expect_err("bad-link must fail") {
+            ProtonError::Api(e) => {
+                assert_eq!(e.code, ResponseCode::DoesNotExist);
+                assert_eq!(e.message, "nope");
+                assert_eq!(e.http_status, 200, "the batch request itself succeeded");
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_aggregate_reports_only_the_failed_links() {
+        check_aggregate("move", mixed_aggregate(ResponseCode::Success))
+            .expect("all-success envelope must pass");
+
+        let err = check_aggregate("move", mixed_aggregate(ResponseCode::DoesNotExist))
+            .expect_err("a failed link must fail the batch");
+        let message = err.to_string();
+        assert!(message.contains("move failed for 1 link(s)"), "{message}");
+        assert!(message.contains("bad-link"), "{message}");
+        assert!(!message.contains("ok-link"), "{message}");
+    }
 
     #[test]
     fn only_sealed_revisions_are_listable() {
@@ -5855,5 +6719,129 @@ mod tests {
         assert!(attrs.capture_time > 0);
         assert_eq!(attrs.main_photo_link_id, None);
         assert!(attrs.tags.is_empty());
+    }
+
+    fn digest(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// The pipeline stores blocks out of order; the manifest must not be.
+    #[test]
+    fn manifest_is_thumbnails_then_blocks_in_index_order() {
+        let manifest = assemble_manifest(
+            &[digest(0xaa), digest(0xbb)],
+            vec![(3, digest(3)), (1, digest(1)), (2, digest(2))],
+        );
+
+        assert_eq!(manifest.len(), 5 * 32);
+        let entries: Vec<u8> = manifest.chunks(32).map(|entry| entry[0]).collect();
+        assert_eq!(entries, vec![0xaa, 0xbb, 1, 2, 3]);
+    }
+
+    #[test]
+    fn manifest_of_a_thumbnail_less_empty_file_is_empty() {
+        assert!(assemble_manifest(&[], Vec::new()).is_empty());
+    }
+
+    fn target(index: Option<i32>, thumbnail_type: Option<i32>, token: &str) -> BlockUploadTarget {
+        BlockUploadTarget {
+            bare_url: "https://storage.example/blob".to_string(),
+            token: token.to_string(),
+            index,
+            thumbnail_type,
+        }
+    }
+
+    #[test]
+    fn upload_targets_are_matched_by_index_not_position() {
+        let mut targets = vec![
+            target(Some(2), None, "second"),
+            target(Some(1), None, "first"),
+        ];
+
+        assert_eq!(
+            take_block_target(&mut targets, 1)
+                .expect("target for 1")
+                .token,
+            "first"
+        );
+        assert_eq!(
+            take_block_target(&mut targets, 2)
+                .expect("target for 2")
+                .token,
+            "second"
+        );
+        assert!(take_block_target(&mut targets, 3).is_none());
+    }
+
+    /// A response that does not echo indices is consumed in request order.
+    #[test]
+    fn upload_targets_without_indices_fall_back_to_request_order() {
+        let mut targets = vec![target(None, None, "first"), target(None, None, "second")];
+
+        assert_eq!(
+            take_block_target(&mut targets, 7)
+                .expect("first target")
+                .token,
+            "first"
+        );
+        assert_eq!(
+            take_block_target(&mut targets, 9)
+                .expect("second target")
+                .token,
+            "second"
+        );
+    }
+
+    #[test]
+    fn thumbnail_targets_are_matched_by_type() {
+        let mut targets = vec![
+            target(None, Some(2), "preview"),
+            target(None, Some(1), "tiny"),
+        ];
+
+        assert_eq!(
+            take_thumbnail_target(&mut targets, 1)
+                .expect("target for type 1")
+                .token,
+            "tiny"
+        );
+        assert_eq!(
+            take_thumbnail_target(&mut targets, 2)
+                .expect("target for type 2")
+                .token,
+            "preview"
+        );
+    }
+
+    fn api_error(code: ResponseCode, http_status: u16) -> ProtonError {
+        ProtonError::Api(ProtonApiError {
+            code,
+            http_status,
+            message: String::new(),
+            details: None,
+        })
+    }
+
+    #[test]
+    fn expired_upload_tokens_are_recognized_by_status_or_code() {
+        assert!(is_expired_upload_token(&api_error(
+            ResponseCode::Success,
+            404
+        )));
+        assert!(is_expired_upload_token(&api_error(
+            ResponseCode::DoesNotExist,
+            422
+        )));
+
+        // Anything else is a plain failure: retried, but against the same token.
+        assert!(!is_expired_upload_token(&api_error(
+            ResponseCode::Success,
+            500
+        )));
+        assert!(!is_expired_upload_token(&ProtonError::invalid_operation(
+            "boom"
+        )));
+        assert!(!is_upload_timeout(&api_error(ResponseCode::Success, 504)));
     }
 }

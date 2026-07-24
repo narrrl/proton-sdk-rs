@@ -112,6 +112,15 @@ impl ProtonPhotosClient {
         self.drive.enumerate_photos_timeline().await
     }
 
+    /// The photos I have shared with others, as [`NodeUid`]s — the photos-volume
+    /// counterpart of `ProtonDriveClient::enumerate_shared_by_me_node_uids`.
+    /// C# `ProtonPhotosClient.EnumerateSharedNodeUidsAsync`. Empty when the
+    /// account has no photos volume. Materialize with
+    /// [`enumerate_nodes`](Self::enumerate_nodes).
+    pub async fn enumerate_shared_node_uids(&self) -> Result<Vec<NodeUid>> {
+        self.drive.enumerate_photos_shared_by_me_node_uids().await
+    }
+
     /// Download and decrypt a photo's active revision, returning its plaintext.
     /// C# `PhotosFileDownloader`.
     pub async fn download_photo(&self, uid: &NodeUid) -> Result<Vec<u8>> {

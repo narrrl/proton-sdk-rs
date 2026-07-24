@@ -174,7 +174,7 @@ impl LinkDetailsDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LinkDto {
     #[serde(rename = "LinkID")]
     pub id: LinkId,
@@ -837,7 +837,7 @@ pub struct BlockUploadPreparationRequest {
     pub thumbnails: Vec<ThumbnailCreationRequest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BlockCreationRequest {
     #[serde(rename = "Index")]
     pub index: i32,
@@ -854,7 +854,7 @@ pub struct BlockCreationRequest {
     pub verifier: BlockVerifier,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BlockVerifier {
     /// Base64 verification token (`code XOR ciphertext_prefix`).
     #[serde(rename = "Token")]
@@ -863,7 +863,7 @@ pub struct BlockVerifier {
 
 /// Thumbnail creation entry in a block-upload preparation request. Mirrors C#
 /// `ThumbnailCreationRequest` (`Size`, `Type`, base64 ciphertext `Hash`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThumbnailCreationRequest {
     #[serde(rename = "Size")]
     pub size: i32,
@@ -888,6 +888,16 @@ pub struct BlockUploadTarget {
     pub bare_url: String,
     #[serde(rename = "Token")]
     pub token: String,
+    /// Index of the content block this target is for, echoed from the request.
+    /// `Option` because it is absent on thumbnail targets and older responses;
+    /// the uploader then falls back to request order. TS reads the same field
+    /// (`UploadLinks[].Index` in `apiService.requestBlockUpload`).
+    #[serde(rename = "Index", default)]
+    pub index: Option<i32>,
+    /// Type of the thumbnail this target is for, echoed from the request
+    /// (TS `ThumbnailLinks[].ThumbnailType`). Absent on content-block targets.
+    #[serde(rename = "ThumbnailType", default)]
+    pub thumbnail_type: Option<i32>,
 }
 
 /// `PUT v2/volumes/{vid}/files/{lid}/revisions/{rid}` — seal the revision.
@@ -1076,6 +1086,12 @@ pub struct SharedByMeLinkDto {
     pub share_id: ShareId,
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
+    /// The share the link is *reached through* — the context in which it lives,
+    /// which differs from `share_id` for an item inside a shared folder. C#
+    /// `SharedByMeLinkDto.ContextShareId`; optional here because the field is a
+    /// recent upstream addition and an older backend simply omits it.
+    #[serde(rename = "ContextShareID", default)]
+    pub context_share_id: Option<ShareId>,
 }
 
 /// The kind of item a share points at. C# `ShareTargetType`.

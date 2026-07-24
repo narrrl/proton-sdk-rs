@@ -108,8 +108,29 @@ pub async fn decrypt_link_verified(
     link: &LinkDto,
 ) -> Result<(DecryptedLink, NodeVerification)> {
     let (passphrase, name, verification) = decrypt_link_parts(account, parent_key, link).await?;
-    let node_key = PrivateKey::from_armored(&link.key, &passphrase)?;
+
+    // Unlocking the node key runs Proton's deliberately expensive S2K — tens of
+    // milliseconds of pure CPU, per node. Off the runtime it goes, so a folder
+    // listing decrypting many nodes at once uses more than one core and never
+    // stalls the reactor (the download path offloads its block crypto the same
+    // way, see `revision::decrypt_block_blocking`).
+    let armored_key = link.key.clone();
+    let node_key =
+        blocking(move || Ok(PrivateKey::from_armored(&armored_key, &passphrase)?)).await?;
+
     Ok((DecryptedLink { node_key, name }, verification))
+}
+
+/// Run CPU-bound PGP work on the blocking pool, mapping a join failure into a
+/// [`ProtonError`].
+async fn blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| ProtonError::invalid_operation(format!("link decrypt task failed: {e}")))?
 }
 
 /// As [`decrypt_link_verified`], but stops short of unlocking the node's own
@@ -146,28 +167,40 @@ async fn decrypt_link_parts(
         AuthorshipClaim::create(account, link.name_signature_email.as_deref()).await
     };
 
-    // Passphrase: decrypted with the parent key, signed (detached) by the node
-    // author; verify against the node claim (fallback = parent key).
-    let passphrase = parent_key.decrypt_armored_message(&link.passphrase)?;
-    let passphrase_status = match &link.passphrase_signature {
-        Some(sig) => verify_detached(sig, &passphrase, &node_claim.ring(parent_key)),
-        None => VerificationStatus::NotSigned,
-    };
+    // The rings are resolved here (they may hit the key-resolution endpoint);
+    // everything after this point is pure PGP work and runs off the runtime.
+    let node_ring = node_claim.ring(parent_key);
+    let name_ring = name_claim.ring(parent_key);
+    let parent_key = parent_key.clone();
+    let armored_passphrase = link.passphrase.clone();
+    let passphrase_signature = link.passphrase_signature.clone();
+    let armored_name = link.name.clone();
 
-    // Name: an inline-signed message addressed to the parent key.
-    let (name_bytes, name_status) =
-        parent_key.decrypt_armored_verify(&link.name, &name_claim.ring(parent_key))?;
-    let name = String::from_utf8(name_bytes).map_err(|e| {
-        ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}"))
-    })?;
+    blocking(move || {
+        // Passphrase: decrypted with the parent key, signed (detached) by the
+        // node author; verify against the node claim (fallback = parent key).
+        let passphrase = parent_key.decrypt_armored_message(&armored_passphrase)?;
+        let passphrase_status = match &passphrase_signature {
+            Some(sig) => verify_detached(sig, &passphrase, &node_ring),
+            None => VerificationStatus::NotSigned,
+        };
 
-    let verification = NodeVerification {
-        name: name_status,
-        passphrase: passphrase_status,
-        content_key: None,
-        extended_attributes: None,
-    };
-    Ok((passphrase, name, verification))
+        // Name: an inline-signed message addressed to the parent key.
+        let (name_bytes, name_status) =
+            parent_key.decrypt_armored_verify(&armored_name, &name_ring)?;
+        let name = String::from_utf8(name_bytes).map_err(|e| {
+            ProtonError::invalid_operation(format!("node name is not valid UTF-8: {e}"))
+        })?;
+
+        let verification = NodeVerification {
+            name: name_status,
+            passphrase: passphrase_status,
+            content_key: None,
+            extended_attributes: None,
+        };
+        Ok((passphrase, name, verification))
+    })
+    .await
 }
 
 /// Decrypt a file's content key and verify its `ContentKeyPacketSignature`.

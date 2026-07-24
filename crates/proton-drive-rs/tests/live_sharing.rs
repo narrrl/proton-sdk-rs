@@ -18,7 +18,9 @@
 
 mod common;
 
-use proton_drive_rs::{MemberRole, ProtonDriveClient, ProtonDrivePublicLinkClient};
+use proton_drive_rs::{
+    MemberRole, ProtonDriveClient, ProtonDrivePublicLinkClient, ProtonPhotosClient,
+};
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given node; best-effort, logs on failure.
@@ -249,6 +251,35 @@ async fn shared_with_me_and_incoming_invitations_read() {
         .await
         .expect("list_incoming_invitations must not error");
     eprintln!("[info] incoming invitations count: {}", incoming.len());
+}
+
+/// The shared-by-me read surface must resolve on both volumes: the main volume
+/// (`ProtonDriveClient`) and the photos volume (`ProtonPhotosClient`, C#
+/// `EnumerateSharedNodeUidsAsync`). Empty is a pass — an account with nothing
+/// shared, or with no photos volume at all, must not error.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn shared_by_me_read() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let shared = client
+        .enumerate_shared_by_me_node_uids()
+        .await
+        .expect("enumerate_shared_by_me_node_uids must not error");
+    eprintln!("[info] shared-by-me count (main volume): {}", shared.len());
+
+    let photos = ProtonPhotosClient::from_drive_client(client.clone());
+    let shared_photos = photos
+        .enumerate_shared_node_uids()
+        .await
+        .expect("photos enumerate_shared_node_uids must not error");
+    eprintln!(
+        "[info] shared-by-me count (photos volume): {}",
+        shared_photos.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
