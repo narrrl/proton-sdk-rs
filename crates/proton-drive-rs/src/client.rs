@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesOrdered, StreamExt, TryStreamExt};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::api::ResponseCode;
@@ -122,6 +122,19 @@ const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 16;
 /// (`internal/upload/streamUploader.ts`); C#'s shared transfer queue depth is 6
 /// (`ProtonDriveClient.DefaultDegreeOfBlockTransferParallelism`).
 const MAX_CONCURRENT_BLOCK_UPLOADS: usize = 5;
+
+/// Content blocks encrypted concurrently within a single file.
+///
+/// Reading, SHA-1 and the size bookkeeping stay strictly in block order; only
+/// the per-block PGP work fans out, onto the blocking pool. TS encrypts one
+/// block at a time (`internal/upload/encryptBlocks.ts`) and relies on buffering
+/// alone, which is enough there because the crypto is native; here a single
+/// core's rPGP throughput is comparable to a fast link, so one in-flight encrypt
+/// becomes the ceiling on exactly the machines that could otherwise saturate it.
+///
+/// Kept below the client-wide permit pool alongside the buffer and upload
+/// windows (`4 + 4 + 5 < 16`) so the encryptor cannot starve its own uploader.
+const MAX_CONCURRENT_BLOCK_ENCRYPTS: usize = 4;
 
 /// Encrypted blocks allowed to wait between the encryptor and the uploader.
 ///
@@ -4449,9 +4462,12 @@ impl ProtonDriveClient {
     /// each block off the runtime, and hand it to the uploader over `tx`.
     ///
     /// Returns the per-block plaintext sizes, the total plaintext size and the
-    /// hex SHA-1 of the whole plaintext — all folded in block order, which is why
-    /// this half stays sequential. TS `encryptBlocks` is sequential for the same
-    /// reason and relies on buffering, not parallel encryption, to hide the cost.
+    /// hex SHA-1 of the whole plaintext — all folded as each block is *read*,
+    /// which is why reading stays sequential. The PGP half of each block runs on
+    /// the blocking pool, [`MAX_CONCURRENT_BLOCK_ENCRYPTS`] at a time, and blocks
+    /// leave in index order regardless of which finishes first
+    /// ([`FuturesOrdered`]) — not for the uploader's sake, which indexes blocks
+    /// on the wire anyway, but so a stall cannot reorder the channel.
     async fn encrypt_content_blocks<R: Read + Send>(
         &self,
         draft: &RevisionDraft,
@@ -4465,37 +4481,71 @@ impl ProtonDriveClient {
 
         // Block indices are 1-based (C# `blockNumber = i + 1`).
         let mut index = 1_i32;
+        let mut reader_drained = false;
+        // Each entry pairs the encrypt task with the in-flight permit its block
+        // holds, so the permit lives exactly as long as the block does.
+        let mut encrypting = FuturesOrdered::new();
+
         loop {
-            // The client-wide in-flight block permit, held until this block's
-            // ciphertext has been stored.
-            let permit =
-                self.block_slots().acquire_owned().await.map_err(|e| {
-                    ProtonError::invalid_operation(format!("block slots closed: {e}"))
-                })?;
+            while !reader_drained && encrypting.len() < MAX_CONCURRENT_BLOCK_ENCRYPTS {
+                // The client-wide in-flight block permit, held until this block's
+                // ciphertext has been stored.
+                //
+                // Only *wait* for one when nothing is in flight. A block being
+                // encrypted already holds a permit and cannot release it until it
+                // has been sent, uploaded and dropped — so blocking here while
+                // holding one would deadlock as soon as the pool is smaller than
+                // this window, which `with_max_inflight_blocks(1)` makes exact.
+                // With something to drain, an unavailable permit just means the
+                // window is as wide as the pool currently allows.
+                let permit = if encrypting.is_empty() {
+                    self.block_slots().acquire_owned().await.map_err(|e| {
+                        ProtonError::invalid_operation(format!("block slots closed: {e}"))
+                    })?
+                } else {
+                    match self.block_slots().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(TryAcquireError::NoPermits) => break,
+                        Err(e) => {
+                            return Err(ProtonError::invalid_operation(format!(
+                                "block slots closed: {e}"
+                            )));
+                        }
+                    }
+                };
 
-            // A fresh buffer per block rather than one reused across the loop:
-            // the plaintext is moved into the blocking encrypt task, and copying
-            // 4 MiB out of a shared buffer would cost as much as allocating.
-            let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE];
-            let n = read_full_block(reader, &mut buf)?;
-            if n == 0 {
-                break;
+                // A fresh buffer per block rather than one reused across the
+                // loop: the plaintext is moved into the blocking encrypt task,
+                // and copying 4 MiB out of a shared buffer would cost as much as
+                // allocating.
+                let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE];
+                let n = read_full_block(reader, &mut buf)?;
+                if n == 0 {
+                    reader_drained = true;
+                    break;
+                }
+                buf.truncate(n);
+
+                sha1.update(&buf);
+                total_size += n as i64;
+                block_sizes.push(n as i32);
+
+                let content_key = draft.content_key.clone();
+                let node_key = draft.node_key.clone();
+                let signing_key = draft.signing_key.clone();
+                let code = verification_code.to_vec();
+                let encrypt = tokio::task::spawn_blocking(move || {
+                    encrypt_content_block(&content_key, &node_key, &signing_key, &code, index, &buf)
+                });
+                encrypting.push_back(async move { (encrypt.await, permit) });
+                index += 1;
             }
-            buf.truncate(n);
 
-            sha1.update(&buf);
-            total_size += n as i64;
-            block_sizes.push(n as i32);
-
-            let content_key = draft.content_key.clone();
-            let node_key = draft.node_key.clone();
-            let signing_key = draft.signing_key.clone();
-            let code = verification_code.to_vec();
-            let (ciphertext, digest, request) = tokio::task::spawn_blocking(move || {
-                encrypt_content_block(&content_key, &node_key, &signing_key, &code, index, &buf)
-            })
-            .await
-            .map_err(|e| {
+            let Some((encrypted, permit)) = encrypting.next().await else {
+                // Reader drained and nothing left in flight.
+                break;
+            };
+            let (ciphertext, digest, request) = encrypted.map_err(|e| {
                 ProtonError::invalid_operation(format!("block encrypt task failed: {e}"))
             })??;
 
@@ -4510,7 +4560,6 @@ impl ProtonDriveClient {
                 // surface its error rather than anything we could say here.
                 break;
             }
-            index += 1;
         }
 
         Ok((block_sizes, total_size, hex::encode(sha1.finalize())))

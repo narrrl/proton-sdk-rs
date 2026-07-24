@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narrrl/proton-sdk-rs"
@@ -12,6 +12,15 @@ rust-version = "1.96"
 authors = ["Nils Pukropp <contact@narl.io>"]
 keywords = ["proton", "drive", "openpgp", "encryption", "sdk"]
 categories = ["api-bindings", "cryptography", "filesystem"]
+
+# Dependencies build optimized even in dev/test. All of the CPU cost on the
+# transfer paths — rPGP's AES/SHA, bcrypt, the S2K derivations — lives in these
+# crates, and unoptimized rPGP is roughly two orders of magnitude slower, which
+# made debug-profile upload benchmarks measure the compiler rather than the link
+# (~2 MiB/s, CPU-bound, where release is network-bound). Workspace crates stay at
+# `opt-level = 0` so incremental rebuilds and backtraces are unaffected.
+[profile.dev.package."*"]
+opt-level = 2
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
