@@ -5770,6 +5770,7 @@ impl ProtonDriveClient {
                 // leaves the claimed metadata absent rather than failing the node.
                 let mut claimed_size = None;
                 let mut claimed_modification_time = None;
+                let mut content_sha1 = None;
                 if let Some(node_key) = node_key.as_ref()
                     && let Some(rev) = file.active_revision.as_ref()
                     && let Some(xattr) = rev.extended_attributes.as_deref()
@@ -5787,6 +5788,7 @@ impl ProtonDriveClient {
                             if let Some(common) = attrs.common {
                                 claimed_size = common.size;
                                 claimed_modification_time = common.modification_time;
+                                content_sha1 = common.digests.and_then(|d| d.sha1);
                             }
                         }
                         Err(e) => {
@@ -5801,8 +5803,10 @@ impl ProtonDriveClient {
                         .active_revision
                         .as_ref()
                         .map(|rev| RevisionState::from_raw(rev.state)),
+                    active_revision_id: file.active_revision.as_ref().map(|rev| rev.id.clone()),
                     claimed_size,
                     claimed_modification_time,
+                    content_sha1,
                 }
             }
             LinkType::Unknown => {

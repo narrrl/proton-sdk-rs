@@ -528,10 +528,14 @@ impl ProtonDrivePublicLinkClient {
                 active_revision_state: file
                     .and_then(|f| f.active_revision.as_ref())
                     .map(|revision| RevisionState::from_raw(revision.state)),
+                active_revision_id: file
+                    .and_then(|f| f.active_revision.as_ref())
+                    .map(|revision| revision.id.clone()),
                 // Claimed metadata lives in the revision's extended attributes,
                 // which this read surface does not fetch.
                 claimed_size: None,
                 claimed_modification_time: None,
+                content_sha1: None,
             }
         };
 
