@@ -111,6 +111,14 @@ pub enum NodeKind {
         /// the file has no active revision (an unsealed draft).
         #[serde(default)]
         active_revision_state: Option<RevisionState>,
+        /// Server-assigned identifier of the file's active revision
+        /// (`ActiveRevision.RevisionID`); `None` for an unsealed draft, or when
+        /// read through a surface that does not carry it. Unlike
+        /// `modification_time` this is a stable revision identity: it advances iff
+        /// a *new* revision was sealed, so a consumer can tell "the same revision,
+        /// re-stamped" from "someone wrote a new revision" without a download.
+        #[serde(default)]
+        active_revision_id: Option<String>,
         /// Authoritative plaintext size from the active revision's decrypted
         /// extended attributes (C# `ClaimedSize`). `None` when the revision has
         /// no `XAttr` or it failed to decrypt.
@@ -118,6 +126,12 @@ pub enum NodeKind {
         /// ISO-8601 modification time from the decrypted extended attributes
         /// (C# `ClaimedModificationTime`), verbatim as written by the uploader.
         claimed_modification_time: Option<String>,
+        /// Lowercase-hex SHA-1 of the full plaintext, from the active revision's
+        /// decrypted extended attributes (`Digests.SHA1`). A download-free content
+        /// fingerprint: two files with the same size *and* the same digest hold
+        /// the same bytes. `None` when the revision carries no digest (some
+        /// clients omit it) or the `XAttr` failed to decrypt.
+        content_sha1: Option<String>,
     },
 }
 
@@ -221,6 +235,38 @@ impl FileThumbnail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_node_carries_active_revision_id_and_defaults_it() {
+        // A File node round-trips its revision id.
+        let kind = NodeKind::File {
+            media_type: "text/plain".into(),
+            total_size_on_storage: 10,
+            active_revision_state: Some(RevisionState::Active),
+            active_revision_id: Some("rev-abc".into()),
+            claimed_size: Some(4),
+            claimed_modification_time: None,
+            content_sha1: Some("da39a3ee".into()),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: NodeKind = serde_json::from_str(&json).unwrap();
+        match back {
+            NodeKind::File {
+                active_revision_id, ..
+            } => assert_eq!(active_revision_id.as_deref(), Some("rev-abc")),
+            NodeKind::Folder => panic!("expected a file"),
+        }
+
+        // A sidecar written before the field existed deserializes to `None`.
+        let legacy = r#"{"File":{"media_type":"text/plain","total_size_on_storage":10,"claimed_size":null,"claimed_modification_time":null}}"#;
+        let back: NodeKind = serde_json::from_str(legacy).unwrap();
+        match back {
+            NodeKind::File {
+                active_revision_id, ..
+            } => assert!(active_revision_id.is_none()),
+            NodeKind::Folder => panic!("expected a file"),
+        }
+    }
 
     #[test]
     fn revision_state_maps_the_wire_value() {
