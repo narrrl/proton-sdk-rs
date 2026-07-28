@@ -4,6 +4,8 @@ use proton_sdk::crypto::VerificationStatus;
 use proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 
+use crate::sharing::ShareMembership;
+
 /// A decrypted Drive node (folder or file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -27,6 +29,14 @@ pub struct Node {
     pub is_shared_publicly: bool,
     /// Email address that signed the node, if present.
     pub signature_email: Option<String>,
+    /// Our membership in the share this node was reached through, when it is
+    /// shared *with* us — this is what says whether we may write to it. `None`
+    /// for nodes we own (the link details carry no `Membership` block).
+    ///
+    /// `#[serde(default)]` is load-bearing: consumers persist `Node` blobs, and
+    /// one written before this field existed must keep deserializing.
+    #[serde(default)]
+    pub membership: Option<ShareMembership>,
     /// Per-field signature-verification results gathered while decrypting the
     /// node. Non-fatal metadata (mirrors C# `AuthorshipVerificationFailure`):
     /// the node is always returned; the caller inspects this to decide trust.
@@ -276,5 +286,52 @@ mod tests {
         // state (or still calls it a draft, as it does mid-upload).
         assert_eq!(RevisionState::from_raw(Some(0)), RevisionState::Active);
         assert_eq!(RevisionState::from_raw(None), RevisionState::Active);
+    }
+
+    /// Consumers persist whole `Node` blobs (the Linux client keeps them in a
+    /// SQLite column), so a node written before `membership` existed has to keep
+    /// deserializing — otherwise adding the field bricks every cached row on
+    /// upgrade.
+    #[test]
+    fn a_node_round_trips_with_and_without_a_membership() {
+        let node = Node {
+            uid: NodeUid::new("vol1".into(), "link1".into()),
+            parent_uid: None,
+            kind: NodeKind::Folder,
+            name: "Team Budget".into(),
+            creation_time: 1,
+            modification_time: 2,
+            trashed: false,
+            is_shared: true,
+            is_shared_publicly: false,
+            signature_email: None,
+            membership: Some(ShareMembership {
+                share_id: "share-1".into(),
+                membership_id: "member-1".into(),
+                permissions: 6,
+            }),
+            verification: NodeVerification::default(),
+        };
+
+        let back: Node = serde_json::from_str(&serde_json::to_string(&node).unwrap()).unwrap();
+        let membership = back.membership.expect("membership survives the round trip");
+        assert_eq!(membership.role_exact(), Some(crate::MemberRole::Editor));
+        assert_eq!(membership.share_id.as_str(), "share-1");
+
+        // A blob written before the field existed reads back as "not shared with
+        // us", which is the same thing an owned node says.
+        let legacy = r#"{
+            "uid": {"volume_id": "vol1", "link_id": "link1"},
+            "parent_uid": null,
+            "kind": "Folder",
+            "name": "My Documents",
+            "creation_time": 1,
+            "modification_time": 2,
+            "trashed": false,
+            "signature_email": null
+        }"#;
+        let back: Node = serde_json::from_str(legacy).unwrap();
+        assert!(back.membership.is_none());
+        assert_eq!(back.name, "My Documents");
     }
 }

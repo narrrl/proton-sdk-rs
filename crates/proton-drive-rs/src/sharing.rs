@@ -6,6 +6,7 @@
 //! Reading shared-with-me nodes and leaving them lives on the client already.
 
 use proton_sdk::ids::{NodeUid, ShareId, ShareMembershipId};
+use serde::{Deserialize, Serialize};
 
 /// A sharing permission role. The wire form is a permissions bitmask
 /// (`Read = 4`, `Write = 2`, `Admin = 16`); Proton only uses three combinations.
@@ -23,14 +24,18 @@ pub enum MemberRole {
 }
 
 impl MemberRole {
+    const VIEWER_PERMISSIONS: i32 = 4;
+    const EDITOR_PERMISSIONS: i32 = 6;
+    const ADMIN_PERMISSIONS: i32 = 22;
+
     /// The permissions bitmask for this role, or `None` for [`MemberRole::Inherited`]
     /// (which has no wire representation when inviting). Mirrors JS
     /// `memberRoleToPermission`.
     pub fn to_permissions(self) -> Option<i32> {
         match self {
-            MemberRole::Viewer => Some(4),
-            MemberRole::Editor => Some(6),
-            MemberRole::Admin => Some(22),
+            MemberRole::Viewer => Some(Self::VIEWER_PERMISSIONS),
+            MemberRole::Editor => Some(Self::EDITOR_PERMISSIONS),
+            MemberRole::Admin => Some(Self::ADMIN_PERMISSIONS),
             MemberRole::Inherited => None,
         }
     }
@@ -41,12 +46,73 @@ impl MemberRole {
     pub fn from_permissions(permissions: Option<i32>) -> Self {
         match permissions {
             None => MemberRole::Inherited,
-            Some(4) => MemberRole::Viewer,
-            Some(6) => MemberRole::Editor,
-            Some(22) => MemberRole::Admin,
+            Some(Self::VIEWER_PERMISSIONS) => MemberRole::Viewer,
+            Some(Self::EDITOR_PERMISSIONS) => MemberRole::Editor,
+            Some(Self::ADMIN_PERMISSIONS) => MemberRole::Admin,
             Some(_) => MemberRole::Viewer,
         }
     }
+
+    /// Like [`from_permissions`](Self::from_permissions), but `None` for a mask
+    /// this build does not recognise instead of degrading it to
+    /// [`MemberRole::Viewer`].
+    ///
+    /// The lenient mapping is right for display — the holder can at least read —
+    /// but exact decoding preserves "we do not know" for permission enforcement.
+    /// P2 can then deny writes while logging or otherwise handling the unknown
+    /// mask explicitly.
+    pub fn from_permissions_exact(permissions: Option<i32>) -> Option<Self> {
+        match permissions {
+            None => Some(MemberRole::Inherited),
+            Some(Self::VIEWER_PERMISSIONS) => Some(MemberRole::Viewer),
+            Some(Self::EDITOR_PERMISSIONS) => Some(MemberRole::Editor),
+            Some(Self::ADMIN_PERMISSIONS) => Some(MemberRole::Admin),
+            Some(_) => None,
+        }
+    }
+}
+
+/// Our membership in a share someone else owns — the wire's
+/// `LinkDetailsDto.Membership`, which says what *we* are allowed to do with a
+/// node shared with us.
+///
+/// Rides on [`Node::membership`](crate::Node::membership) for anything reached
+/// through a share, and is `None` for nodes we own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMembership {
+    /// The share the node was granted through.
+    pub share_id: ShareId,
+    /// Our membership in it (the handle for leaving the share).
+    pub membership_id: ShareMembershipId,
+    /// The raw permissions bitmask, kept so an unrecognised value can still be
+    /// logged or round-tripped rather than being flattened into a role.
+    pub permissions: i32,
+}
+
+impl ShareMembership {
+    /// Decode the raw permissions using the existing lenient mapping.
+    pub fn role(&self) -> MemberRole {
+        MemberRole::from_permissions(Some(self.permissions))
+    }
+
+    /// Decode the raw permissions without guessing at an unrecognised mask.
+    pub fn role_exact(&self) -> Option<MemberRole> {
+        MemberRole::from_permissions_exact(Some(self.permissions))
+    }
+}
+
+/// One item from the shared-with-me listing, with the share it was granted
+/// through.
+///
+/// The share id matters because a shared node is the **root of the sharer's
+/// share on the sharer's volume**: it comes back parentless and only that
+/// share's key unlocks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedWithMeItem {
+    /// The shared node.
+    pub uid: NodeUid,
+    /// The share the node was granted through.
+    pub share_id: ShareId,
 }
 
 /// A member of a share (an invitation that has been accepted).
@@ -181,4 +247,94 @@ pub struct Bookmark {
     pub is_folder: bool,
     /// When the bookmark was created (Unix seconds).
     pub creation_time: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_strict_role_mapping_refuses_to_guess_at_an_unknown_mask() {
+        // The three masks Proton actually uses, plus the absent case.
+        for (mask, want) in [
+            (None, MemberRole::Inherited),
+            (Some(4), MemberRole::Viewer),
+            (Some(6), MemberRole::Editor),
+            (Some(22), MemberRole::Admin),
+        ] {
+            assert_eq!(MemberRole::from_permissions_exact(mask), Some(want));
+            assert_eq!(MemberRole::from_permissions(mask), want);
+        }
+
+        // An unrecognised mask is where the two mappings part company: the
+        // lenient one degrades to Viewer so the holder can at least read, the
+        // strict one admits it does not know so an enforcing caller can fail
+        // closed instead of silently denying a real editor.
+        for mask in [0, 2, 8, 16, 30, -1] {
+            assert_eq!(MemberRole::from_permissions_exact(Some(mask)), None);
+            assert_eq!(MemberRole::from_permissions(Some(mask)), MemberRole::Viewer);
+        }
+    }
+
+    #[test]
+    fn a_membership_decodes_roles_from_its_raw_permissions() {
+        let membership = |permissions| ShareMembership {
+            share_id: "s1".into(),
+            membership_id: "m1".into(),
+            permissions,
+        };
+
+        let editor = membership(6);
+        assert_eq!(editor.role(), MemberRole::Editor);
+        assert_eq!(editor.role_exact(), Some(MemberRole::Editor));
+
+        let viewer = membership(4);
+        assert_eq!(viewer.role(), MemberRole::Viewer);
+        assert_eq!(viewer.role_exact(), Some(MemberRole::Viewer));
+
+        // A future permission bit remains available to callers. The lenient
+        // display mapping and exact decoder are derived each time.
+        let unknown = membership(38);
+        assert_eq!(unknown.role(), MemberRole::Viewer);
+        assert_eq!(unknown.role_exact(), None);
+        assert_eq!(unknown.permissions, 38);
+    }
+
+    #[test]
+    fn membership_serde_stores_only_authoritative_data() {
+        let membership = ShareMembership {
+            share_id: "share-1".into(),
+            membership_id: "member-1".into(),
+            permissions: 22,
+        };
+        let json = serde_json::to_value(&membership).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "share_id": "share-1",
+                "membership_id": "member-1",
+                "permissions": 22
+            })
+        );
+        let back: ShareMembership = serde_json::from_value(json).unwrap();
+        assert_eq!(back, membership);
+        assert_eq!(back.role(), MemberRole::Admin);
+        assert_eq!(back.role_exact(), Some(MemberRole::Admin));
+    }
+
+    #[test]
+    fn forged_serialized_roles_cannot_override_raw_permissions() {
+        let json = serde_json::json!({
+            "share_id": "share-1",
+            "membership_id": "member-1",
+            "permissions": 38,
+            "role": "admin",
+            "role_exact": "admin"
+        });
+
+        let membership: ShareMembership = serde_json::from_value(json).unwrap();
+        assert_eq!(membership.permissions, 38);
+        assert_eq!(membership.role(), MemberRole::Viewer);
+        assert_eq!(membership.role_exact(), None);
+    }
 }

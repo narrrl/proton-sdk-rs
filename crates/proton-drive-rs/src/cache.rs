@@ -165,6 +165,7 @@ mod tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: crate::node::NodeVerification::default(),
         }
     }

@@ -62,7 +62,7 @@ pub use public_link::{ProtonDrivePublicLinkClient, PublicLinkInfo};
 pub use revision::{Revision, RevisionReader};
 pub use sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
-    PublicLink, ShareInvitation, ShareMember,
+    PublicLink, ShareInvitation, ShareMember, ShareMembership, SharedWithMeItem,
 };
 
 pub use proton_sdk;

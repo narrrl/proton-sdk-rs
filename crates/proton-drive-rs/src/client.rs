@@ -62,12 +62,12 @@ use crate::dtos::{
     NodeNameAvailabilityResponse, PhotosAttributesDto, RenameLinkRequest, RevisionConflict,
     RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
     RevisionListResponse, RevisionMetadataResponse, RevisionResponse, RevisionUpdateRequest,
-    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareResponse,
-    ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedByMeResponse, SharedWithMeResponse,
-    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
-    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
-    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
-    VolumeEventListResponse, VolumeTrashResponse,
+    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto,
+    ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedByMeResponse,
+    SharedWithMeResponse, SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest,
+    SmallUploadResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
+    ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, UpdatePermissionsRequest,
+    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
@@ -77,7 +77,7 @@ use crate::revision::{
 };
 use crate::sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
-    PublicLink, ShareInvitation, ShareMember,
+    PublicLink, ShareInvitation, ShareMember, ShareMembership, SharedWithMeItem,
 };
 use crate::single_flight::SingleFlight;
 
@@ -2883,9 +2883,29 @@ impl ProtonDriveClient {
     /// [`enumerate_nodes`](Self::enumerate_nodes).
     pub async fn enumerate_shared_with_me_node_uids(&self) -> Result<Vec<NodeUid>> {
         let mut timer = self.telemetry.start("enumerate_shared_with_me_node_uids");
-        let uids = self.page_shared_with_me().await?;
+        let items = self.page_shared_with_me().await?;
         timer.success();
-        Ok(uids)
+        Ok(items.into_iter().map(|item| item.uid).collect())
+    }
+
+    /// The nodes shared *with* me, each with the share it was granted through.
+    ///
+    /// Same listing as
+    /// [`enumerate_shared_with_me_node_uids`](Self::enumerate_shared_with_me_node_uids),
+    /// but keeping the `ShareID` the wire carries: a shared node is the root of
+    /// the sharer's share on *their* volume, so it comes back parentless and
+    /// only that share's key unlocks it. A caller that mounts shared content
+    /// needs the share id to reason about it without re-deriving it from link
+    /// details.
+    ///
+    /// Order is the API's and is preserved. Materialize the uids with
+    /// [`enumerate_nodes`](Self::enumerate_nodes) — the resulting
+    /// [`Node::membership`](crate::Node::membership) carries our role.
+    pub async fn enumerate_shared_with_me(&self) -> Result<Vec<SharedWithMeItem>> {
+        let mut timer = self.telemetry.start("enumerate_shared_with_me");
+        let items = self.page_shared_with_me().await?;
+        timer.success();
+        Ok(items)
     }
 
     /// Page `v2/sharedwithme` in the order the API returns, recording each item's
@@ -2894,8 +2914,8 @@ impl ProtonDriveClient {
     ///
     /// Order is the API's and is preserved: it is what a front-end lists, and a
     /// set's iteration order would reshuffle the page on every refresh.
-    async fn page_shared_with_me(&self) -> Result<Vec<NodeUid>> {
-        let mut uids = Vec::new();
+    async fn page_shared_with_me(&self) -> Result<Vec<SharedWithMeItem>> {
+        let mut items = Vec::new();
         let mut shares = HashMap::new();
         let mut anchor: Option<String> = None;
 
@@ -2906,14 +2926,9 @@ impl ProtonDriveClient {
             };
             let page: SharedWithMeResponse = self.http.get(&path).await?;
 
-            for link in &page.links {
-                let is_drive_item = ShareTargetType::from_raw(link.share_target_type)
-                    .is_some_and(ShareTargetType::is_drive_item);
-                if is_drive_item {
-                    let uid = NodeUid::new(link.volume_id.clone(), link.link_id.clone());
-                    shares.insert(uid.clone(), link.share_id.clone());
-                    uids.push(uid);
-                }
+            for item in drive_items(&page) {
+                shares.insert(item.uid.clone(), item.share_id.clone());
+                items.push(item);
             }
 
             anchor = page.anchor_id.filter(|id| !id.is_empty());
@@ -2923,7 +2938,7 @@ impl ProtonDriveClient {
         }
 
         self.cache.lock().await.shared_with_me_shares = Some(shares);
-        Ok(uids)
+        Ok(items)
     }
 
     /// The membership share id behind each node shared with us, keyed by the
@@ -5833,6 +5848,9 @@ impl ProtonDriveClient {
                 .as_ref()
                 .is_some_and(|sharing| sharing.share_url_id.is_some()),
             signature_email: link.signature_email.clone(),
+            // Present only when the node is shared *with* us; it is what says
+            // whether we may write to it.
+            membership: details.membership.as_ref().map(share_membership_from_dto),
             verification,
         };
 
@@ -6496,22 +6514,55 @@ fn is_upload_timeout(error: &ProtonError) -> bool {
     matches!(error, ProtonError::Transport(e) if e.is_timeout())
 }
 
+/// Copy the already-fetched wire membership into the public read model.
+fn share_membership_from_dto(dto: &ShareMembershipSummaryDto) -> ShareMembership {
+    ShareMembership {
+        share_id: dto.share_id.clone(),
+        membership_id: dto.membership_id.clone(),
+        permissions: dto.permissions,
+    }
+}
+
+/// The Drive-owned items of one `v2/sharedwithme` page, in the order the API
+/// returned them.
+///
+/// Albums and photos belong to [`ProtonPhotosClient`](crate::ProtonPhotosClient)
+/// and a `Root` target is not an item, so all three are dropped — as is a target
+/// type this build does not recognise, which is safer to skip than to guess at.
+/// Order is preserved: it is what a front-end lists, and reshuffling it would
+/// move rows around on every refresh.
+fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
+    page.links
+        .iter()
+        .filter(|link| {
+            ShareTargetType::from_raw(link.share_target_type)
+                .is_some_and(ShareTargetType::is_drive_item)
+        })
+        .map(|link| SharedWithMeItem {
+            uid: NodeUid::new(link.volume_id.clone(), link.link_id.clone()),
+            share_id: link.share_id.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, aggregate_outcomes, alternate_names,
-        assemble_manifest, check_aggregate, epoch_to_iso8601, is_expired_upload_token,
+        assemble_manifest, check_aggregate, drive_items, epoch_to_iso8601, is_expired_upload_token,
         is_listable_revision_state, is_upload_timeout, join_node_path, path_segments,
-        small_upload_applicable, take_block_target, take_thumbnail_target, to_drive_event,
+        share_membership_from_dto, small_upload_applicable, take_block_target,
+        take_thumbnail_target, to_drive_event,
     };
     use crate::dtos::{
-        AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, VolumeEventDto,
-        VolumeEventLinkDto,
+        AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
+        SharedWithMeLinkDto, SharedWithMeResponse, VolumeEventDto, VolumeEventLinkDto,
     };
     use crate::node::RevisionState;
+    use crate::sharing::MemberRole;
     use proton_sdk::api::{ApiResponse, ResponseCode};
     use proton_sdk::error::{ProtonApiError, ProtonError};
-    use proton_sdk::ids::{DriveEventId, LinkId, VolumeId};
+    use proton_sdk::ids::{DriveEventId, LinkId, ShareId, ShareMembershipId, VolumeId};
 
     /// A batch envelope with one successful link and one that failed with `code`.
     fn mixed_aggregate(code: ResponseCode) -> AggregateLinksResponse {
@@ -6568,6 +6619,53 @@ mod tests {
         assert!(message.contains("move failed for 1 link(s)"), "{message}");
         assert!(message.contains("bad-link"), "{message}");
         assert!(!message.contains("ok-link"), "{message}");
+    }
+
+    #[test]
+    fn shared_with_me_items_keep_share_ids_order_and_drive_targets() {
+        let link = |link_id: &str, share_id: &str, target_type| SharedWithMeLinkDto {
+            volume_id: VolumeId::new("shared-volume"),
+            share_id: ShareId::new(share_id),
+            link_id: LinkId::new(link_id),
+            share_target_type: target_type,
+        };
+        let page = SharedWithMeResponse {
+            links: vec![
+                link("folder", "share-folder", 1),
+                link("album", "share-album", 3),
+                link("file", "share-file", 2),
+                link("root", "share-root", 0),
+                link("vendor", "share-vendor", 5),
+                link("future", "share-future", 99),
+            ],
+            anchor_id: None,
+            more: false,
+        };
+
+        let items = drive_items(&page);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].uid.link_id, LinkId::new("folder"));
+        assert_eq!(items[0].share_id, ShareId::new("share-folder"));
+        assert_eq!(items[1].uid.link_id, LinkId::new("file"));
+        assert_eq!(items[1].share_id, ShareId::new("share-file"));
+        assert_eq!(items[2].uid.link_id, LinkId::new("vendor"));
+        assert_eq!(items[2].share_id, ShareId::new("share-vendor"));
+    }
+
+    #[test]
+    fn membership_dto_copies_raw_authority_into_the_public_shape() {
+        let dto = ShareMembershipSummaryDto {
+            share_id: ShareId::new("share-1"),
+            membership_id: ShareMembershipId::new("membership-1"),
+            permissions: 38,
+        };
+
+        let membership = share_membership_from_dto(&dto);
+        assert_eq!(membership.share_id, dto.share_id);
+        assert_eq!(membership.membership_id, dto.membership_id);
+        assert_eq!(membership.permissions, 38);
+        assert_eq!(membership.role(), MemberRole::Viewer);
+        assert_eq!(membership.role_exact(), None);
     }
 
     #[test]

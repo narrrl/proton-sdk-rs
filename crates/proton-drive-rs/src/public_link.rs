@@ -553,6 +553,9 @@ impl ProtonDrivePublicLinkClient {
             is_shared: true,
             is_shared_publicly: true,
             signature_email: link.name_signature_email.clone(),
+            // A public-link visitor has no account membership — access comes
+            // from the link's own share password, not from a share member row.
+            membership: None,
             verification: Default::default(),
         })
     }
