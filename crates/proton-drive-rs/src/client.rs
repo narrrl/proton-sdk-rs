@@ -1,6 +1,7 @@
 //! The high-level Drive client and its read operations.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use bytes::Bytes;
 use futures::stream::{self, FuturesOrdered, StreamExt, TryStreamExt};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, mpsc};
 
 use proton_sdk::account::{AccountClient, KeySalt};
 use proton_sdk::api::ResponseCode;
@@ -46,7 +47,7 @@ use crate::dtos::{
     AcceptInvitationRequest, AggregateLinksResponse, BlockCreationRequest, BlockDto,
     BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
     BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
-    CommonExtendedAttributes, CreateBookmarkRequest, CreatePublicLinkRequest,
+    CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
     CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
     DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
     DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
@@ -226,6 +227,13 @@ pub struct ProtonDriveClient {
     /// want the same folder key, and resolving it walks (and decrypts) the whole
     /// ancestor chain.
     parent_key_loads: Arc<SingleFlight<(NodeUid, bool), PrivateKey>>,
+    /// Serializes context-share lookups against moves and remote invalidations.
+    ///
+    /// Lookups hold a read guard through cache/network/cache; context-changing
+    /// operations hold a write guard through pre/post invalidation and the
+    /// request. This makes stale cache reinsertion impossible without changing
+    /// the normal HTTP error path.
+    context_share_gate: Arc<RwLock<()>>,
 }
 
 /// The one-time-per-account setup that [`ProtonDriveClient`] single-flights.
@@ -243,6 +251,10 @@ struct Bootstrap {
 /// root, the share key), so this caps memory rather than changing behavior. See
 /// SDK plan #9.
 const FOLDER_KEY_CACHE_CAP: usize = 512;
+
+/// Upper bound on node-to-context-share mappings held in memory. A miss is safe:
+/// the context endpoint is read-only and repopulates the entry.
+const CONTEXT_SHARE_CACHE_CAP: usize = 512;
 
 struct DriveCache {
     main_volume_id: Option<VolumeId>,
@@ -266,6 +278,10 @@ struct DriveCache {
     /// by the shared node itself (which is that share's root link). `None` until
     /// [`ProtonDriveClient::shared_with_me_shares`] pages `v2/sharedwithme`.
     shared_with_me_shares: Option<HashMap<NodeUid, ShareId>>,
+    /// The highest (closest-to-root) share through which each node is reached.
+    /// Move, subtree deletion, and access-change invalidations clear the cache
+    /// because one event can affect mappings beyond the node it names.
+    context_share_ids: LruCache<NodeUid, ShareId>,
 }
 
 impl Default for DriveCache {
@@ -281,6 +297,9 @@ impl Default for DriveCache {
                 NonZeroUsize::new(FOLDER_KEY_CACHE_CAP).expect("cap is non-zero"),
             ),
             shared_with_me_shares: None,
+            context_share_ids: LruCache::new(
+                NonZeroUsize::new(CONTEXT_SHARE_CACHE_CAP).expect("cap is non-zero"),
+            ),
         }
     }
 }
@@ -433,6 +452,7 @@ impl ProtonDriveClient {
             bootstrap: Arc::new(Bootstrap::default()),
             node_loads: Arc::new(SingleFlight::default()),
             parent_key_loads: Arc::new(SingleFlight::default()),
+            context_share_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -461,6 +481,7 @@ impl ProtonDriveClient {
             bootstrap: Arc::new(Bootstrap::default()),
             node_loads: Arc::new(SingleFlight::default()),
             parent_key_loads: Arc::new(SingleFlight::default()),
+            context_share_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -552,6 +573,35 @@ impl ProtonDriveClient {
         self.get_node(&root_uid)
             .await?
             .ok_or_else(|| ProtonError::invalid_operation("My Files root folder not found"))
+    }
+
+    /// Resolve the highest share through which `uid` is reached.
+    ///
+    /// Uses Proton's `GET volumes/{vid}/links/{lid}/context` endpoint and keeps
+    /// a bounded in-memory LRU because sharing and membership-address operations
+    /// commonly ask for the same node repeatedly. The read guard serializes the
+    /// full lookup against context-changing moves and remote invalidations, so a
+    /// completed request cannot reinsert data after an invalidation.
+    pub async fn context_share_id(&self, uid: &NodeUid) -> Result<ShareId> {
+        let mut timer = self.telemetry.start("context_share_id");
+        let _context_guard = self.context_share_gate.read().await;
+
+        if let Some(share_id) = self.cache.lock().await.context_share_ids.get(uid).cloned() {
+            timer.attr("cache", "hit");
+            timer.success();
+            return Ok(share_id);
+        }
+
+        let response: ContextShareResponse = self.http.get(&context_share_path(uid)).await?;
+        let share_id = response.context_share_id;
+        self.cache
+            .lock()
+            .await
+            .context_share_ids
+            .put(uid.clone(), share_id.clone());
+        timer.attr("cache", "miss");
+        timer.success();
+        Ok(share_id)
     }
 
     /// Fetch a single node's decrypted metadata, or `None` if it does not exist.
@@ -1076,24 +1126,46 @@ impl ProtonDriveClient {
     /// event consumer — e.g. [`EventManager`](crate::EventManager) — calls this
     /// per event so those caches converge on the server.
     ///
-    /// - `NodeUpdated` / `NodeDeleted`: forget the node's own folder key (its
-    ///   passphrase may have been re-encrypted) and its entity-cache entry. The
-    ///   parent's key is untouched — adding or removing a child does not re-key
-    ///   the parent.
+    /// - `NodeUpdated`: forget the node's own folder key and entity-cache entry,
+    ///   and clear all context-share mappings. A move can change the context of
+    ///   the node's whole subtree, while the event names only the moved root.
+    /// - `NodeDeleted`: forget the node's own folder key and entity-cache entry,
+    ///   and clear context-share mappings because descendants may also be gone.
     /// - `ContinuityLost` / `ScopeAccessLost`: the cursor gap means we cannot know
     ///   what changed, so drop every folder key and clear the entity cache.
-    /// - cursor-only / shared-with-me events: nothing cached to invalidate.
+    /// - `SharedWithMeUpdated`: clear context mappings because foreign-share
+    ///   access may have changed. Cursor-only events invalidate nothing.
     pub async fn invalidate_caches_for_event(&self, event: &DriveEvent) -> Result<()> {
         match event {
-            DriveEvent::NodeUpdated { node_uid, .. } | DriveEvent::NodeDeleted { node_uid, .. } => {
+            DriveEvent::NodeUpdated { node_uid, .. } => {
                 self.cache.lock().await.folder_keys.pop(node_uid);
+                {
+                    let _context_guard = self.context_share_gate.write().await;
+                    self.cache.lock().await.context_share_ids.clear();
+                }
+                self.entities.remove_node(node_uid).await?;
+            }
+            DriveEvent::NodeDeleted { node_uid, .. } => {
+                self.cache.lock().await.folder_keys.pop(node_uid);
+                {
+                    let _context_guard = self.context_share_gate.write().await;
+                    self.cache.lock().await.context_share_ids.clear();
+                }
                 self.entities.remove_node(node_uid).await?;
             }
             DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
                 self.cache.lock().await.folder_keys.clear();
+                {
+                    let _context_guard = self.context_share_gate.write().await;
+                    self.cache.lock().await.context_share_ids.clear();
+                }
                 self.entities.clear().await?;
             }
-            DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
+            DriveEvent::SharedWithMeUpdated { .. } => {
+                let _context_guard = self.context_share_gate.write().await;
+                self.cache.lock().await.context_share_ids.clear();
+            }
+            DriveEvent::CursorAdvanced { .. } => {}
         }
         Ok(())
     }
@@ -2574,7 +2646,13 @@ impl ProtonDriveClient {
             original_hash: parts.original_hash,
         };
         let path = format!("v2/volumes/{}/links/{}/move", uid.volume_id, uid.link_id);
-        let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+        let client = self.clone();
+        let _: proton_sdk::api::ApiResponse = run_context_share_mutation(
+            self.context_share_gate.clone(),
+            self.cache.clone(),
+            async move { client.http.put(&path, &request).await },
+        )
+        .await?;
         timer.success();
         Ok(())
     }
@@ -2696,7 +2774,14 @@ impl ProtonDriveClient {
                     signature_email: None,
                 };
                 let path = format!("volumes/{}/links/move-multiple", new_parent.volume_id);
-                let response: AggregateLinksResponse = match self.http.put(&path, &request).await {
+                let client = self.clone();
+                let result = run_context_share_mutation(
+                    self.context_share_gate.clone(),
+                    self.cache.clone(),
+                    async move { client.http.put(&path, &request).await },
+                )
+                .await;
+                let response: AggregateLinksResponse = match result {
                     Ok(response) => response,
                     Err(e) => {
                         // The chunk failed as a whole; charge it to every node it
@@ -3779,7 +3864,7 @@ impl ProtonDriveClient {
         let parent_key = self.resolve_parent_key(&uid.volume_id, link).await?;
         let node_key = decrypt_link(&parent_key, link)?.node_key;
 
-        let (address_id, inviter_email, address_key) = self.membership_address().await?;
+        let (address_id, inviter_email, address_key) = self.membership_address_for(uid).await?;
 
         if let Some(sharing) = detail.sharing {
             // Already shared: recover the existing share's passphrase session key
@@ -3894,7 +3979,7 @@ impl ProtonDriveClient {
         let root = self.get_my_files_folder().await?;
         let volume_id = root.uid.volume_id.clone();
 
-        let (address_id, _email, address_key) = self.membership_address().await?;
+        let (address_id, _email, address_key) = self.membership_address_for(&root.uid).await?;
         let address_key_id = self.address_primary_key_id(&address_id).await?;
 
         let material = build_volume_creation_material(&address_key, name)?;
@@ -4771,6 +4856,37 @@ impl ProtonDriveClient {
             .address_id
             .clone();
         self.resolve_membership_address(address_id).await
+    }
+
+    /// Resolve a node's context-share membership address.
+    ///
+    /// The fallback is intentional and permanent: the context endpoint is newer
+    /// than the My Files path and sharing must retain its previous behavior when
+    /// the endpoint or context share cannot be resolved.
+    async fn membership_address_for(
+        &self,
+        uid: &NodeUid,
+    ) -> Result<(AddressId, String, PrivateKey)> {
+        let context_result = async {
+            let share_id = self.context_share_id(uid).await?;
+            let path = format!("shares/{share_id}");
+            let response: ShareResponse = self.http.get(&path).await?;
+            self.resolve_membership_address(response.share.address_id)
+                .await
+        }
+        .await;
+
+        match context_result {
+            Ok(address) => Ok(address),
+            Err(error) => {
+                tracing::warn!(
+                    %uid,
+                    %error,
+                    "failed to resolve context-share membership address; falling back to My Files"
+                );
+                self.membership_address().await
+            }
+        }
     }
 
     /// The membership address for the Photos share. Errors when the account has
@@ -6514,6 +6630,42 @@ fn is_upload_timeout(error: &ProtonError) -> bool {
     matches!(error, ProtonError::Transport(e) if e.is_timeout())
 }
 
+/// Run a request that may change node context shares.
+///
+/// The write guard excludes context lookups for the full request. Invalidating
+/// both before and after handles ambiguous transport failures, where the server
+/// may commit despite returning an error. The caller acquires the guard and
+/// performs pre-invalidation before the request is detached, so cancellation
+/// while waiting cannot issue the request. Once detached, the task owns the
+/// guard, request, and cleanup so cancellation cannot skip post-invalidation.
+async fn run_context_share_mutation<F, T>(
+    gate: Arc<RwLock<()>>,
+    cache: Arc<Mutex<DriveCache>>,
+    request: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let context_guard = gate.write_owned().await;
+    cache.lock().await.context_share_ids.clear();
+
+    tokio::spawn(async move {
+        let _context_guard = context_guard;
+        let result = request.await;
+        cache.lock().await.context_share_ids.clear();
+        result
+    })
+    .await
+    .map_err(|error| {
+        ProtonError::invalid_operation(format!("context-changing request task failed: {error}"))
+    })?
+}
+
+fn context_share_path(uid: &NodeUid) -> String {
+    format!("volumes/{}/links/{}/context", uid.volume_id, uid.link_id)
+}
+
 /// Copy the already-fetched wire membership into the public read model.
 fn share_membership_from_dto(dto: &ShareMembershipSummaryDto) -> ShareMembership {
     ShareMembership {
@@ -6548,11 +6700,11 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, aggregate_outcomes, alternate_names,
-        assemble_manifest, check_aggregate, drive_items, epoch_to_iso8601, is_expired_upload_token,
-        is_listable_revision_state, is_upload_timeout, join_node_path, path_segments,
-        share_membership_from_dto, small_upload_applicable, take_block_target,
-        take_thumbnail_target, to_drive_event,
+        CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, aggregate_outcomes,
+        alternate_names, assemble_manifest, check_aggregate, context_share_path, drive_items,
+        epoch_to_iso8601, is_expired_upload_token, is_listable_revision_state, is_upload_timeout,
+        join_node_path, path_segments, run_context_share_mutation, share_membership_from_dto,
+        small_upload_applicable, take_block_target, take_thumbnail_target, to_drive_event,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
@@ -6562,7 +6714,11 @@ mod tests {
     use crate::sharing::MemberRole;
     use proton_sdk::api::{ApiResponse, ResponseCode};
     use proton_sdk::error::{ProtonApiError, ProtonError};
-    use proton_sdk::ids::{DriveEventId, LinkId, ShareId, ShareMembershipId, VolumeId};
+    use proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, ShareMembershipId, VolumeId};
+    use std::future::Future as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::{Mutex, Notify, RwLock};
 
     /// A batch envelope with one successful link and one that failed with `code`.
     fn mixed_aggregate(code: ResponseCode) -> AggregateLinksResponse {
@@ -6722,6 +6878,191 @@ mod tests {
         // daemon leaks one decrypted folder key per folder ever visited.
         let cache = DriveCache::default();
         assert_eq!(cache.folder_keys.cap().get(), FOLDER_KEY_CACHE_CAP);
+    }
+
+    #[test]
+    fn context_share_cache_is_bounded_and_promotes_hits() {
+        let mut cache = DriveCache::default();
+        assert_eq!(cache.context_share_ids.cap().get(), CONTEXT_SHARE_CACHE_CAP);
+
+        for index in 0..CONTEXT_SHARE_CACHE_CAP {
+            cache.context_share_ids.put(
+                NodeUid::new(
+                    VolumeId::new("volume-1"),
+                    LinkId::new(format!("link-{index}")),
+                ),
+                ShareId::new(format!("share-{index}")),
+            );
+        }
+
+        let oldest = NodeUid::new(VolumeId::new("volume-1"), LinkId::new("link-0"));
+        assert_eq!(
+            cache.context_share_ids.get(&oldest),
+            Some(&ShareId::new("share-0"))
+        );
+        cache.context_share_ids.put(
+            NodeUid::new(VolumeId::new("volume-1"), LinkId::new("overflow")),
+            ShareId::new("overflow-share"),
+        );
+
+        assert!(
+            cache.context_share_ids.peek(&oldest).is_some(),
+            "a hit must promote the entry"
+        );
+        assert!(
+            cache
+                .context_share_ids
+                .peek(&NodeUid::new(
+                    VolumeId::new("volume-1"),
+                    LinkId::new("link-1")
+                ))
+                .is_none(),
+            "the least-recently-used entry must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_share_gate_excludes_lookups_and_mutations() {
+        let gate = RwLock::new(());
+
+        let lookup_guard = gate.read().await;
+        assert!(
+            gate.try_write().is_err(),
+            "a lookup read guard must block a context mutation"
+        );
+        drop(lookup_guard);
+
+        let _mutation_guard = gate.write().await;
+        assert!(
+            gate.try_read().is_err(),
+            "a mutation write guard must block a context lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_context_mutation_while_queued_does_not_start_request() {
+        let gate = Arc::new(RwLock::new(()));
+        let cache = Arc::new(Mutex::new(DriveCache::default()));
+        let lookup_guard = gate.read().await;
+        let request_started = Arc::new(AtomicBool::new(false));
+
+        let mut mutation = Box::pin(run_context_share_mutation(gate.clone(), cache, {
+            let request_started = request_started.clone();
+            async move {
+                request_started.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+
+        let was_pending = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(mutation.as_mut().poll(context).is_pending())
+        })
+        .await;
+        assert!(was_pending, "the mutation must be queued behind the lookup");
+
+        // If the helper detached before acquiring the gate, let that task run
+        // now so it queues behind the held read guard.
+        tokio::task::yield_now().await;
+        drop(mutation);
+        drop(lookup_guard);
+
+        // Acquiring the gate proves no detached mutation remains queued.
+        let completed_guard = gate.write().await;
+        drop(completed_guard);
+        assert!(
+            !request_started.load(Ordering::SeqCst),
+            "cancelling before gate acquisition must not start the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_mutation_finishes_post_invalidation_after_caller_cancellation() {
+        let gate = Arc::new(RwLock::new(()));
+        let cache = Arc::new(Mutex::new(DriveCache::default()));
+        let uid = NodeUid::new(VolumeId::new("volume-1"), LinkId::new("link-1"));
+        cache
+            .lock()
+            .await
+            .context_share_ids
+            .put(uid.clone(), ShareId::new("before-move"));
+
+        let request_started = Arc::new(Notify::new());
+        let finish_request = Arc::new(Notify::new());
+        let caller = tokio::spawn({
+            let gate = gate.clone();
+            let cache = cache.clone();
+            let request_uid = uid.clone();
+            let request_started = request_started.clone();
+            let finish_request = finish_request.clone();
+            async move {
+                let request_cache = cache.clone();
+                run_context_share_mutation(gate, cache, async move {
+                    request_started.notify_one();
+                    finish_request.notified().await;
+
+                    // White-box marker: post-invalidation is otherwise
+                    // observationally indistinguishable from pre-invalidation.
+                    request_cache
+                        .lock()
+                        .await
+                        .context_share_ids
+                        .put(request_uid, ShareId::new("request-completed"));
+                    Ok(())
+                })
+                .await
+            }
+        });
+
+        request_started.notified().await;
+        assert!(
+            cache.lock().await.context_share_ids.peek(&uid).is_none(),
+            "the detached mutation must invalidate before its request"
+        );
+
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller should be cancelled")
+                .is_cancelled()
+        );
+        finish_request.notify_one();
+
+        // The detached task owns the write guard until its post-invalidation.
+        let completed_guard = gate.write().await;
+        drop(completed_guard);
+        let state = cache.lock().await;
+        assert!(
+            state.context_share_ids.peek(&uid).is_none(),
+            "caller cancellation must not skip the post-request invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_mutation_preserves_request_error_variant() {
+        let result = run_context_share_mutation(
+            Arc::new(RwLock::new(())),
+            Arc::new(Mutex::new(DriveCache::default())),
+            async { Err::<(), _>(api_error(ResponseCode::DoesNotExist, 422)) },
+        )
+        .await;
+
+        match result.expect_err("request should fail") {
+            ProtonError::Api(error) => {
+                assert_eq!(error.code, ResponseCode::DoesNotExist);
+                assert_eq!(error.http_status, 422);
+            }
+            other => panic!("expected original API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_share_route_matches_the_drive_api() {
+        let uid = NodeUid::new(VolumeId::new("volume-1"), LinkId::new("link-1"));
+        assert_eq!(
+            context_share_path(&uid),
+            "volumes/volume-1/links/link-1/context"
+        );
     }
 
     #[test]

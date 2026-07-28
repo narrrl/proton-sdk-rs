@@ -55,6 +55,16 @@ pub struct LinkDetailsResponse {
     pub links: Vec<LinkDetailsDto>,
 }
 
+/// `GET volumes/{vid}/links/{lid}/context`.
+///
+/// Proton's C# SDK models this as `ContextShareResponse`; the API envelope also
+/// carries the common `Code` field, which serde intentionally ignores here.
+#[derive(Debug, Deserialize)]
+pub struct ContextShareResponse {
+    #[serde(rename = "ContextShareID")]
+    pub context_share_id: ShareId,
+}
+
 /// `GET volumes/{vid}/photos` response (C# `TimelinePhotoListResponse`).
 #[derive(Debug, Deserialize)]
 pub struct TimelinePhotoListResponse {
@@ -1255,6 +1265,15 @@ pub struct DeviceUpdateShareDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_share_response_parses_required_share_id() {
+        let response: ContextShareResponse =
+            serde_json::from_str(r#"{"Code":1000,"ContextShareID":"context-share-1"}"#)
+                .expect("context share response");
+
+        assert_eq!(response.context_share_id, ShareId::new("context-share-1"));
+    }
 
     #[test]
     fn only_drive_share_targets_are_drive_items() {
