@@ -320,6 +320,19 @@ impl ApiHttpClient {
         self.send::<(), T>(Method::DELETE, path, None).await
     }
 
+    /// `DELETE {path}` with a JSON body, returning a typed success body.
+    ///
+    /// A few Drive endpoints take their operand in the body of a `DELETE`
+    /// (C# `HttpApiCallBuilder.DeleteAsync(route, payload, ...)`), e.g. removing
+    /// photo tags.
+    pub async fn delete_with_body<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.send::<B, T>(Method::DELETE, path, Some(body)).await
+    }
+
     async fn send<B: Serialize, T: DeserializeOwned>(
         &self,
         method: Method,

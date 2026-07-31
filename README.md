@@ -272,6 +272,11 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | | Incoming Invites | ✅ | List, accept, or reject invitations shared *with* the current user. |
 | **Photos** | Photos Timeline | ✅ | `ProtonPhotosClient` maps photostream, timeline enumeration, and photo downloads. |
 | | Photo Uploads | ✅ | Uploading photos with `PhotoUploadMetadata` (capture time, tags, grouping). |
+| | Albums (read) | ✅ | List albums (`enumerate_album_node_uids`) and their photos (`enumerate_album`); album nodes carry `Node::album`. |
+| | Photo Tags | ✅ | Add/remove classification tags (`update_photos`); `Favorite` on photos in our own timeline. |
+| | Shared Photos | ✅ | Photos/albums shared *with* us (`enumerate_shared_with_me_node_uids`, `enumerate_shared_with_me_album_uids`). |
+| | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported. |
+| | Album Writes | ❌ | Creating albums and adding/removing photos is not ported. |
 | | Photos Volume Create| ❌ | Volume creation is not yet ported. |
 | **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`); keys/secrets remain strictly in memory. |
 

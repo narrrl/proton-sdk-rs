@@ -54,8 +54,13 @@ pub use event_manager::{
     EventManagerConfig, MemoryCursorStore,
 };
 pub use events::{DriveEvent, DriveEventScopeId};
-pub use node::{Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
-pub use photos::{PhotoTag, PhotoUploadMetadata, PhotosTimelineItem, ProtonPhotosClient};
+pub use node::{
+    AlbumProperties, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail, ThumbnailType,
+};
+pub use photos::{
+    AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
+    ProtonPhotosClient,
+};
 pub use proton_sdk::account::KeySalt;
 pub use proton_sdk::cache::{CacheRepository, EncryptedCacheRepository, InMemoryCacheRepository};
 pub use public_link::{ProtonDrivePublicLinkClient, PublicLinkInfo};

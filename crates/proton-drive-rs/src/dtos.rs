@@ -142,10 +142,15 @@ pub struct LinkDetailsDto {
     #[serde(rename = "File")]
     pub file: Option<FileDto>,
     /// Photos-volume `/links` returns file properties under `Photo` (a superset
-    /// of `File`) rather than `File`. Deserialized as [`FileDto`]; the extra
-    /// photo fields are ignored. C# `linkDetailsDto.File ?? linkDetailsDto.Photo`.
+    /// of `File`) rather than `File`. C# `linkDetailsDto.File ?? linkDetailsDto.Photo`.
     #[serde(rename = "Photo")]
-    pub photo: Option<FileDto>,
+    pub photo: Option<PhotoDto>,
+    /// Album properties, for a link of type [`LinkType::Album`]. An album
+    /// decrypts exactly like a folder — the block simply carries the hash key
+    /// under the same name plus the album-only metadata (C# `AlbumDto`, layered
+    /// onto a `FolderNode` by `DtoToMetadataConverter.ConvertAlbumMetadataAsync`).
+    #[serde(rename = "Album")]
+    pub album: Option<AlbumDto>,
     /// Present when the node is shared (with members and/or via a public link).
     #[serde(rename = "Sharing", default)]
     pub sharing: Option<LinkSharingDto>,
@@ -180,8 +185,153 @@ impl LinkDetailsDto {
     /// File properties for a file/photo node, preferring `File` and falling back
     /// to the photos-volume `Photo` block.
     pub fn file_properties(&self) -> Option<&FileDto> {
-        self.file.as_ref().or(self.photo.as_ref())
+        self.file
+            .as_ref()
+            .or_else(|| self.photo.as_ref().map(|photo| &photo.file))
     }
+
+    /// Folder properties for a folder/album node. An album's hash key and
+    /// extended attributes live in the `Album` block, which is otherwise a
+    /// superset of `Folder` — C# builds a synthetic `FolderDto` from it.
+    pub fn folder_properties(&self) -> Option<FolderProperties<'_>> {
+        if let Some(folder) = self.folder.as_ref() {
+            return Some(FolderProperties {
+                hash_key: &folder.hash_key,
+                extended_attributes: folder.extended_attributes.as_deref(),
+            });
+        }
+        self.album.as_ref().map(|album| FolderProperties {
+            hash_key: &album.hash_key,
+            extended_attributes: album.extended_attributes.as_deref(),
+        })
+    }
+}
+
+/// The folder-shaped part of a `Folder` or `Album` block (C#
+/// `ConvertAlbumMetadataAsync`'s synthetic `FolderDto`).
+pub struct FolderProperties<'a> {
+    pub hash_key: &'a str,
+    pub extended_attributes: Option<&'a str>,
+}
+
+/// Photo properties on a photos-volume link (C# `PhotoDto : FileDto`).
+#[derive(Debug, Deserialize)]
+pub struct PhotoDto {
+    /// The file properties a photo shares with any other file.
+    #[serde(flatten)]
+    pub file: FileDto,
+    /// Capture time in seconds since the Unix epoch.
+    #[serde(rename = "CaptureTime", default)]
+    pub capture_time: i64,
+    /// Lowercase-hex HMAC of the plaintext SHA-1 under the photos root's hash
+    /// key — the second half of duplicate detection.
+    #[serde(rename = "ContentHash", default)]
+    pub content_hash: Option<String>,
+    /// Set when this photo is a *related* photo (live-photo video, burst
+    /// sibling): the link id of the main photo it belongs to.
+    #[serde(rename = "MainPhotoLinkID", default)]
+    pub main_photo_link_id: Option<LinkId>,
+    /// The related photos of this (main) photo.
+    #[serde(rename = "RelatedPhotosLinkIDs", default)]
+    pub related_photo_link_ids: Vec<LinkId>,
+    /// Classification tags as their `PhotoTag` discriminants; unknown values are
+    /// dropped when the node is built.
+    #[serde(rename = "Tags", default)]
+    pub tags: Vec<i32>,
+    /// The albums this photo has been added to.
+    #[serde(rename = "Albums", default)]
+    pub album_inclusions: Vec<PhotoAlbumInclusionDto>,
+}
+
+/// One album a photo belongs to (C# `PhotoAlbumInclusionDto`).
+#[derive(Debug, Deserialize)]
+pub struct PhotoAlbumInclusionDto {
+    #[serde(rename = "AlbumLinkID")]
+    pub album_link_id: LinkId,
+    #[serde(rename = "AddedTime", default)]
+    pub creation_time: i64,
+}
+
+/// Album properties on a photos-volume link (C# `AlbumDto`).
+#[derive(Debug, Deserialize)]
+pub struct AlbumDto {
+    /// The album's child-name hash key — same field a folder carries.
+    #[serde(rename = "NodeHashKey")]
+    pub hash_key: String,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: Option<String>,
+    #[serde(rename = "PhotoCount", default)]
+    pub photo_count: i32,
+    #[serde(rename = "CoverLinkID", default)]
+    pub cover_link_id: Option<LinkId>,
+    /// Epoch seconds of the last change to the album's contents.
+    #[serde(rename = "LastActivityTime", default)]
+    pub last_activity_time: i64,
+}
+
+/// `GET photos/volumes/{vid}/albums` — the albums on a photos volume, paged on
+/// `AnchorID` (C# `AlbumListResponse`).
+#[derive(Debug, Deserialize)]
+pub struct AlbumListResponse {
+    #[serde(rename = "Albums", default)]
+    pub albums: Vec<AlbumListItemDto>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<LinkId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumListItemDto {
+    #[serde(rename = "LinkID")]
+    pub id: LinkId,
+}
+
+/// `GET photos/volumes/{vid}/albums/{lid}/children` — an album's photos, newest
+/// capture first, paged on `AnchorID` (C# `AlbumItemListResponse`).
+#[derive(Debug, Deserialize)]
+pub struct AlbumItemListResponse {
+    #[serde(rename = "Photos", default)]
+    pub photos: Vec<AlbumItemDto>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<LinkId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumItemDto {
+    #[serde(rename = "LinkID")]
+    pub id: LinkId,
+    #[serde(rename = "CaptureTime", default)]
+    pub capture_time: i64,
+}
+
+/// `GET photos/albums/shared-with-me` — albums other users share with us. Unlike
+/// `v2/sharedwithme` each row carries its own volume (C# `SharedAlbumsResponse`).
+#[derive(Debug, Deserialize)]
+pub struct SharedAlbumsResponse {
+    #[serde(rename = "Albums", default)]
+    pub albums: Vec<SharedAlbumDto>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+    #[serde(rename = "AnchorID", default)]
+    pub anchor_id: Option<LinkId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SharedAlbumDto {
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+}
+
+/// `POST`/`DELETE photos/volumes/{vid}/links/{lid}/tags` (C# `PhotoTagsRequest`).
+#[derive(Debug, Serialize)]
+pub struct PhotoTagsRequest {
+    #[serde(rename = "Tags")]
+    pub tags: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1136,6 +1286,12 @@ impl ShareTargetType {
     pub fn is_drive_item(self) -> bool {
         matches!(self, Self::Folder | Self::File | Self::ProtonVendor)
     }
+
+    /// Whether the Photos client owns this kind (C#
+    /// `ProtonPhotosClient.ShareTargetTypes`).
+    pub fn is_photos_item(self) -> bool {
+        matches!(self, Self::Album | Self::Photo)
+    }
 }
 
 /// `GET devices` — the account's registered devices. C# `DeviceListResponse`.
@@ -1273,6 +1429,119 @@ mod tests {
                 .expect("context share response");
 
         assert_eq!(response.context_share_id, ShareId::new("context-share-1"));
+    }
+
+    #[test]
+    fn album_link_details_expose_folder_properties() {
+        // An album's hash key arrives in the `Album` block, not `Folder`; the
+        // rest of the client reads it through `folder_properties` (C# builds a
+        // synthetic `FolderDto` from `AlbumDto`).
+        let raw = r#"{
+            "Link": {
+                "LinkID": "album-1", "Type": 3, "ParentLinkID": "root", "State": 1,
+                "CreateTime": 1, "ModifyTime": 2, "Name": "enc", "NodeKey": "k",
+                "NodePassphrase": "p"
+            },
+            "Album": {
+                "NodeHashKey": "hash-key", "XAttr": "xattr", "PhotoCount": 7,
+                "CoverLinkID": "photo-9", "LastActivityTime": 1700000000
+            }
+        }"#;
+        let details: LinkDetailsDto = serde_json::from_str(raw).unwrap();
+        let album = details.album.as_ref().expect("album block");
+        assert_eq!(album.photo_count, 7);
+        assert_eq!(album.cover_link_id.as_ref().unwrap().as_str(), "photo-9");
+        assert_eq!(album.last_activity_time, 1_700_000_000);
+
+        let folder = details
+            .folder_properties()
+            .expect("album reads as a folder");
+        assert_eq!(folder.hash_key, "hash-key");
+        assert_eq!(folder.extended_attributes, Some("xattr"));
+        assert!(matches!(details.link.parsed_type(), LinkType::Album));
+    }
+
+    #[test]
+    fn photo_link_details_carry_file_and_photo_properties() {
+        // The photos volume returns file properties under `Photo` — a superset
+        // of `File` — so both halves have to come out of the one block.
+        let raw = r#"{
+            "Link": {
+                "LinkID": "photo-1", "Type": 2, "ParentLinkID": "root", "State": 1,
+                "CreateTime": 1, "ModifyTime": 2, "Name": "enc", "NodeKey": "k",
+                "NodePassphrase": "p"
+            },
+            "Photo": {
+                "MediaType": "image/jpeg", "TotalEncryptedSize": 42,
+                "ContentKeyPacket": "packet",
+                "CaptureTime": 1700000000, "ContentHash": "abcd",
+                "MainPhotoLinkID": "photo-main",
+                "RelatedPhotosLinkIDs": ["photo-2"],
+                "Tags": [0, 2, 99],
+                "Albums": [{ "AlbumLinkID": "album-1", "AddedTime": 1700000001 }]
+            }
+        }"#;
+        let details: LinkDetailsDto = serde_json::from_str(raw).unwrap();
+        let file = details.file_properties().expect("file properties");
+        assert_eq!(file.media_type, "image/jpeg");
+        assert_eq!(file.total_size_on_storage, 42);
+
+        let photo = details.photo.as_ref().expect("photo block");
+        assert_eq!(photo.capture_time, 1_700_000_000);
+        assert_eq!(photo.content_hash.as_deref(), Some("abcd"));
+        assert_eq!(
+            photo.main_photo_link_id.as_ref().unwrap().as_str(),
+            "photo-main"
+        );
+        assert_eq!(photo.related_photo_link_ids.len(), 1);
+        // Unknown discriminants survive the wire; they are dropped where the
+        // node is built, not here.
+        assert_eq!(photo.tags, [0, 2, 99]);
+        assert_eq!(photo.album_inclusions[0].album_link_id.as_str(), "album-1");
+    }
+
+    #[test]
+    fn album_listings_page_on_anchor() {
+        let albums: AlbumListResponse = serde_json::from_str(
+            r#"{"Albums":[{"LinkID":"album-1"}],"More":true,"AnchorID":"album-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(albums.albums[0].id.as_str(), "album-1");
+        assert!(albums.more);
+        assert_eq!(albums.anchor_id.unwrap().as_str(), "album-1");
+
+        let items: AlbumItemListResponse = serde_json::from_str(
+            r#"{"Photos":[{"LinkID":"photo-1","CaptureTime":1700000000}],"More":false}"#,
+        )
+        .unwrap();
+        assert_eq!(items.photos[0].capture_time, 1_700_000_000);
+        assert!(!items.more);
+        assert!(items.anchor_id.is_none());
+
+        // Shared albums live on the sharer's volume, so each row carries one.
+        let shared: SharedAlbumsResponse = serde_json::from_str(
+            r#"{"Albums":[{"VolumeID":"vol-9","LinkID":"album-3"}],"More":false}"#,
+        )
+        .unwrap();
+        assert_eq!(shared.albums[0].volume_id.as_str(), "vol-9");
+        assert_eq!(shared.albums[0].link_id.as_str(), "album-3");
+    }
+
+    #[test]
+    fn only_photos_share_targets_are_photos_items() {
+        // C# `ProtonPhotosClient.ShareTargetTypes` — the complement of the Drive
+        // client's set, minus the root share, which is neither's.
+        for (raw, expected) in [
+            (0, false),
+            (1, false),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, false),
+        ] {
+            let kind = ShareTargetType::from_raw(raw).expect("known target type");
+            assert_eq!(kind.is_photos_item(), expected, "target type {raw}");
+        }
     }
 
     #[test]

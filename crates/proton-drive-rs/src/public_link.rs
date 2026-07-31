@@ -556,6 +556,10 @@ impl ProtonDrivePublicLinkClient {
             // A public-link visitor has no account membership — access comes
             // from the link's own share password, not from a share member row.
             membership: None,
+            // A public link points at a Drive folder or file; the photos volume
+            // is not reachable this way, so there is no photo/album metadata.
+            photo: None,
+            album: None,
             verification: Default::default(),
         })
     }
@@ -567,7 +571,10 @@ impl ProtonDrivePublicLinkClient {
 /// (C# `linkDetailsDto.File ?? linkDetailsDto.Photo`) — a public link may point
 /// into either.
 fn file_properties(details: &LinkDetailsDto) -> Option<&FileDto> {
-    details.file.as_ref().or(details.photo.as_ref())
+    details
+        .file
+        .as_ref()
+        .or_else(|| details.photo.as_ref().map(|photo| &photo.file))
 }
 
 fn decode_base64(value: &str, what: &str) -> Result<Vec<u8>> {

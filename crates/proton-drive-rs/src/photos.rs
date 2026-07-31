@@ -46,6 +46,43 @@ pub enum PhotoTag {
     Raw = 9,
 }
 
+impl PhotoTag {
+    /// Map a wire tag discriminant, or `None` for one this SDK does not know
+    /// (the server may add tags; an unknown one is dropped, not an error).
+    pub fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Favorite),
+            1 => Some(Self::Screenshot),
+            2 => Some(Self::Video),
+            3 => Some(Self::LivePhoto),
+            4 => Some(Self::MotionPhoto),
+            5 => Some(Self::Selfie),
+            6 => Some(Self::Portrait),
+            7 => Some(Self::Burst),
+            8 => Some(Self::Panorama),
+            9 => Some(Self::Raw),
+            _ => None,
+        }
+    }
+}
+
+/// One photo's tag changes, applied by
+/// [`ProtonPhotosClient::update_photos`]. Mirrors C# `PhotoTagsUpdate`.
+#[derive(Debug, Clone)]
+pub struct PhotoTagsUpdate {
+    pub node_uid: NodeUid,
+    pub tags_to_add: Vec<PhotoTag>,
+    pub tags_to_remove: Vec<PhotoTag>,
+}
+
+/// One entry of an album listing: a photo and its capture time (epoch seconds).
+/// C# `AlbumItem(NodeUid Uid, DateTime CaptureTime)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumItem {
+    pub uid: NodeUid,
+    pub capture_time: i64,
+}
+
 /// Caller-supplied metadata for a photo upload. Mirrors C#
 /// `PhotosFileUploadMetadata`: all fields are optional. `capture_time` defaults
 /// to the upload time when unset; `main_photo_uid` links a related photo
@@ -219,6 +256,53 @@ impl ProtonPhotosClient {
     /// Find active photos with the same name and plaintext SHA-1 digest.
     pub async fn find_duplicates(&self, name: &str, contents: &[u8]) -> Result<Vec<NodeUid>> {
         self.drive.find_photo_duplicates(name, contents).await
+    }
+
+    /// The albums on the account's photos volume, as [`NodeUid`]s.
+    /// C# `ProtonPhotosClient.EnumerateAlbumNodeUidsAsync`. Empty when the
+    /// account has no photos volume. Materialize with
+    /// [`enumerate_nodes`](Self::enumerate_nodes) — an album node is a folder
+    /// carrying [`Node::album`](crate::Node::album).
+    pub async fn enumerate_album_node_uids(&self) -> Result<Vec<NodeUid>> {
+        self.drive.enumerate_album_node_uids().await
+    }
+
+    /// The photos in `album_uid`, newest capture first.
+    /// C# `ProtonPhotosClient.EnumerateAlbumAsync`.
+    pub async fn enumerate_album(&self, album_uid: &NodeUid) -> Result<Vec<AlbumItem>> {
+        self.drive.enumerate_album(album_uid).await
+    }
+
+    /// The photos and albums other users share with us, as [`NodeUid`]s — the
+    /// photos counterpart of `ProtonDriveClient::enumerate_shared_with_me_node_uids`
+    /// (C# `ProtonPhotosClient.EnumerateSharedWithMeNodeUidsAsync`, which filters
+    /// `v2/sharedwithme` to the Photo/Album target types).
+    pub async fn enumerate_shared_with_me_node_uids(&self) -> Result<Vec<NodeUid>> {
+        self.drive.enumerate_photos_shared_with_me_node_uids().await
+    }
+
+    /// The albums shared with us, as [`NodeUid`]s, from the dedicated
+    /// `photos/albums/shared-with-me` listing (C#
+    /// `PhotoOperations.EnumerateSharedWithMeAlbumUidsAsync`). Each row carries
+    /// its own volume — these live on the sharer's photos volume.
+    pub async fn enumerate_shared_with_me_album_uids(&self) -> Result<Vec<NodeUid>> {
+        self.drive.enumerate_shared_with_me_album_uids().await
+    }
+
+    /// Add and/or remove classification tags on photos.
+    ///
+    /// C# `ProtonPhotosClient.UpdatePhotosAsync`: one outcome per input update,
+    /// in input order — a photo that fails does not stop the others.
+    /// [`PhotoTag::Favorite`] is not a plain tag: it is set through the dedicated
+    /// `favorite` endpoint, and only for photos that already live on our own
+    /// photos volume. Favoriting a *shared* photo needs the photo re-encrypted
+    /// for our timeline root, which is not ported yet and fails that update.
+    /// Removing `Favorite` goes through the ordinary tag-removal endpoint.
+    pub async fn update_photos(
+        &self,
+        updates: &[PhotoTagsUpdate],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        self.drive.update_photos(updates).await
     }
 }
 

@@ -44,35 +44,41 @@ use crate::crypto::{
 };
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
-    AcceptInvitationRequest, AggregateLinksResponse, BlockCreationRequest, BlockDto,
-    BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
-    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
-    CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
-    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
-    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
-    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
-    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
-    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
-    FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
-    FolderCreationResponse, InvitationDetailsResponse, InvitationsListResponse,
-    InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
-    InviteProtonUserInvitationDto, InviteProtonUserRequest, InviteProtonUserResponse,
-    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
-    LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
-    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
-    NodeNameAvailabilityResponse, PhotosAttributesDto, RenameLinkRequest, RevisionConflict,
-    RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
-    RevisionListResponse, RevisionMetadataResponse, RevisionResponse, RevisionUpdateRequest,
-    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto,
-    ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedByMeResponse,
+    AcceptInvitationRequest, AggregateLinksResponse, AlbumItemListResponse, AlbumListResponse,
+    BlockCreationRequest, BlockDto, BlockUploadPreparationRequest, BlockUploadPreparationResponse,
+    BlockUploadTarget, BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto,
+    BookmarksResponse, CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest,
+    CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse,
+    DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse,
+    DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto,
+    ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
+    ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
+    FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
+    FolderCreationRequest, FolderCreationResponse, InvitationDetailsResponse,
+    InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
+    InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
+    InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
+    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
+    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
+    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
+    PhotosAttributesDto, RenameLinkRequest, RevisionConflict, RevisionCreationRequest,
+    RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
+    RevisionMetadataResponse, RevisionResponse, RevisionUpdateRequest, ShareInvitationDto,
+    ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse,
+    ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse,
     SharedWithMeResponse, SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest,
     SmallUploadResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
     ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, UpdatePermissionsRequest,
     VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
-use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, Thumbnail, ThumbnailType};
-use crate::photos::{PhotoUploadMetadata, PhotosTimelineItem};
+use crate::node::{
+    AlbumProperties, FileThumbnail, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail,
+    ThumbnailType,
+};
+use crate::photos::{
+    AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
+};
 use crate::revision::{
     MAX_CONCURRENT_BLOCK_DOWNLOADS, Revision, RevisionReader, digest_and_decrypt_block_blocking,
 };
@@ -177,6 +183,29 @@ enum NodeDetail {
 /// Candidate name hashes checked per `checkAvailableHashes` request (C#
 /// `NodeOperations.GetAvailableNameAsync` `batchSize`).
 const NAME_AVAILABILITY_BATCH: usize = 10;
+
+/// Longest node name the API accepts (C# `NodeOperations.MaxNodeNameLength`).
+const MAX_NODE_NAME_LENGTH: usize = 255;
+
+/// Reject a caller-supplied node name before it is encrypted and sent.
+///
+/// C# `NodeOperations.ValidateNodeName` (itself mirroring the JS SDK's
+/// `validateNodeName`), applied on create, rename and rename-during-move. The
+/// length is counted in `char`s: C# counts UTF-16 code units, which differs only
+/// for astral-plane characters, and neither matches the server's own byte
+/// accounting — this is a client-side guard against obviously bad input, not the
+/// authority.
+fn validate_node_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(ProtonError::invalid_operation("Name must not be empty"));
+    }
+    if name.chars().count() > MAX_NODE_NAME_LENGTH {
+        return Err(ProtonError::invalid_operation(format!(
+            "Name must be {MAX_NODE_NAME_LENGTH} characters long at most"
+        )));
+    }
+    Ok(())
+}
 
 /// High-level Proton Drive client.
 ///
@@ -1207,7 +1236,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
-            .or(detail.photo)
+            .or(detail.photo.map(|photo| photo.file))
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -1299,7 +1328,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
-            .or(detail.photo)
+            .or(detail.photo.map(|photo| photo.file))
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -1926,7 +1955,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
-            .or(detail.photo)
+            .or(detail.photo.map(|photo| photo.file))
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -2413,6 +2442,7 @@ impl ProtonDriveClient {
         last_modification_time: Option<i64>,
     ) -> Result<NodeUid> {
         let mut timer = self.telemetry.start("create_folder");
+        validate_node_name(name)?;
         let volume_id = parent_uid.volume_id.clone();
 
         // Resolve the parent folder key + hash key and the membership address.
@@ -2544,6 +2574,7 @@ impl ProtonDriveClient {
         new_media_type: Option<&str>,
     ) -> Result<()> {
         let mut timer = self.telemetry.start("rename_node");
+        validate_node_name(new_name)?;
         let details = self
             .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
             .await?;
@@ -4959,13 +4990,18 @@ impl ProtonDriveClient {
                 for_photos,
             )
             .await?;
-        let folder = details
+        let detail = details
             .links
             .into_iter()
             .next()
-            .and_then(|d| d.folder)
             .ok_or_else(|| ProtonError::invalid_operation("parent node is not a folder"))?;
-        Ok(parent_key.decrypt_armored_message(&folder.hash_key)?)
+        // An album carries its hash key in the `Album` block instead of `Folder`
+        // (C# builds a synthetic `FolderDto` from `AlbumDto`), and album children
+        // are hashed under it exactly as a folder's are.
+        let folder = detail
+            .folder_properties()
+            .ok_or_else(|| ProtonError::invalid_operation("parent node is not a folder"))?;
+        Ok(parent_key.decrypt_armored_message(folder.hash_key)?)
     }
 
     /// Fetch the block verification code, validating that the returned content
@@ -5525,6 +5561,266 @@ impl ProtonDriveClient {
             .collect())
     }
 
+    /// Page the albums on the account's photos volume.
+    ///
+    /// Mirrors C# `PhotosNodeOperations.EnumerateAlbumNodeUidsAsync`:
+    /// `GET photos/volumes/{vid}/albums`, paged on `AnchorID`. Empty when the
+    /// account has no photos volume (C# yields nothing rather than erroring).
+    pub(crate) async fn enumerate_album_node_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self.telemetry.start("enumerate_album_node_uids");
+        if !self.ensure_photos().await? {
+            timer.success();
+            return Ok(Vec::new());
+        }
+        let volume_id = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root")
+            .volume_id;
+
+        let mut uids = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+        loop {
+            let path = match &anchor {
+                Some(anchor_id) => {
+                    format!("photos/volumes/{volume_id}/albums?AnchorID={anchor_id}")
+                }
+                None => format!("photos/volumes/{volume_id}/albums"),
+            };
+            let page: AlbumListResponse = self.http.get(&path).await?;
+
+            for album in &page.albums {
+                uids.push(NodeUid::new(volume_id.clone(), album.id.clone()));
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.as_str().is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+        timer.success();
+        Ok(uids)
+    }
+
+    /// Page one album's photos, newest capture first.
+    ///
+    /// Mirrors C# `PhotosNodeOperations.EnumerateAlbumAsync`:
+    /// `GET photos/volumes/{vid}/albums/{lid}/children?Sort=Captured&Desc=1`,
+    /// paged on `AnchorID`. The album's own volume is used, so an album shared
+    /// with us (on the sharer's photos volume) enumerates the same way.
+    pub(crate) async fn enumerate_album(&self, album_uid: &NodeUid) -> Result<Vec<AlbumItem>> {
+        let mut timer = self.telemetry.start("enumerate_album");
+        let mut items = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+        loop {
+            let base = format!(
+                "photos/volumes/{}/albums/{}/children?Sort=Captured&Desc=1",
+                album_uid.volume_id, album_uid.link_id
+            );
+            let path = match &anchor {
+                Some(anchor_id) => format!("{base}&AnchorID={anchor_id}"),
+                None => base,
+            };
+            let page: AlbumItemListResponse = self.http.get(&path).await?;
+
+            for photo in &page.photos {
+                items.push(AlbumItem {
+                    uid: NodeUid::new(album_uid.volume_id.clone(), photo.id.clone()),
+                    capture_time: photo.capture_time,
+                });
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.as_str().is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+        timer.success();
+        Ok(items)
+    }
+
+    /// Page the albums other users share with us.
+    ///
+    /// Mirrors C# `PhotoOperations.EnumerateSharedWithMeAlbumUidsAsync`:
+    /// `GET photos/albums/shared-with-me`, paged on `AnchorID`. Unlike
+    /// `v2/sharedwithme` each row carries its own `VolumeID` — a shared album
+    /// lives on the sharer's photos volume — and the listing is account-wide, so
+    /// it works even when *we* have no photos volume.
+    pub(crate) async fn enumerate_shared_with_me_album_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self.telemetry.start("enumerate_shared_with_me_album_uids");
+        let mut uids = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+        loop {
+            let path = match &anchor {
+                Some(anchor_id) => format!("photos/albums/shared-with-me?AnchorID={anchor_id}"),
+                None => "photos/albums/shared-with-me".to_string(),
+            };
+            let page: SharedAlbumsResponse = self.http.get(&path).await?;
+
+            for album in &page.albums {
+                uids.push(NodeUid::new(album.volume_id.clone(), album.link_id.clone()));
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.as_str().is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+        timer.success();
+        Ok(uids)
+    }
+
+    /// The photos and albums shared *with* us, from `v2/sharedwithme`.
+    ///
+    /// The same listing [`enumerate_shared_with_me_node_uids`](Self::enumerate_shared_with_me_node_uids)
+    /// pages, kept to the target types the Photos client owns (C#
+    /// `ProtonPhotosClient.ShareTargetTypes` = Photo + Album). Exposed through
+    /// [`ProtonPhotosClient`](crate::ProtonPhotosClient).
+    pub(crate) async fn enumerate_photos_shared_with_me_node_uids(&self) -> Result<Vec<NodeUid>> {
+        let mut timer = self
+            .telemetry
+            .start("enumerate_photos_shared_with_me_node_uids");
+        let mut uids = Vec::new();
+        let mut anchor: Option<String> = None;
+        loop {
+            let path = match &anchor {
+                Some(anchor_id) => format!("v2/sharedwithme?AnchorID={anchor_id}"),
+                None => "v2/sharedwithme".to_string(),
+            };
+            let page: SharedWithMeResponse = self.http.get(&path).await?;
+
+            for link in &page.links {
+                if ShareTargetType::from_raw(link.share_target_type)
+                    .is_some_and(ShareTargetType::is_photos_item)
+                {
+                    uids.push(NodeUid::new(link.volume_id.clone(), link.link_id.clone()));
+                }
+            }
+
+            anchor = page.anchor_id.filter(|id| !id.is_empty());
+            if !page.more || anchor.is_none() {
+                break;
+            }
+        }
+        timer.success();
+        Ok(uids)
+    }
+
+    /// Apply tag additions/removals to photos.
+    ///
+    /// Mirrors C# `PhotoOperations.UpdatePhotosAsync`: one outcome per input
+    /// update, in input order, so a photo that fails does not stop the others —
+    /// the outer `Err` is reserved for what makes the whole call impossible.
+    /// `Favorite` is special-cased exactly as upstream: it is *set* through
+    /// `POST photos/volumes/{vid}/links/{lid}/favorite` and only for photos on
+    /// our own photos volume, while every other tag (and every removal,
+    /// `Favorite` included) goes through the tags endpoints.
+    ///
+    /// Favoriting a photo on someone else's volume needs the photo — and its
+    /// related photos — re-encrypted for our timeline root and sent as the
+    /// favorite request body (upstream `03b1cb7f`, `PhotoTransferPayloadBuilder`).
+    /// That is not ported, so such an update fails with an explicit error rather
+    /// than silently doing nothing.
+    pub(crate) async fn update_photos(
+        &self,
+        updates: &[PhotoTagsUpdate],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        let mut timer = self.telemetry.start("update_photos");
+        timer.attr("photo_count", updates.len());
+        if updates.is_empty() {
+            timer.success();
+            return Ok(Vec::new());
+        }
+
+        // Resolved once: the volume a bodyless favorite is valid on. `None` when
+        // the account has no photos volume, which makes every favorite fail below.
+        let own_photos_volume = if self.ensure_photos().await? {
+            self.cache
+                .lock()
+                .await
+                .photos_root
+                .clone()
+                .map(|root| root.volume_id)
+        } else {
+            None
+        };
+
+        let mut outcomes = Vec::with_capacity(updates.len());
+        for update in updates {
+            let outcome = self
+                .apply_tag_update(update, own_photos_volume.as_ref())
+                .await;
+            outcomes.push((update.node_uid.clone(), outcome));
+        }
+        timer.success();
+        Ok(outcomes)
+    }
+
+    /// One photo's tag update (C# `PhotoOperations.ApplyTagUpdateAsync`).
+    async fn apply_tag_update(
+        &self,
+        update: &PhotoTagsUpdate,
+        own_photos_volume: Option<&VolumeId>,
+    ) -> Result<()> {
+        let volume_id = &update.node_uid.volume_id;
+        let link_id = &update.node_uid.link_id;
+
+        if update.tags_to_add.contains(&PhotoTag::Favorite) {
+            match own_photos_volume {
+                Some(own) if own == volume_id => {
+                    let path = format!("photos/volumes/{volume_id}/links/{link_id}/favorite");
+                    // An empty object, not `()`: serde renders the unit type as
+                    // `null`, which the API rejects.
+                    let _: proton_sdk::api::ApiResponse =
+                        self.http.post(&path, &serde_json::json!({})).await?;
+                }
+                _ => {
+                    return Err(ProtonError::invalid_operation(
+                        "favoriting a photo that is not on this account's photos volume is not supported yet",
+                    ));
+                }
+            }
+        }
+
+        // `Favorite` has its own endpoint and is never sent as a plain tag.
+        let tags_to_add: Vec<i32> = update
+            .tags_to_add
+            .iter()
+            .filter(|&&tag| tag != PhotoTag::Favorite)
+            .map(|&tag| tag as i32)
+            .collect();
+        if !tags_to_add.is_empty() {
+            let path = format!("photos/volumes/{volume_id}/links/{link_id}/tags");
+            let _: proton_sdk::api::ApiResponse = self
+                .http
+                .post(&path, &PhotoTagsRequest { tags: tags_to_add })
+                .await?;
+        }
+
+        if !update.tags_to_remove.is_empty() {
+            let tags_to_remove: Vec<i32> = update
+                .tags_to_remove
+                .iter()
+                .map(|&tag| tag as i32)
+                .collect();
+            let path = format!("photos/volumes/{volume_id}/links/{link_id}/tags");
+            let _: proton_sdk::api::ApiResponse = self
+                .http
+                .delete_with_body(
+                    &path,
+                    &PhotoTagsRequest {
+                        tags: tags_to_remove,
+                    },
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Download and decrypt a photo's active revision into `output` (photos
     /// routing). C# `PhotosFileDownloader`: the node is resolved via the photos
     /// endpoint; blocks are fetched from their absolute storage URLs exactly as
@@ -5545,7 +5841,7 @@ impl ProtonDriveClient {
         let link = detail.link;
         let file = detail
             .file
-            .or(detail.photo)
+            .or(detail.photo.map(|photo| photo.file))
             .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} is not a file")))?;
 
         let content_key_packet_b64 = file.content_key_packet.ok_or_else(|| {
@@ -5847,6 +6143,11 @@ impl ProtonDriveClient {
             .clone()
             .map(|pid| NodeUid::new(volume_id.clone(), pid));
 
+        // Album- and photo-only metadata, layered onto the folder/file node the
+        // way C# layers `AlbumNode : FolderNode` / `PhotoNode : FileNode`.
+        let mut album = None;
+        let mut photo = None;
+
         let kind = match link.parsed_type() {
             LinkType::Folder | LinkType::Album => {
                 let node_key = node_key.as_ref().ok_or_else(|| {
@@ -5858,6 +6159,15 @@ impl ProtonDriveClient {
                     .await
                     .folder_keys
                     .put(uid.clone(), node_key.clone());
+                album = details.album.as_ref().map(|album| AlbumProperties {
+                    photo_count: album.photo_count,
+                    cover_photo_uid: album
+                        .cover_link_id
+                        .clone()
+                        .map(|link_id| NodeUid::new(volume_id.clone(), link_id)),
+                    last_activity_time: (album.last_activity_time != 0)
+                        .then_some(album.last_activity_time),
+                });
                 NodeKind::Folder
             }
             LinkType::File => {
@@ -5927,6 +6237,31 @@ impl ProtonDriveClient {
                         }
                     }
                 }
+                photo = details.photo.as_ref().map(|photo| PhotoProperties {
+                    capture_time: photo.capture_time,
+                    content_hash: photo.content_hash.clone(),
+                    main_photo_uid: photo
+                        .main_photo_link_id
+                        .clone()
+                        .map(|link_id| NodeUid::new(volume_id.clone(), link_id)),
+                    related_photo_uids: photo
+                        .related_photo_link_ids
+                        .iter()
+                        .map(|link_id| NodeUid::new(volume_id.clone(), link_id.clone()))
+                        .collect(),
+                    // An unknown tag discriminant is dropped: the server may add
+                    // tags this SDK predates, and that must not fail the node.
+                    tags: photo
+                        .tags
+                        .iter()
+                        .filter_map(|&t| PhotoTag::from_raw(t))
+                        .collect(),
+                    album_uids: photo
+                        .album_inclusions
+                        .iter()
+                        .map(|album| NodeUid::new(volume_id.clone(), album.album_link_id.clone()))
+                        .collect(),
+                });
                 NodeKind::File {
                     media_type: file.media_type.clone(),
                     total_size_on_storage: file.total_size_on_storage,
@@ -5967,6 +6302,8 @@ impl ProtonDriveClient {
             // Present only when the node is shared *with* us; it is what says
             // whether we may write to it.
             membership: details.membership.as_ref().map(share_membership_from_dto),
+            photo,
+            album,
             verification,
         };
 
@@ -6700,11 +7037,13 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP, aggregate_outcomes,
-        alternate_names, assemble_manifest, check_aggregate, context_share_path, drive_items,
-        epoch_to_iso8601, is_expired_upload_token, is_listable_revision_state, is_upload_timeout,
-        join_node_path, path_segments, run_context_share_mutation, share_membership_from_dto,
+        CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
+        MAX_NODE_NAME_LENGTH, aggregate_outcomes, alternate_names, assemble_manifest,
+        check_aggregate, context_share_path, drive_items, epoch_to_iso8601,
+        is_expired_upload_token, is_listable_revision_state, is_upload_timeout, join_node_path,
+        path_segments, run_context_share_mutation, share_membership_from_dto,
         small_upload_applicable, take_block_target, take_thumbnail_target, to_drive_event,
+        validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
@@ -7136,6 +7475,22 @@ mod tests {
     fn rejects_unknown_event_type() {
         let vid = VolumeId::new("vol-1");
         assert!(to_drive_event(&vid, &event(99, None)).is_err());
+    }
+
+    #[test]
+    fn node_names_are_validated_before_they_are_sent() {
+        // C# `NodeOperations.ValidateNodeName`: empty and over-long names are
+        // rejected client-side rather than round-tripping to a server error.
+        assert!(validate_node_name("report.txt").is_ok());
+        assert!(validate_node_name("").is_err());
+
+        let longest = "a".repeat(MAX_NODE_NAME_LENGTH);
+        assert!(validate_node_name(&longest).is_ok());
+        assert!(validate_node_name(&format!("{longest}a")).is_err());
+
+        // Counted in characters, not bytes: a 255-emoji name is 1020 bytes and
+        // still legal.
+        assert!(validate_node_name(&"🙂".repeat(MAX_NODE_NAME_LENGTH)).is_ok());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use proton_sdk::crypto::VerificationStatus;
 use proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 
+use crate::photos::PhotoTag;
 use crate::sharing::ShareMembership;
 
 /// A decrypted Drive node (folder or file).
@@ -37,11 +38,54 @@ pub struct Node {
     /// one written before this field existed must keep deserializing.
     #[serde(default)]
     pub membership: Option<ShareMembership>,
+    /// Photo-only metadata, present on a photos-volume file node. C# layers this
+    /// as `PhotoNode : FileNode`; here it is an optional block so a `Node`
+    /// persisted before photos existed still deserializes.
+    #[serde(default)]
+    pub photo: Option<PhotoProperties>,
+    /// Album-only metadata, present on an album node. An album is otherwise a
+    /// folder (C# `AlbumNode : FolderNode`), so [`Node::kind`] stays
+    /// [`NodeKind::Folder`].
+    #[serde(default)]
+    pub album: Option<AlbumProperties>,
     /// Per-field signature-verification results gathered while decrypting the
     /// node. Non-fatal metadata (mirrors C# `AuthorshipVerificationFailure`):
     /// the node is always returned; the caller inspects this to decide trust.
     #[serde(default)]
     pub verification: NodeVerification,
+}
+
+/// Photo-only metadata on a photos-volume file node. Mirrors the fields C#
+/// `PhotoNode` adds to `FileNode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhotoProperties {
+    /// Capture time in seconds since the Unix epoch.
+    pub capture_time: i64,
+    /// Lowercase-hex HMAC of the plaintext SHA-1 under the photos root's hash
+    /// key — what duplicate detection matches on. `None` on older photos.
+    pub content_hash: Option<String>,
+    /// Set when this is a *related* photo (live-photo video, burst sibling):
+    /// the main photo it belongs to.
+    pub main_photo_uid: Option<NodeUid>,
+    /// This (main) photo's related photos.
+    pub related_photo_uids: Vec<NodeUid>,
+    /// Classification tags. Values the server sends that this SDK does not know
+    /// are dropped rather than failing the node.
+    pub tags: Vec<PhotoTag>,
+    /// The albums this photo has been added to.
+    pub album_uids: Vec<NodeUid>,
+}
+
+/// Album-only metadata on an album node. Mirrors the fields C# `AlbumNode` adds
+/// to `FolderNode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlbumProperties {
+    pub photo_count: i32,
+    /// The photo shown as the album's cover, when it has one.
+    pub cover_photo_uid: Option<NodeUid>,
+    /// Epoch seconds of the last change to the album's contents; `None` when the
+    /// server sends none.
+    pub last_activity_time: Option<i64>,
 }
 
 /// Outcome of verifying the signatures encountered while decrypting a node.
@@ -310,6 +354,8 @@ mod tests {
                 membership_id: "member-1".into(),
                 permissions: 6,
             }),
+            photo: None,
+            album: None,
             verification: NodeVerification::default(),
         };
 
