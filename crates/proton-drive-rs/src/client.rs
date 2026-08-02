@@ -63,13 +63,13 @@ use crate::dtos::{
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
     PhotosAttributesDto, RenameLinkRequest, RevisionConflict, RevisionCreationRequest,
     RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
-    RevisionMetadataResponse, RevisionResponse, RevisionUpdateRequest, ShareInvitationDto,
-    ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse,
-    ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse,
-    SharedWithMeResponse, SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest,
-    SmallUploadResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
-    ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, UpdatePermissionsRequest,
-    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
+    RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
+    ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse, ShareTargetType, ShareUrlDto,
+    ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse, SharedWithMeResponse,
+    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
+    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
+    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
+    VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -87,19 +87,21 @@ use crate::sharing::{
     PublicLink, ShareInvitation, ShareMember, ShareMembership, SharedWithMeItem,
 };
 use crate::single_flight::SingleFlight;
-
-/// Content blocks are 4 MiB of plaintext each (C# `RevisionWriter.DefaultBlockSize`).
-const DEFAULT_BLOCK_SIZE: usize = 1 << 22;
+use crate::transport::{DEFAULT_BLOCK_SIZE, RevisionTransport, rank_block_sizes};
 
 /// Maximum encrypted multipart size accepted by the atomic upload endpoint.
 const SMALL_UPLOAD_SIZE_LIMIT: usize = 128 * 1024;
 
 /// Maximum links per batch trash/restore/delete request (C#
 /// `NodeOperations.MaximumBatchCount`).
-const MAX_BATCH_COUNT: usize = 150;
+pub(crate) const MAX_BATCH_COUNT: usize = 150;
+
+/// Thumbnail block ids resolved per `POST volumes/{vid}/thumbnails` request
+/// (C# `FileOperations.MaxThumbnailIdsPerRequest`).
+pub(crate) const MAX_THUMBNAIL_IDS_PER_REQUEST: usize = 30;
 
 /// Link-detail batches fetched at once, per volume, when enumerating nodes.
-const MAX_CONCURRENT_DETAIL_FETCHES: usize = 4;
+pub(crate) const MAX_CONCURRENT_DETAIL_FETCHES: usize = 4;
 
 /// Nodes decrypted at once within one batch of link details.
 ///
@@ -121,7 +123,7 @@ const MAX_CONCURRENT_NODE_BUILDS: usize = 8;
 /// Sized a little above one file's pipeline (an upload holds up to
 /// `MAX_BUFFERED_UPLOAD_BLOCKS + MAX_CONCURRENT_BLOCK_UPLOADS + 1` permits) so a
 /// lone transfer still saturates it and a second one is not starved.
-const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 16;
+pub(crate) const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 16;
 
 /// Content blocks uploaded concurrently within a single file.
 ///
@@ -515,13 +517,6 @@ impl ProtonDriveClient {
     }
 
     /// The account client backing this Drive client's key chain.
-    /// The underlying HTTP client, for sibling modules that issue their own
-    /// requests against the same session (e.g. [`RevisionReader`] fetching
-    /// block bodies from storage).
-    pub(crate) fn http(&self) -> &ApiHttpClient {
-        &self.http
-    }
-
     pub fn account(&self) -> &AccountClient {
         &self.account
     }
@@ -585,6 +580,16 @@ impl ProtonDriveClient {
     /// whole-file download path and the upload pipeline to acquire against.
     pub(crate) fn block_slots(&self) -> Arc<Semaphore> {
         self.block_slots.clone()
+    }
+
+    /// What a [`RevisionReader`] needs from this client, and nothing else.
+    ///
+    /// The session is `Static` because an ordinary bearer session refreshes its
+    /// own tokens inside [`ApiHttpClient`] on a 401; by the time an error
+    /// reaches the transport there is nothing left to retry. The visitor path
+    /// supplies a session that can genuinely be renewed.
+    pub(crate) fn revision_transport(&self) -> RevisionTransport {
+        RevisionTransport::authenticated(self.http.clone(), self.block_slots())
     }
 
     /// Resolve (and cache) the user's "My Files" root folder.
@@ -1361,7 +1366,7 @@ impl ProtonDriveClient {
 
         timer.success();
         Ok(RevisionReader::new(
-            self.clone(),
+            self.revision_transport(),
             uid.clone(),
             revision_id,
             content_key,
@@ -1639,26 +1644,11 @@ impl ProtonDriveClient {
 
     /// Plaintext size of each content block, in block order.
     ///
-    /// These sizes are not merely descriptive: [`RevisionReader`] accumulates
-    /// them to derive where each block *starts* in the plaintext. A vector that
-    /// overstates any block but the last therefore shifts every block after it,
-    /// and the reader splices those blocks at the wrong offsets — returning
-    /// full-length reads of the wrong bytes, with no error to notice. See
-    /// `revision.rs::padded_block_sizes_shift_later_blocks`, which pins that
-    /// consequence.
-    ///
-    /// So the sources are ranked by how much they can be trusted, and the
-    /// function refuses rather than guesses when none of them holds:
-    ///
-    /// 1. `Common.BlockSizes` from the revision's extended attributes — the
-    ///    authoritative value, written by the uploading client.
-    /// 2. `Common.Size` — the total, from which all-but-last full blocks and a
-    ///    final short block follow by subtraction. Sound for the standard
-    ///    layout the uploader produces.
-    /// 3. Nothing usable. A single-block file cannot be misaligned (there is no
-    ///    later block to shift), so it is assumed full-size and only its
-    ///    reported length can be wrong. A multi-block file is an error: serving
-    ///    it would mean serving misplaced bytes.
+    /// Decrypts the revision's extended attributes — *verified*, which is what
+    /// needs an account client and is therefore why this lives here rather than
+    /// in `transport` — and hands them to
+    /// [`rank_block_sizes`](crate::transport::rank_block_sizes), which owns the
+    /// ranking rules and the refusal.
     async fn resolve_block_sizes(
         &self,
         node_key: &PrivateKey,
@@ -1687,40 +1677,7 @@ impl ProtonDriveClient {
             None => None,
         };
 
-        let block = DEFAULT_BLOCK_SIZE as u64;
-
-        if let Some(sizes) = common.as_ref().and_then(|c| c.block_sizes.as_ref())
-            && sizes.len() == block_count
-        {
-            // A non-positive entry is as corrupting as a padded one — a
-            // zero-length block in the middle shifts everything after it — so a
-            // malformed vector is rejected outright rather than clamped.
-            if let Some(bad) = sizes.iter().position(|&n| n <= 0) {
-                return Err(ProtonError::invalid_operation(format!(
-                    "revision {} records a non-positive size for block {bad}",
-                    revision.id
-                )));
-            }
-            return Ok(sizes.iter().map(|&n| n as u64).collect());
-        }
-
-        if let Some(total) = common.and_then(|c| c.size).filter(|&n| n >= 0) {
-            let total = total as u64;
-            return Ok((0..block_count)
-                .map(|i| total.saturating_sub(block * i as u64).min(block))
-                .collect());
-        }
-
-        if block_count <= 1 {
-            return Ok(vec![block; block_count]);
-        }
-
-        Err(ProtonError::invalid_operation(format!(
-            "revision {} has {block_count} blocks but no usable size information \
-             (no BlockSizes, no Size); refusing to guess, since a wrong block \
-             layout would serve misaligned content",
-            revision.id
-        )))
+        rank_block_sizes(common.as_ref(), &revision.id, block_count)
     }
 
     /// Download and decrypt a file's thumbnail of the given type, if it has one.
@@ -1814,8 +1771,6 @@ impl ProtonDriveClient {
         thumbnail_type: ThumbnailType,
         for_photos: bool,
     ) -> Result<Vec<FileThumbnail>> {
-        const MAX_THUMBNAIL_IDS_PER_REQUEST: usize = 30;
-
         let mut results: Vec<FileThumbnail> = Vec::new();
 
         // Group link ids by volume, preserving first-seen volume order.
@@ -5087,50 +5042,21 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// The revision's metadata and its full, ordered block table.
+    ///
+    /// The paging, ordering and contiguity rules are identical on the visitor
+    /// path, so they live in
+    /// [`RevisionTransport::list_blocks`](crate::transport::RevisionTransport)
+    /// and this is the authenticated entry point to them.
     pub(crate) async fn fetch_revision_blocks(
         &self,
         volume_id: &VolumeId,
         link_id: &LinkId,
         revision_id: &str,
     ) -> Result<(RevisionDto, Vec<BlockDto>)> {
-        const PAGE_SIZE: i32 = 50;
-
-        let mut blocks: Vec<BlockDto> = Vec::new();
-        let mut metadata: Option<RevisionDto> = None;
-        let mut from_index: i32 = 1;
-
-        loop {
-            let path = format!(
-                "v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}?FromBlockIndex={from_index}&PageSize={PAGE_SIZE}&NoBlockUrls=0"
-            );
-            let response: RevisionResponse = self.http.get(&path).await?;
-            let mut revision = response.revision;
-            let page = std::mem::take(&mut revision.blocks);
-            let page_len = page.len();
-
-            if metadata.is_none() {
-                metadata = Some(revision);
-            }
-            blocks.extend(page);
-
-            if page_len < PAGE_SIZE as usize {
-                break;
-            }
-            from_index = blocks.iter().map(|b| b.index).max().unwrap_or(from_index) + 1;
-        }
-
-        blocks.sort_by_key(|b| b.index);
-        for (offset, block) in blocks.iter().enumerate() {
-            if block.index != offset as i32 + 1 {
-                return Err(ProtonError::invalid_operation(
-                    "file contents are incomplete (non-contiguous blocks)",
-                ));
-            }
-        }
-
-        let metadata = metadata
-            .ok_or_else(|| ProtonError::invalid_operation("revision returned no metadata"))?;
-        Ok((metadata, blocks))
+        self.revision_transport()
+            .list_blocks(volume_id, link_id, revision_id)
+            .await
     }
 
     async fn ensure_my_files(&self) -> Result<()> {

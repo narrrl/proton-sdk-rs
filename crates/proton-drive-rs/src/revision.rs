@@ -14,8 +14,8 @@ use crate::node::RevisionState;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock};
 
-use crate::client::ProtonDriveClient;
 use crate::dtos::BlockDto;
+use crate::transport::RevisionTransport;
 
 /// Content blocks fetched concurrently within a single file.
 ///
@@ -134,7 +134,11 @@ struct BlockTable {
 /// file gains a new revision, this reader keeps serving the old one; reopen to
 /// follow the change.
 pub struct RevisionReader {
-    client: ProtonDriveClient,
+    /// Everything the read needs from whoever opened it: block permits, an HTTP
+    /// client already carrying the right route prefix, and — for a session that
+    /// can die under the reader — the renewal path. Deliberately *not* a whole
+    /// client, so an anonymous public-link visitor can have one too.
+    transport: RevisionTransport,
     uid: NodeUid,
     revision_id: String,
     content_key: ContentKey,
@@ -149,7 +153,7 @@ pub struct RevisionReader {
 
 impl RevisionReader {
     pub(crate) fn new(
-        client: ProtonDriveClient,
+        transport: RevisionTransport,
         uid: NodeUid,
         revision_id: String,
         content_key: ContentKey,
@@ -158,7 +162,7 @@ impl RevisionReader {
     ) -> Self {
         let file_size = block_sizes.iter().sum();
         Self {
-            client,
+            transport,
             uid,
             revision_id,
             content_key,
@@ -249,7 +253,7 @@ impl RevisionReader {
         // Held across fetch *and* decrypt: both halves are resident 4 MiB
         // buffers, and the plaintext outlives the ciphertext.
         let permit = self
-            .client
+            .transport
             .block_slots()
             .acquire_owned()
             .await
@@ -257,12 +261,14 @@ impl RevisionReader {
 
         let (url, token, generation) = self.block_location(index).await?;
 
-        let ciphertext = match self.client.http().get_storage_blob(&url, &token).await {
+        // A block fetch carries a `pm-storage-token` and no session credential
+        // at all, so it cannot fail for session reasons — only the URL expires.
+        let ciphertext = match self.transport.http().get_storage_blob(&url, &token).await {
             Ok(bytes) => bytes,
             Err(e) if is_expired_block_url(&e) => {
                 self.refresh_blocks(generation).await?;
                 let (url, token, _) = self.block_location(index).await?;
-                self.client.http().get_storage_blob(&url, &token).await?
+                self.transport.http().get_storage_blob(&url, &token).await?
             }
             Err(e) => return Err(e),
         };
@@ -300,8 +306,8 @@ impl RevisionReader {
         }
 
         let (_, blocks) = self
-            .client
-            .fetch_revision_blocks(&self.uid.volume_id, &self.uid.link_id, &self.revision_id)
+            .transport
+            .list_blocks(&self.uid.volume_id, &self.uid.link_id, &self.revision_id)
             .await?;
 
         if blocks.len() != self.block_sizes.len() {

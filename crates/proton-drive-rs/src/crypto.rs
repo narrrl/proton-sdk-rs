@@ -249,19 +249,34 @@ pub async fn decrypt_extended_attributes_verified(
     Ok((attrs, status))
 }
 
+/// Decrypt a revision's extended attributes without verifying their signature.
+///
+/// For callers that have the node key but no [`AccountClient`] to resolve the
+/// author's public key through — namely an anonymous public-link visitor, who
+/// has no address book and cannot look up a signer at all.
+///
+/// Skipping verification loses nothing a visitor could otherwise have used:
+/// [`decrypt_extended_attributes_verified`] returns the status as *metadata* and
+/// callers do not gate on it (see the SDK's rule that a failed verification is
+/// never an error). Decryption still proves the payload was encrypted to this
+/// node key.
+pub(crate) fn decrypt_extended_attributes_unverified(
+    node_key: &PrivateKey,
+    armored_xattr: &str,
+) -> Result<DecryptedExtendedAttributes> {
+    let json = node_key.decrypt_armored_message(armored_xattr)?;
+    serde_json::from_slice(&json).map_err(|e| {
+        ProtonError::invalid_operation(format!("deserialize extended attributes: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proton_sdk::crypto::generate_node_key;
 
-    /// Decrypt + deserialize XAttr without verification (the production path
-    /// uses [`decrypt_extended_attributes_verified`], which needs an account to
-    /// resolve author keys).
     fn decrypt_xattr(node_key: &PrivateKey, armored: &str) -> DecryptedExtendedAttributes {
-        let json = node_key
-            .decrypt_armored_message(armored)
-            .expect("decrypt xattr");
-        serde_json::from_slice(&json).expect("deserialize xattr")
+        decrypt_extended_attributes_unverified(node_key, armored).expect("decrypt xattr")
     }
 
     #[test]

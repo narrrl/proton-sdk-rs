@@ -19,7 +19,8 @@
 mod common;
 
 use proton_drive_rs::{
-    MemberRole, ProtonDriveClient, ProtonDrivePublicLinkClient, ProtonPhotosClient,
+    MemberRole, ProtonDriveClient, ProtonDrivePublicLinkClient, ProtonPhotosClient, Thumbnail,
+    ThumbnailType,
 };
 use proton_sdk::ids::NodeUid;
 
@@ -436,6 +437,321 @@ async fn custom_password_link_requires_the_password() {
         .expect("open with the custom password");
     let root = visitor.get_root_node().await.expect("visitor root node");
     assert_eq!(root.uid, folder);
+
+    cleanup(client, &folder).await;
+}
+
+// ---------------------------------------------------------------------------
+// Public link — seekable reads, the streaming path
+// ---------------------------------------------------------------------------
+
+/// A multi-block file, in blocks of `4 MiB`, whose every byte encodes its own
+/// offset. A range served from the wrong block is then identifiable rather than
+/// merely unequal — which matters here, because a wrong block-size vector
+/// returns a full-length read of the wrong bytes with no error at all.
+fn positional_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// **The load-bearing test for streaming over a public link.**
+///
+/// Everything `proton-stream` does rests on one uncertain fact: that the
+/// `drive/unauth/` revision endpoint returns a usable `XAttr` to an anonymous
+/// visitor. Without it `rank_block_sizes` cannot place block boundaries and
+/// refuses to open a multi-block file, and seeking is impossible. The visitor
+/// route has form here — `?NoBlockUrls=true` already strips `BareURL`/`Token` —
+/// so this is verified, not assumed.
+///
+/// Then the reads themselves: a range spanning a block boundary, a range wholly
+/// inside a later block (the seek case), and the short final block.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_visitor_can_seek_within_a_shared_multi_block_file() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-seek").await;
+
+    // 9 MiB: two full 4 MiB blocks and a 1 MiB tail, so both the boundary case
+    // and the short-tail case are reachable.
+    const BLOCK: usize = 4 << 20;
+    let contents = positional_payload(9 << 20);
+    let name = format!("seekable-{}.bin", common::unique_suffix());
+    let file = client
+        .upload_file(&folder, &name, "application/octet-stream", &contents)
+        .await
+        .expect("upload_file");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    let reader = visitor
+        .open_revision(&file)
+        .await
+        .expect("a visitor must be able to open a revision for reading");
+
+    // If this fails, the unauth revision response carried no usable size and the
+    // whole streaming design needs revisiting — so it is asserted before the
+    // reads, with a message that says which rung was missing.
+    assert_eq!(
+        reader.block_sizes(),
+        &[BLOCK as u64, BLOCK as u64, 1 << 20],
+        "the visitor must resolve true per-block sizes; a padded or empty vector \
+         means the unauth revision response omitted its XAttr"
+    );
+    assert_eq!(
+        reader.size(),
+        contents.len() as u64,
+        "and they must sum to the real file size"
+    );
+
+    // A range straddling the block 0 / block 1 boundary.
+    let straddle = reader
+        .read_at(BLOCK as u64 - 1024, 2048)
+        .await
+        .expect("read across a block boundary");
+    assert_eq!(
+        straddle,
+        &contents[BLOCK - 1024..BLOCK + 1024],
+        "a read spanning two blocks must splice them at the right offset"
+    );
+
+    // The seek case: a range wholly inside the *last* full block, touching
+    // neither of the ones before it.
+    let seeked = reader
+        .read_at(6 << 20, 64 << 10)
+        .await
+        .expect("read from the middle of the file");
+    let want = &contents[(6 << 20)..(6 << 20) + (64 << 10)];
+    assert_eq!(
+        seeked, want,
+        "a mid-file read must return the bytes at that offset, not an earlier block's"
+    );
+
+    // The short tail, and a read that runs past EOF: clamped, never padded.
+    let tail = reader
+        .read_at(8 << 20, 4 << 20)
+        .await
+        .expect("read the short final block");
+    assert_eq!(
+        tail,
+        &contents[8 << 20..],
+        "the final block is 1 MiB, and a read past EOF is clamped to it"
+    );
+    assert!(
+        reader
+            .read_at(contents.len() as u64, 4096)
+            .await
+            .expect("a read at EOF is not an error")
+            .is_empty(),
+        "a read starting at EOF yields nothing"
+    );
+
+    // `download_range` is the one-shot form of the same thing.
+    let ranged = visitor
+        .download_range(&file, 5 << 20, 4096)
+        .await
+        .expect("download_range");
+    assert_eq!(ranged, &contents[(5 << 20)..(5 << 20) + 4096]);
+
+    // And the whole-file path must still agree with all of it — it now drives a
+    // paged, concurrent block pipeline rather than one un-paged sequential loop.
+    let whole = visitor
+        .download_file(&file)
+        .await
+        .expect("visitor download");
+    assert_eq!(
+        whole, contents,
+        "the whole-file download must match the uploaded bytes"
+    );
+
+    cleanup(client, &folder).await;
+}
+
+/// A visitor's node listing must carry the uploader's claimed metadata, which it
+/// previously left as `None` — a catalog has nothing to show without a size.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_visitor_sees_claimed_size_and_digest_on_shared_files() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-xattr").await;
+
+    let contents = positional_payload(64 << 10);
+    let name = format!("claimed-{}.bin", common::unique_suffix());
+    let file = client
+        .upload_file(&folder, &name, "application/octet-stream", &contents)
+        .await
+        .expect("upload_file");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    let node = visitor
+        .get_node(&file)
+        .await
+        .expect("visitor node lookup")
+        .expect("the shared file must exist");
+
+    match &node.kind {
+        proton_drive_rs::NodeKind::File {
+            claimed_size,
+            content_sha1,
+            ..
+        } => {
+            assert_eq!(
+                *claimed_size,
+                Some(contents.len() as i64),
+                "the visitor must read the uploader's claimed size from the link details XAttr"
+            );
+            assert!(
+                content_sha1.is_some(),
+                "and the content digest alongside it"
+            );
+        }
+        other => panic!("expected a file, got {other:?}"),
+    }
+
+    cleanup(client, &folder).await;
+}
+
+/// Renewing the session must not strand a reader that was already handed out —
+/// the whole reason the session is swapped in place rather than replaced.
+///
+/// Simulates the expiry rather than waiting hours for one: an explicit
+/// `refresh_session` puts the reader on a session it was not opened with, which
+/// is exactly the state a real expiry leaves it in once recovery has run.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn refreshing_the_session_keeps_an_open_reader_working() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-renew").await;
+
+    let contents = positional_payload(5 << 20);
+    let name = format!("renew-{}.bin", common::unique_suffix());
+    let file = client
+        .upload_file(&folder, &name, "application/octet-stream", &contents)
+        .await
+        .expect("upload_file");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    let reader = visitor.open_revision(&file).await.expect("open_revision");
+
+    let before = reader.read_at(0, 4096).await.expect("read before refresh");
+    assert_eq!(before, &contents[..4096]);
+
+    visitor
+        .refresh_session()
+        .await
+        .expect("refresh_session must replay the handshake");
+
+    // Past the first block, so this genuinely fetches under the new session
+    // rather than replaying anything cached.
+    let after = reader
+        .read_at(4 << 20, 4096)
+        .await
+        .expect("a reader opened before the refresh must keep working");
+    assert_eq!(after, &contents[(4 << 20)..(4 << 20) + 4096]);
+
+    cleanup(client, &folder).await;
+}
+
+/// Thumbnails on the visitor path: the same block-storage fetch and content-key
+/// decrypt as the authenticated one, over `drive/unauth/`.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_visitor_can_download_thumbnails_of_shared_files() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-thumb").await;
+
+    let contents = positional_payload(32 << 10);
+    let thumbnail = b"not a real jpeg, but it round-trips".to_vec();
+    let name = format!("thumbed-{}.bin", common::unique_suffix());
+    let file = client
+        .upload_file_from(
+            &folder,
+            &name,
+            "application/octet-stream",
+            std::io::Cursor::new(contents.clone()),
+            contents.len() as i64,
+            vec![
+                Thumbnail::new(ThumbnailType::Thumbnail, thumbnail.clone())
+                    .expect("small thumbnail"),
+            ],
+            None,
+            false,
+        )
+        .await
+        .expect("upload_file_from with a thumbnail");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    let single = visitor
+        .download_thumbnail(&file, ThumbnailType::Thumbnail)
+        .await
+        .expect("visitor thumbnail download");
+    assert_eq!(
+        single.as_deref(),
+        Some(thumbnail.as_slice()),
+        "the visitor must decrypt the thumbnail it was shown"
+    );
+
+    let batch = visitor
+        .enumerate_thumbnails(std::slice::from_ref(&file), ThumbnailType::Thumbnail)
+        .await
+        .expect("visitor thumbnail batch");
+    assert_eq!(batch.len(), 1, "one file in, one result out");
+    assert_eq!(
+        batch[0]
+            .result
+            .as_deref()
+            .expect("the batch entry succeeded"),
+        thumbnail.as_slice()
+    );
 
     cleanup(client, &folder).await;
 }

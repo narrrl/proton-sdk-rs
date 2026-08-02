@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
-use proton_drive_rs::{ProtonDriveClient, RevisionReader};
+use proton_drive_rs::{ProtonDriveClient, ProtonDrivePublicLinkClient, RevisionReader};
 use proton_sdk::ids::NodeUid;
 
 /// `download_file` inside a spawned task.
@@ -127,4 +127,50 @@ fn reader_read_at_is_spawnable(
         }
         Ok::<_, proton_sdk::error::ProtonError>(())
     })
+}
+
+/// The same guard on the visitor path, which is the one that actually matters
+/// for a streaming player: `open_revision` over a public link, then several
+/// concurrent `read_at`s off one shared reader inside spawned tasks.
+///
+/// The public client reaches this through a different route than the
+/// authenticated one — its transport wraps a renewable session behind a trait
+/// object — so `Send`ness has to be re-proven, not assumed.
+fn public_link_reader_read_at_is_spawnable(
+    client: ProtonDrivePublicLinkClient,
+    uid: NodeUid,
+) -> JoinHandle<proton_sdk::error::Result<()>> {
+    tokio::spawn(async move {
+        let reader: Arc<RevisionReader> = Arc::new(client.open_revision(&uid).await?);
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..4u64 {
+            let reader = reader.clone();
+            set.spawn(async move { reader.read_at(i * 4096, 4096).await });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.expect("task panicked")?;
+        }
+        Ok::<_, proton_sdk::error::ProtonError>(())
+    })
+}
+
+/// `download_file_to` on the visitor path, which now drives the same `buffered`
+/// block pipeline the authenticated one does.
+fn public_link_download_file_to_is_spawnable(
+    client: ProtonDrivePublicLinkClient,
+    uid: NodeUid,
+) -> JoinHandle<proton_sdk::error::Result<()>> {
+    tokio::spawn(async move {
+        let mut sink: Vec<u8> = Vec::new();
+        client.download_file_to(&uid, &mut sink).await
+    })
+}
+
+/// `enumerate_nodes` on the visitor path: chunked and fanned out with
+/// `buffered` over cloned clients.
+fn public_link_enumerate_nodes_is_spawnable(
+    client: ProtonDrivePublicLinkClient,
+    uids: Vec<NodeUid>,
+) -> JoinHandle<proton_sdk::error::Result<Vec<proton_drive_rs::Node>>> {
+    tokio::spawn(async move { client.enumerate_nodes(&uids).await })
 }

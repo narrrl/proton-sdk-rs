@@ -270,6 +270,8 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | | External Invites | ✅ | Invite non-Proton users (`invite_external_users`) and track registration status. |
 | | Bookmarks | ✅ | Save and list public link bookmarks (`create_bookmark`, `list_bookmarks`). |
 | | Incoming Invites | ✅ | List, accept, or reject invitations shared *with* the current user. |
+| | Public Link (consume) | ✅ | Open someone else's link with no Proton account (`ProtonDrivePublicLinkClient`): SRP handshake, custom passwords, browse and download the shared subtree. |
+| | Public Link streaming | ✅ | Seekable range reads over a shared file (`open_revision` → `RevisionReader::read_at`), plus thumbnails and in-place session renewal — a visitor can stream a large file without downloading it. |
 | **Photos** | Photos Timeline | ✅ | `ProtonPhotosClient` maps photostream, timeline enumeration, and photo downloads. |
 | | Photo Uploads | ✅ | Uploading photos with `PhotoUploadMetadata` (capture time, tags, grouping). |
 | | Albums (read) | ✅ | List albums (`enumerate_album_node_uids`) and their photos (`enumerate_album`); album nodes carry `Node::album`. |

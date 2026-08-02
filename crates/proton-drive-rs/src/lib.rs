@@ -45,6 +45,7 @@ mod public_link;
 mod revision;
 mod sharing;
 mod single_flight;
+mod transport;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
 pub use client::ProtonDriveClient;
@@ -55,7 +56,8 @@ pub use event_manager::{
 };
 pub use events::{DriveEvent, DriveEventScopeId};
 pub use node::{
-    AlbumProperties, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail, ThumbnailType,
+    AlbumProperties, FileThumbnail, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail,
+    ThumbnailType,
 };
 pub use photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,

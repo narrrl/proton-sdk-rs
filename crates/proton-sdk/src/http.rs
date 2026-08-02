@@ -48,6 +48,16 @@ pub struct ApiHttpClient {
     /// root. Empty by default. Lives on the outer struct (not `Inner`) so clones
     /// can carry different prefixes while sharing one token/telemetry store.
     route_prefix: Arc<str>,
+    /// Whether a 401 should be met with a token refresh and one retry.
+    ///
+    /// True for an ordinary bearer session. False for an anonymous public-link
+    /// session, whose refresh token is deliberately empty
+    /// (`public_link.rs::PublicLinkSession::auth`) — there, refreshing posts an
+    /// empty token to `auth/v4/refresh` and the caller sees an error about
+    /// *refresh* instead of the 401 that actually happened. Lives on the outer
+    /// struct alongside `route_prefix`, for the same reason: clones differ
+    /// while sharing one token store.
+    refresh_tokens: bool,
 }
 
 /// Callback invoked after a successful token refresh.
@@ -98,6 +108,7 @@ impl ApiHttpClient {
                 on_tokens_refreshed: std::sync::Mutex::new(None),
             }),
             route_prefix: Arc::from(""),
+            refresh_tokens: true,
         })
     }
 
@@ -110,6 +121,24 @@ impl ApiHttpClient {
         Self {
             inner: Arc::clone(&self.inner),
             route_prefix: route.into(),
+            refresh_tokens: self.refresh_tokens,
+        }
+    }
+
+    /// Derive a clone that does **not** try to refresh its tokens on a 401,
+    /// sharing this client's token store, telemetry sink and connection pool.
+    ///
+    /// For a session that has no refresh token to spend — an anonymous
+    /// public-link session is minted with an empty one — refreshing turns a
+    /// clean "your session is gone" 401 into a confusing failure of
+    /// `auth/v4/refresh` itself. With refresh off, the 401 reaches the caller
+    /// intact as `ProtonError::Api { http_status: 401 }`, which is what a
+    /// re-handshake path needs in order to recognise its cue.
+    pub fn without_token_refresh(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            route_prefix: Arc::clone(&self.route_prefix),
+            refresh_tokens: false,
         }
     }
 
@@ -288,7 +317,7 @@ impl ApiHttpClient {
         let response = self
             .send_multipart_with_token(path, &metadata, binary_parts, &rejected_token)
             .await?;
-        let response = if response.status() == StatusCode::UNAUTHORIZED {
+        let response = if response.status() == StatusCode::UNAUTHORIZED && self.refresh_tokens {
             let bytes = response.bytes().await?;
             if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes)
                 && matches!(
@@ -349,7 +378,7 @@ impl ApiHttpClient {
             .send_with_token(method.clone(), path, body, &access_token)
             .await?;
 
-        let response = if response.status() == StatusCode::UNAUTHORIZED {
+        let response = if response.status() == StatusCode::UNAUTHORIZED && self.refresh_tokens {
             self.handle_unauthorized(method, path, body, response, access_token)
                 .await?
         } else {
@@ -893,6 +922,109 @@ mod tests {
                 .attributes
                 .iter()
                 .any(|(k, v)| *k == "status" && v == "200")
+        );
+    }
+
+    /// A client built with [`ApiHttpClient::without_token_refresh`] hands the
+    /// 401 straight to the caller instead of spending a refresh token on it.
+    ///
+    /// The request count is the real assertion: an ordinary client answers a 401
+    /// by posting to `auth/v4/refresh` and retrying, so a second connection
+    /// would prove the opt-out did not take. A public-link session has no
+    /// refresh token to spend, and needs the bare 401 to know it must re-run the
+    /// SRP handshake.
+    #[tokio::test]
+    async fn a_client_without_token_refresh_surfaces_the_401() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+
+        // Answers every connection with a 401, so a client that retries after a
+        // refresh gets counted rather than hanging.
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await.unwrap();
+                let body = br#"{"Code":401,"Error":"Invalid access token"}"#;
+                let head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(body).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+
+        let config = ProtonClientConfiguration::new("test@1.0")
+            .with_base_url(format!("http://{addr}/"))
+            .with_retry_policy(RetryPolicy::disabled());
+        let client = ApiHttpClient::new(
+            config,
+            SessionId::from("test-session"),
+            // Empty, exactly as a public-link session is minted.
+            Tokens {
+                access_token: "access".into(),
+                refresh_token: String::new(),
+            },
+        )
+        .unwrap()
+        .without_token_refresh();
+
+        let error = client
+            .get::<ApiResponse>("some/path")
+            .await
+            .expect_err("a 401 is an error");
+
+        match error {
+            ProtonError::Api(e) => assert_eq!(e.http_status, 401, "the 401 reaches the caller"),
+            other => panic!("expected an api error, got {other:?}"),
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "no refresh attempt, no retry"
+        );
+
+        server.abort();
+    }
+
+    /// The opt-out rides along on `with_base_route`, so a Drive/public-link
+    /// client derived from a non-refreshing one does not silently regain the
+    /// refresh behaviour.
+    #[test]
+    fn the_token_refresh_opt_out_survives_a_base_route_change() {
+        let client = ApiHttpClient::new(
+            ProtonClientConfiguration::new("test@1.0"),
+            SessionId::from("test-session"),
+            Tokens {
+                access_token: "access".into(),
+                refresh_token: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(client.refresh_tokens, "an ordinary session refreshes");
+        assert!(
+            !client.without_token_refresh().refresh_tokens,
+            "the opt-out takes"
+        );
+        assert!(
+            !client
+                .without_token_refresh()
+                .with_base_route("drive/unauth/")
+                .refresh_tokens,
+            "and survives a route change"
+        );
+        assert!(
+            client.with_base_route("drive/").refresh_tokens,
+            "an ordinary session keeps refreshing across a route change"
         );
     }
 }
