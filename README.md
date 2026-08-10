@@ -280,7 +280,7 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported. |
 | | Album Writes | ❌ | Creating albums and adding/removing photos is not ported. |
 | | Photos Volume Create| ❌ | Volume creation is not yet ported. |
-| **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`); keys/secrets remain strictly in memory. |
+| **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`, or `with_entity_repository` to chain one onto a `with_key_salts` client); keys/secrets remain strictly in memory. |
 
 ---
 

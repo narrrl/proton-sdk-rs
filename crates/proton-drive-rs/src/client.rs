@@ -528,6 +528,28 @@ impl ProtonDriveClient {
         self.account.quota().await
     }
 
+    /// Swap in a caller-supplied entity-cache repository on an already-built
+    /// client.
+    ///
+    /// [`with_entity_cache`](Self::with_entity_cache) is a constructor, so it
+    /// cannot be combined with [`with_key_salts`](Self::with_key_salts) — and a
+    /// client that resumes a persisted session needs the salts *and* wants a
+    /// persistent cache. This is the chainable form, so both are reachable:
+    ///
+    /// ```ignore
+    /// let client = ProtonDriveClient::with_key_salts(&session, password, salts)
+    ///     .with_entity_repository(my_repo);
+    /// ```
+    ///
+    /// The repository holds *decrypted* node metadata (names, sizes, parents) —
+    /// never key material, which stays in the in-memory secret cache — so a
+    /// persistent implementation should be encrypted at rest unless the caller
+    /// already persists the same metadata itself.
+    pub fn with_entity_repository(mut self, entity_repository: Arc<dyn CacheRepository>) -> Self {
+        self.entities = DriveEntityCache::new(entity_repository);
+        self
+    }
+
     /// Attach a telemetry observer to receive a
     /// [`TelemetryEvent`](proton_sdk::telemetry::TelemetryEvent) for each
     /// instrumented operation (transfers, navigation, mutations) plus a
