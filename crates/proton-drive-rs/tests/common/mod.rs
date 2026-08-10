@@ -17,6 +17,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use proton_drive_rs::ProtonDriveClient;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::error::ProtonError;
+use proton_sdk::ids::NodeUid;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -361,4 +362,28 @@ pub fn unique_suffix() -> String {
         .unwrap()
         .as_nanos();
     format!("{nanos}")
+}
+
+/// Panic on any per-node failure in a batch outcome list (`trash_nodes`,
+/// `restore_nodes`, `delete_nodes`, `move_nodes`): those calls report one
+/// outcome per node instead of failing the whole call, so a test that expects
+/// success has to look at every outcome.
+#[allow(dead_code)]
+pub fn expect_all_ok(what: &str, outcomes: &[(NodeUid, Result<(), ProtonError>)]) {
+    for (uid, outcome) in outcomes {
+        if let Err(e) = outcome {
+            panic!("{what} failed for {uid}: {e}");
+        }
+    }
+}
+
+/// Report per-node failures on a best-effort cleanup path without failing the
+/// test that is tearing down.
+#[allow(dead_code)]
+pub fn log_outcomes(what: &str, outcomes: &[(NodeUid, Result<(), ProtonError>)]) {
+    for (uid, outcome) in outcomes {
+        if let Err(e) = outcome {
+            eprintln!("[cleanup] {what} failed for {uid}: {e}");
+        }
+    }
 }

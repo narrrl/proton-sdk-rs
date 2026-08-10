@@ -304,6 +304,17 @@ impl ProtonPhotosClient {
     ) -> Result<Vec<(NodeUid, Result<()>)>> {
         self.drive.update_photos(updates).await
     }
+
+    /// [`update_photos`](Self::update_photos) as a stream: each photo's outcome
+    /// arrives as that photo's update finishes, mirroring the C#
+    /// `IAsyncEnumerable<PhotoUpdateResult>`. The `Err` item is a failure that
+    /// makes the whole call impossible and ends the stream.
+    pub fn update_photos_streaming<'a>(
+        &'a self,
+        updates: &[PhotoTagsUpdate],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        self.drive.update_photos_streaming(updates)
+    }
 }
 
 #[cfg(test)]

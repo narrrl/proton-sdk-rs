@@ -251,7 +251,7 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | | Telemetry | ✅ | Pluggable request tracking (`ITelemetry` analogue). |
 | **Drive / Volume** | Volume Resolution | ✅ | Auto-resolves volume lists; auto-creates the `my-files` root volume on first login. |
 | | Node Listing | ✅ | `get_node`, `enumerate_folder_children`, `enumerate_trash` with key resolution. |
-| | File Operations | ✅ | Rename, trash, restore, delete, empty trash. |
+| | File Operations | ✅ | Rename, trash, restore, delete, empty trash — batch calls report one outcome per node (`trash_nodes`), or stream them as each batch lands (`trash_nodes_streaming`). |
 | | Move Operations | ✅ | Same-volume move. Batch moves are chunked automatically. |
 | | Cross-volume Move | ❌ | Not supported (throwing `NotImplementedException` in the C# public API too). |
 | **Uploads** | Block Uploading | ✅ | Encrypts and uploads chunks (4 MiB default) to block storage. |
@@ -275,7 +275,7 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | **Photos** | Photos Timeline | ✅ | `ProtonPhotosClient` maps photostream, timeline enumeration, and photo downloads. |
 | | Photo Uploads | ✅ | Uploading photos with `PhotoUploadMetadata` (capture time, tags, grouping). |
 | | Albums (read) | ✅ | List albums (`enumerate_album_node_uids`) and their photos (`enumerate_album`); album nodes carry `Node::album`. |
-| | Photo Tags | ✅ | Add/remove classification tags (`update_photos`); `Favorite` on photos in our own timeline. |
+| | Photo Tags | ✅ | Add/remove classification tags (`update_photos`, or `update_photos_streaming` for per-photo outcomes as they finish); `Favorite` on photos in our own timeline. |
 | | Shared Photos | ✅ | Photos/albums shared *with* us (`enumerate_shared_with_me_node_uids`, `enumerate_shared_with_me_album_uids`). |
 | | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported. |
 | | Album Writes | ❌ | Creating albums and adding/removing photos is not ported. |

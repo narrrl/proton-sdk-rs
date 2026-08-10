@@ -15,12 +15,16 @@ use proton_sdk::ids::{LinkId, NodeUid};
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
 async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
-    if let Err(e) = client.trash_nodes(uids).await {
-        eprintln!("[cleanup] trash failed: {e}");
-        return;
+    match client.trash_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("trash", &outcomes),
+        Err(e) => {
+            eprintln!("[cleanup] trash failed: {e}");
+            return;
+        }
     }
-    if let Err(e) = client.delete_nodes(uids).await {
-        eprintln!("[cleanup] delete failed: {e}");
+    match client.delete_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("delete", &outcomes),
+        Err(e) => eprintln!("[cleanup] delete failed: {e}"),
     }
 }
 
@@ -77,10 +81,11 @@ async fn folder_create_rename_trash_restore() {
     assert_eq!(node.name, renamed, "rename must take effect");
 
     // trash
-    client
+    let outcomes = client
         .trash_nodes(std::slice::from_ref(&uid))
         .await
         .expect("trash");
+    common::expect_all_ok("trash", &outcomes);
     let node = get(client, &uid, "after trash").await;
     assert!(node.trashed, "node must report trashed");
     let trash = client
@@ -90,10 +95,11 @@ async fn folder_create_rename_trash_restore() {
     assert!(trash.contains(&uid), "trash listing must include the node");
 
     // restore
-    client
+    let outcomes = client
         .restore_nodes(std::slice::from_ref(&uid))
         .await
         .expect("restore");
+    common::expect_all_ok("restore", &outcomes);
     let node = get(client, &uid, "after restore").await;
     assert!(!node.trashed, "node must no longer be trashed");
 
@@ -121,10 +127,11 @@ async fn folder_empty_trash() {
         .await
         .expect("create_folder");
 
-    client
+    let outcomes = client
         .trash_nodes(std::slice::from_ref(&uid))
         .await
         .expect("trash");
+    common::expect_all_ok("trash", &outcomes);
     assert!(
         client
             .enumerate_trash_node_uids()

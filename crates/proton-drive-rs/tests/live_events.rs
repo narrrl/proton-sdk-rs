@@ -21,12 +21,16 @@ use proton_sdk::ids::{DriveEventId, NodeUid};
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
 async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
-    if let Err(e) = client.trash_nodes(uids).await {
-        eprintln!("[cleanup] trash failed: {e}");
-        return;
+    match client.trash_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("trash", &outcomes),
+        Err(e) => {
+            eprintln!("[cleanup] trash failed: {e}");
+            return;
+        }
     }
-    if let Err(e) = client.delete_nodes(uids).await {
-        eprintln!("[cleanup] delete failed: {e}");
+    match client.delete_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("delete", &outcomes),
+        Err(e) => eprintln!("[cleanup] delete failed: {e}"),
     }
 }
 
@@ -230,10 +234,11 @@ async fn trashing_surfaces_is_trashed() {
 
     // Seed after creation so the trash is the change we look for.
     let cursor = seed(client, &scope).await;
-    client
+    let outcomes = client
         .trash_nodes(std::slice::from_ref(&folder))
         .await
         .expect("trash folder");
+    common::expect_all_ok("trash", &outcomes);
 
     let found = poll_for(client, &scope, &cursor, |e| {
         matches!(
@@ -248,8 +253,9 @@ async fn trashing_surfaces_is_trashed() {
     );
 
     // Best-effort permanent delete (already trashed).
-    if let Err(e) = client.delete_nodes(std::slice::from_ref(&folder)).await {
-        eprintln!("[cleanup] delete failed: {e}");
+    match client.delete_nodes(std::slice::from_ref(&folder)).await {
+        Ok(outcomes) => common::log_outcomes("delete", &outcomes),
+        Err(e) => eprintln!("[cleanup] delete failed: {e}"),
     }
 }
 
@@ -273,17 +279,19 @@ async fn permanent_delete_surfaces_node_deleted() {
         .create_folder(&root.uid, &format!("evt-delete-{suffix}"), None)
         .await
         .expect("create folder");
-    client
+    let outcomes = client
         .trash_nodes(std::slice::from_ref(&folder))
         .await
         .expect("trash folder");
+    common::expect_all_ok("trash", &outcomes);
 
     // Seed after trashing so the permanent delete is the awaited change.
     let cursor = seed(client, &scope).await;
-    client
+    let outcomes = client
         .delete_nodes(std::slice::from_ref(&folder))
         .await
         .expect("delete folder");
+    common::expect_all_ok("delete", &outcomes);
 
     let found = poll_for(
         client,

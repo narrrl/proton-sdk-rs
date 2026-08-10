@@ -17,12 +17,16 @@ use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
 async fn cleanup(client: &proton_drive_rs::ProtonDriveClient, uids: &[NodeUid]) {
-    if let Err(e) = client.trash_nodes(uids).await {
-        eprintln!("[cleanup] trash failed: {e}");
-        return;
+    match client.trash_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("trash", &outcomes),
+        Err(e) => {
+            eprintln!("[cleanup] trash failed: {e}");
+            return;
+        }
     }
-    if let Err(e) = client.delete_nodes(uids).await {
-        eprintln!("[cleanup] delete failed: {e}");
+    match client.delete_nodes(uids).await {
+        Ok(outcomes) => common::log_outcomes("delete", &outcomes),
+        Err(e) => eprintln!("[cleanup] delete failed: {e}"),
     }
 }
 

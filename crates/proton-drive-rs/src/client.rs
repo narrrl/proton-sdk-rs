@@ -1,6 +1,6 @@
 //! The high-level Drive client and its read operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{Cursor, Read};
 use std::num::NonZeroUsize;
@@ -2882,55 +2882,131 @@ impl ProtonDriveClient {
 
     /// Move `uids` to the trash. Mirrors C# `NodeOperations.TrashAsync`
     /// (`POST v2/volumes/{vid}/trash_multiple`). Live validation pending.
-    pub async fn trash_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+    ///
+    /// One outcome per node the server reported on, like [`move_nodes`](Self::move_nodes):
+    /// a node the batch envelope rejects does not fail the others. The outer
+    /// `Err` is reserved for a request that never produced an envelope.
+    /// [`trash_nodes_streaming`](Self::trash_nodes_streaming) reports the same
+    /// outcomes one at a time as each batch lands.
+    pub async fn trash_nodes(&self, uids: &[NodeUid]) -> Result<Vec<(NodeUid, Result<()>)>> {
         let mut timer = self.telemetry.start("trash_nodes");
         timer.attr("node_count", uids.len());
-        for (volume_id, link_ids) in group_by_volume(uids) {
-            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
-                let path = format!("v2/volumes/{volume_id}/trash_multiple");
-                let body = MultipleLinksRequest { link_ids: chunk };
-                let response: AggregateLinksResponse = self.http.post(&path, &body).await?;
-                check_aggregate("trash", response)?;
-            }
-        }
+        let outcomes = self
+            .node_action_stream(NodeAction::Trash, uids)
+            .try_collect()
+            .await?;
         timer.success();
-        Ok(())
+        Ok(outcomes)
+    }
+
+    /// [`trash_nodes`](Self::trash_nodes) as a stream: each node's outcome is
+    /// yielded as soon as the batch carrying it comes back, instead of after
+    /// every batch. Mirrors the C# `IAsyncEnumerable<NodeActionResult>`.
+    /// A failed request yields one `Err` and ends the stream.
+    pub fn trash_nodes_streaming<'a>(
+        &'a self,
+        uids: &[NodeUid],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        self.node_action_stream(NodeAction::Trash, uids)
     }
 
     /// Restore `uids` from the trash. Mirrors C#
     /// `NodeOperations.RestoreFromTrashAsync`
     /// (`PUT v2/volumes/{vid}/trash/restore_multiple`). Live validation pending.
-    pub async fn restore_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+    /// Per-node outcomes, like [`trash_nodes`](Self::trash_nodes).
+    pub async fn restore_nodes(&self, uids: &[NodeUid]) -> Result<Vec<(NodeUid, Result<()>)>> {
         let mut timer = self.telemetry.start("restore_nodes");
         timer.attr("node_count", uids.len());
-        for (volume_id, link_ids) in group_by_volume(uids) {
-            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
-                let path = format!("v2/volumes/{volume_id}/trash/restore_multiple");
-                let body = MultipleLinksRequest { link_ids: chunk };
-                let response: AggregateLinksResponse = self.http.put(&path, &body).await?;
-                check_aggregate("restore", response)?;
-            }
-        }
+        let outcomes = self
+            .node_action_stream(NodeAction::Restore, uids)
+            .try_collect()
+            .await?;
         timer.success();
-        Ok(())
+        Ok(outcomes)
+    }
+
+    /// [`restore_nodes`](Self::restore_nodes) as a stream of per-node outcomes.
+    pub fn restore_nodes_streaming<'a>(
+        &'a self,
+        uids: &[NodeUid],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        self.node_action_stream(NodeAction::Restore, uids)
     }
 
     /// Permanently delete `uids` (which must already be in the trash). Mirrors
     /// C# `NodeOperations.DeleteFromTrashAsync`
     /// (`POST v2/volumes/{vid}/trash/delete_multiple`). Live validation pending.
-    pub async fn delete_nodes(&self, uids: &[NodeUid]) -> Result<()> {
+    /// Per-node outcomes, like [`trash_nodes`](Self::trash_nodes).
+    pub async fn delete_nodes(&self, uids: &[NodeUid]) -> Result<Vec<(NodeUid, Result<()>)>> {
         let mut timer = self.telemetry.start("delete_nodes");
         timer.attr("node_count", uids.len());
-        for (volume_id, link_ids) in group_by_volume(uids) {
-            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
-                let path = format!("v2/volumes/{volume_id}/trash/delete_multiple");
-                let body = MultipleLinksRequest { link_ids: chunk };
-                let response: AggregateLinksResponse = self.http.post(&path, &body).await?;
-                check_aggregate("delete", response)?;
-            }
-        }
+        let outcomes = self
+            .node_action_stream(NodeAction::Delete, uids)
+            .try_collect()
+            .await?;
         timer.success();
-        Ok(())
+        Ok(outcomes)
+    }
+
+    /// [`delete_nodes`](Self::delete_nodes) as a stream of per-node outcomes.
+    pub fn delete_nodes_streaming<'a>(
+        &'a self,
+        uids: &[NodeUid],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        self.node_action_stream(NodeAction::Delete, uids)
+    }
+
+    /// The shared body of the trash-family batch operations: group by volume,
+    /// chunk each group at [`MAX_BATCH_COUNT`], and yield the per-link outcomes
+    /// of every batch as it returns. Mirrors the C# async iterators, including
+    /// their mapping — only the links the aggregate envelope reports on produce
+    /// an outcome.
+    fn node_action_stream<'a>(
+        &'a self,
+        action: NodeAction,
+        uids: &[NodeUid],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        let batches: VecDeque<(VolumeId, Vec<LinkId>)> = group_by_volume(uids)
+            .into_iter()
+            .flat_map(|(volume_id, link_ids)| {
+                link_ids
+                    .chunks(MAX_BATCH_COUNT)
+                    .map(|chunk| (volume_id.clone(), chunk.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        stream::unfold(
+            (batches, VecDeque::new()),
+            move |(mut batches, mut pending): (VecDeque<_>, VecDeque<_>)| async move {
+                loop {
+                    if let Some(outcome) = pending.pop_front() {
+                        return Some((Ok(outcome), (batches, pending)));
+                    }
+                    let (volume_id, link_ids) = batches.pop_front()?;
+                    let path = action.path(&volume_id);
+                    let body = MultipleLinksRequest {
+                        link_ids: &link_ids,
+                    };
+                    let response: Result<AggregateLinksResponse> = match action {
+                        NodeAction::Restore => self.http.put(&path, &body).await,
+                        NodeAction::Trash | NodeAction::Delete => {
+                            self.http.post(&path, &body).await
+                        }
+                    };
+                    match response {
+                        Ok(response) => pending.extend(
+                            aggregate_outcomes(response)
+                                .into_iter()
+                                .map(|(link_id, o)| (NodeUid::new(volume_id.clone(), link_id), o)),
+                        ),
+                        // A request that never produced an envelope says nothing
+                        // about its nodes: report it and stop.
+                        Err(e) => return Some((Err(e), (VecDeque::new(), VecDeque::new()))),
+                    }
+                }
+            },
+        )
     }
 
     /// Permanently empty the main volume's trash. Mirrors C#
@@ -5685,6 +5761,50 @@ impl ProtonDriveClient {
         Ok(outcomes)
     }
 
+    /// [`update_photos`](Self::update_photos) as a stream: one outcome per
+    /// photo, yielded as that photo's update finishes instead of after all of
+    /// them (C# `PhotoOperations.UpdatePhotosAsync`'s
+    /// `IAsyncEnumerable<PhotoUpdateResult>`). The single `Err` item is the
+    /// photos-root resolution that makes the whole call impossible; it ends the
+    /// stream.
+    pub(crate) fn update_photos_streaming<'a>(
+        &'a self,
+        updates: &[PhotoTagsUpdate],
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        let updates: VecDeque<PhotoTagsUpdate> = updates.iter().cloned().collect();
+        // `None` until the first item resolves the photos volume once, exactly
+        // as the collecting variant does before its loop.
+        let own_photos_volume: Option<Option<VolumeId>> = None;
+
+        stream::unfold(
+            (updates, own_photos_volume),
+            move |(mut updates, own_photos_volume): (VecDeque<_>, Option<Option<VolumeId>>)| async move {
+                let update = updates.pop_front()?;
+                let own_photos_volume = match own_photos_volume {
+                    Some(resolved) => resolved,
+                    None => match self.ensure_photos().await {
+                        Ok(true) => self
+                            .cache
+                            .lock()
+                            .await
+                            .photos_root
+                            .clone()
+                            .map(|root| root.volume_id),
+                        Ok(false) => None,
+                        Err(e) => return Some((Err(e), (VecDeque::new(), Some(None)))),
+                    },
+                };
+                let outcome = self
+                    .apply_tag_update(&update, own_photos_volume.as_ref())
+                    .await;
+                Some((
+                    Ok((update.node_uid.clone(), outcome)),
+                    (updates, Some(own_photos_volume)),
+                ))
+            },
+        )
+    }
+
     /// One photo's tag update (C# `PhotoOperations.ApplyTagUpdateAsync`).
     async fn apply_tag_update(
         &self,
@@ -6520,6 +6640,25 @@ fn join_node_path<'a>(names: impl Iterator<Item = &'a str>) -> String {
     path
 }
 
+/// Which trash-family batch endpoint a node action hits. C# has one async
+/// iterator per action; the bodies differ only in route and verb.
+#[derive(Debug, Clone, Copy)]
+enum NodeAction {
+    Trash,
+    Restore,
+    Delete,
+}
+
+impl NodeAction {
+    fn path(self, volume_id: &VolumeId) -> String {
+        match self {
+            Self::Trash => format!("v2/volumes/{volume_id}/trash_multiple"),
+            Self::Restore => format!("v2/volumes/{volume_id}/trash/restore_multiple"),
+            Self::Delete => format!("v2/volumes/{volume_id}/trash/delete_multiple"),
+        }
+    }
+}
+
 /// Group node uids by volume, preserving order, so each volume's links are
 /// batched into a single request family (C# groups by `VolumeId`).
 fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
@@ -6611,26 +6750,6 @@ fn aggregate_outcomes(response: AggregateLinksResponse) -> Vec<(LinkId, Result<(
             (pair.link_id, outcome)
         })
         .collect()
-}
-
-fn check_aggregate(op: &str, response: AggregateLinksResponse) -> Result<()> {
-    let failures: Vec<String> = aggregate_outcomes(response)
-        .into_iter()
-        .filter_map(|(link_id, outcome)| match outcome {
-            Ok(()) => None,
-            Err(ProtonError::Api(e)) => Some(format!("{link_id} ({:?})", e.code)),
-            Err(e) => Some(format!("{link_id} ({e})")),
-        })
-        .collect();
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ProtonError::invalid_operation(format!(
-            "{op} failed for {} link(s): {}",
-            failures.len(),
-            failures.join(", ")
-        )))
-    }
 }
 
 /// Build the photo seal attributes from a completed block write + caller
@@ -6964,12 +7083,11 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 mod tests {
     use super::{
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
-        MAX_NODE_NAME_LENGTH, aggregate_outcomes, alternate_names, assemble_manifest,
-        check_aggregate, context_share_path, drive_items, epoch_to_iso8601,
-        is_expired_upload_token, is_listable_revision_state, is_upload_timeout, join_node_path,
-        path_segments, run_context_share_mutation, share_membership_from_dto,
-        small_upload_applicable, take_block_target, take_thumbnail_target, to_drive_event,
-        validate_node_name,
+        MAX_NODE_NAME_LENGTH, NodeAction, aggregate_outcomes, alternate_names, assemble_manifest,
+        context_share_path, drive_items, epoch_to_iso8601, is_expired_upload_token,
+        is_listable_revision_state, is_upload_timeout, join_node_path, path_segments,
+        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
+        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
@@ -7010,6 +7128,23 @@ mod tests {
     }
 
     #[test]
+    fn node_action_routes_match_upstream() {
+        let volume = VolumeId::new("vol-1");
+        assert_eq!(
+            NodeAction::Trash.path(&volume),
+            "v2/volumes/vol-1/trash_multiple"
+        );
+        assert_eq!(
+            NodeAction::Restore.path(&volume),
+            "v2/volumes/vol-1/trash/restore_multiple"
+        );
+        assert_eq!(
+            NodeAction::Delete.path(&volume),
+            "v2/volumes/vol-1/trash/delete_multiple"
+        );
+    }
+
+    #[test]
     fn aggregate_outcomes_keeps_per_link_codes() {
         let outcomes = aggregate_outcomes(mixed_aggregate(ResponseCode::DoesNotExist));
 
@@ -7027,19 +7162,6 @@ mod tests {
             }
             other => panic!("expected an API error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn check_aggregate_reports_only_the_failed_links() {
-        check_aggregate("move", mixed_aggregate(ResponseCode::Success))
-            .expect("all-success envelope must pass");
-
-        let err = check_aggregate("move", mixed_aggregate(ResponseCode::DoesNotExist))
-            .expect_err("a failed link must fail the batch");
-        let message = err.to_string();
-        assert!(message.contains("move failed for 1 link(s)"), "{message}");
-        assert!(message.contains("bad-link"), "{message}");
-        assert!(!message.contains("ok-link"), "{message}");
     }
 
     #[test]
