@@ -38,7 +38,7 @@ pub(crate) const MAX_CONCURRENT_BLOCK_DOWNLOADS: usize = 10;
 pub(crate) async fn decrypt_block_blocking(
     content_key: ContentKey,
     ciphertext: Bytes,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     join_decrypt(tokio::task::spawn_blocking(move || {
         content_key.decrypt_block(&ciphertext)
     }))
@@ -52,7 +52,7 @@ pub(crate) async fn decrypt_block_blocking(
 pub(crate) async fn digest_and_decrypt_block_blocking(
     content_key: ContentKey,
     ciphertext: Bytes,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(Vec<u8>, Bytes)> {
     let handle = tokio::task::spawn_blocking(move || {
         let digest = Sha256::digest(&ciphertext).to_vec();
         content_key
@@ -249,7 +249,7 @@ impl RevisionReader {
     /// in-flight block slot, and dropping it here rather than at the caller
     /// would let `buffered` pile up decrypted blocks that nothing is accounting
     /// for. The caller drops it once the bytes are consumed.
-    async fn block_plaintext(&self, index: usize) -> Result<(Vec<u8>, OwnedSemaphorePermit)> {
+    async fn block_plaintext(&self, index: usize) -> Result<(Bytes, OwnedSemaphorePermit)> {
         // Held across fetch *and* decrypt: both halves are resident 4 MiB
         // buffers, and the plaintext outlives the ciphertext.
         let permit = self

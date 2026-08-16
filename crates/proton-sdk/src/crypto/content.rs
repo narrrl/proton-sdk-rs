@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 
+use bytes::Bytes;
 use pgp::armor::Dearmor;
 use pgp::composed::{MessageBuilder, PlainSessionKey, RawSessionKey};
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
@@ -347,7 +348,7 @@ impl ContentKey {
     /// rejects a message that *starts* with a SEIPD packet, so we parse packets
     /// directly, locate the SEIPD (tolerating a leading PKESK, e.g. a full
     /// round-trip message), and decrypt it with the supplied session key.
-    pub fn decrypt_block(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt_block(&self, ciphertext: &[u8]) -> Result<Bytes, CryptoError> {
         let inner = self.decrypt_seipd(ciphertext)?;
 
         // A content block's payload is a single literal-data packet.
@@ -357,7 +358,11 @@ impl ContentKey {
             .ok_or_else(|| CryptoError::Parse("block payload is empty".into()))?
             .map_err(|e| CryptoError::Parse(format!("block payload packet: {e}")))?;
         match literal {
-            Packet::LiteralData(data) => Ok(data.data().to_vec()),
+            // `into_bytes`, not `data().to_vec()`: the literal packet already
+            // owns its payload as `Bytes`, and a block is 4 MiB — copying it out
+            // doubled the peak footprint of every block delivered, times the ten
+            // a download has in flight.
+            Packet::LiteralData(data) => Ok(data.into_bytes()),
             other => Err(CryptoError::Parse(format!(
                 "block payload is not literal data: {:?}",
                 other.tag()

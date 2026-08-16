@@ -68,7 +68,19 @@ struct Inner {
     base_url: String,
     config: ProtonClientConfiguration,
     session_id: SessionId,
-    tokens: Mutex<Tokens>,
+    /// The current tokens, read on every request and replaced by a refresh.
+    ///
+    /// A plain `std::sync::RwLock` over an `Arc` snapshot, deliberately *not*
+    /// the tokio mutex it used to be: reading the access token is what every
+    /// ordinary request does, and holding an async mutex for it meant queueing
+    /// behind whoever was refreshing — a refresh that stalls on the network (up
+    /// to the retry policy's whole budget) stalled every other API call with it.
+    /// The lock here is only ever held for a clone of an `Arc`, never across an
+    /// await; the mutual exclusion a refresh needs lives in [`Inner::refresh`].
+    tokens: std::sync::RwLock<Arc<Tokens>>,
+    /// Serializes token refreshes. Held across the refresh network call, so it
+    /// must be the async mutex; readers of `tokens` never touch it.
+    refresh: Mutex<()>,
     /// Telemetry sink for per-request events. Interior-mutable because the
     /// client is already shared (cloned into the Drive client) by the time a
     /// caller attaches a sink via [`ApiHttpClient::set_telemetry`]. Defaults to
@@ -103,7 +115,8 @@ impl ApiHttpClient {
                 base_url,
                 config,
                 session_id,
-                tokens: Mutex::new(tokens),
+                tokens: std::sync::RwLock::new(Arc::new(tokens)),
+                refresh: Mutex::new(()),
                 telemetry: std::sync::Mutex::new(NoopTelemetry::shared()),
                 on_tokens_refreshed: std::sync::Mutex::new(None),
             }),
@@ -144,7 +157,16 @@ impl ApiHttpClient {
 
     /// Snapshot the current tokens (e.g. to persist for a later `resume`).
     pub async fn current_tokens(&self) -> Tokens {
-        self.inner.tokens.lock().await.clone()
+        (*self.tokens()).clone()
+    }
+
+    /// The current tokens, as a cheap `Arc` snapshot. Never held across an await.
+    fn tokens(&self) -> Arc<Tokens> {
+        self.inner
+            .tokens
+            .read()
+            .expect("tokens rwlock poisoned")
+            .clone()
     }
 
     /// Attach a telemetry sink to receive a per-request
@@ -313,7 +335,7 @@ impl ApiHttpClient {
         let metadata = serde_json::to_vec(metadata)?;
         let mut timer = self.telemetry().start("http_request");
         timer.attr("method", "POST");
-        let rejected_token = self.inner.tokens.lock().await.access_token.clone();
+        let rejected_token = self.tokens().access_token.clone();
         let response = self
             .send_multipart_with_token(path, &metadata, binary_parts, &rejected_token)
             .await?;
@@ -371,7 +393,7 @@ impl ApiHttpClient {
         let mut timer = self.telemetry().start("http_request");
         timer.attr("method", method.as_str());
 
-        let access_token = self.inner.tokens.lock().await.access_token.clone();
+        let access_token = self.tokens().access_token.clone();
 
         // An early `?` here records the op as a failure (OpTimer defaults to it).
         let response = self
@@ -501,14 +523,19 @@ impl ApiHttpClient {
     /// in-memory access token already differs from the rejected one, another
     /// task refreshed first and we reuse its result.
     async fn refresh_access_token(&self, rejected_access_token: &str) -> Result<String> {
-        let mut guard = self.inner.tokens.lock().await;
+        // The refresh lock, not the token lock: ordinary requests read the
+        // tokens without ever waiting on this.
+        let _guard = self.inner.refresh.lock().await;
 
-        if guard.access_token != rejected_access_token {
-            return Ok(guard.access_token.clone());
+        // Re-read under the refresh lock — whoever held it before us may have
+        // already replaced the token we were handed a 401 for.
+        let current = self.tokens();
+        if current.access_token != rejected_access_token {
+            return Ok(current.access_token.clone());
         }
 
-        let refreshed = self.request_refresh(&guard.refresh_token).await?;
-        *guard = refreshed.clone();
+        let refreshed = self.request_refresh(&current.refresh_token).await?;
+        *self.inner.tokens.write().expect("tokens rwlock poisoned") = Arc::new(refreshed.clone());
 
         // Notify callback
         if let Some(ref cb) = *self
@@ -1026,5 +1053,99 @@ mod tests {
             client.with_base_route("drive/").refresh_tokens,
             "an ordinary session keeps refreshing across a route change"
         );
+    }
+
+    /// An ordinary request reads the access token without queueing behind an
+    /// in-flight refresh.
+    ///
+    /// This is the property the token lock exists to have: the tokens were once
+    /// behind a tokio `Mutex` that the refresh path held across its network
+    /// call, so one slow `auth/v4/refresh` — up to the whole retry budget —
+    /// stalled every other API call on the session. The refresh here is made
+    /// deliberately slow; the concurrent GET has to finish long before it.
+    #[tokio::test]
+    async fn an_ordinary_request_does_not_wait_for_an_in_flight_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const REFRESH_DELAY: Duration = Duration::from_millis(1500);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // `/needs-refresh` 401s once, which sends the caller to
+        // `auth/v4/refresh` — and that reply is held back. Everything else is
+        // answered immediately.
+        let unauthorized = Arc::new(AtomicUsize::new(0));
+        let seen = unauthorized.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+                    let (status, body) = if request.contains("auth/v4/refresh") {
+                        tokio::time::sleep(REFRESH_DELAY).await;
+                        (
+                            "200 OK",
+                            r#"{"Code":1000,"AccessToken":"fresh","RefreshToken":"fresh-refresh","UID":"test-session"}"#.to_string(),
+                        )
+                    } else if request.contains("needs-refresh")
+                        && seen.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        // Only the first attempt 401s; the retry after the
+                        // refresh succeeds, as it would against the real API.
+                        ("401 Unauthorized", r#"{"Code":401}"#.to_string())
+                    } else {
+                        ("200 OK", r#"{"Code":1000}"#.to_string())
+                    };
+
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(body.as_bytes()).await.unwrap();
+                    sock.flush().await.unwrap();
+                });
+            }
+        });
+
+        let config = ProtonClientConfiguration::new("test@1.0")
+            .with_base_url(format!("http://{addr}/"))
+            .with_retry_policy(RetryPolicy::disabled());
+        let client = ApiHttpClient::new(
+            config,
+            SessionId::from("test-session"),
+            Tokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+            },
+        )
+        .unwrap();
+
+        let refreshing = tokio::spawn({
+            let client = client.clone();
+            async move { client.get::<ApiResponse>("needs-refresh").await }
+        });
+
+        // Give the refresh time to be issued and be sitting on the network.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = Instant::now();
+        let _: ApiResponse = client.get("ordinary").await.unwrap();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < REFRESH_DELAY / 2,
+            "an ordinary request waited {waited:?} on a refresh still in flight"
+        );
+
+        refreshing.await.unwrap().unwrap();
+        server.abort();
     }
 }

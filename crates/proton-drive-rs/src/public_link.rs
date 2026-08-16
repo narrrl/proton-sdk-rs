@@ -117,14 +117,26 @@ impl Credentials {
             ));
         }
 
-        let proofs = generate_proofs(
-            info.version,
-            self.password.as_bytes(),
-            &decode_base64(&info.url_password_salt, "UrlPasswordSalt")?,
-            &info.modulus,
-            &decode_base64(&info.server_ephemeral, "ServerEphemeral")?,
-            DEFAULT_BIT_LENGTH,
-        )?;
+        // SRP proofs are a bcrypt derivation plus 2048-bit modular
+        // exponentiations — tens of milliseconds of pure CPU. Inline they stalled
+        // the reactor thread; the crate offloads its crypto everywhere else
+        // (`crypto::decrypt_link_verified`) and this is no different.
+        let version = info.version;
+        let password = self.password.clone();
+        let url_password_salt = decode_base64(&info.url_password_salt, "UrlPasswordSalt")?;
+        let modulus = info.modulus.clone();
+        let server_ephemeral = decode_base64(&info.server_ephemeral, "ServerEphemeral")?;
+        let proofs = blocking(move || {
+            Ok(generate_proofs(
+                version,
+                password.as_bytes(),
+                &url_password_salt,
+                &modulus,
+                &server_ephemeral,
+                DEFAULT_BIT_LENGTH,
+            )?)
+        })
+        .await?;
 
         let request = PublicLinkAuthRequest {
             client_proof: BASE64.encode(&proofs.client_proof),
@@ -147,7 +159,7 @@ impl Credentials {
             ));
         }
 
-        let share_key = self.unlock_share_key(&response)?;
+        let share_key = self.unlock_share_key(&response).await?;
 
         // An absent AccessToken means the server accepted an existing Proton
         // session instead of minting an anonymous one. We have no such session
@@ -197,16 +209,34 @@ impl Credentials {
     /// `DriveCrypto.decryptKeyWithSrpPassword`. The salt is a bcrypt salt, not
     /// the SRP one: the same `derive_key_passphrase` the create side used to
     /// wrap this passphrase.
-    fn unlock_share_key(&self, response: &PublicLinkAuthResponse) -> Result<PrivateKey> {
+    /// Runs on the blocking pool: the bcrypt derivation and the share key's S2K
+    /// are each tens of milliseconds of CPU.
+    async fn unlock_share_key(&self, response: &PublicLinkAuthResponse) -> Result<PrivateKey> {
         let salt = decode_base64(&response.share.share_password_salt, "SharePasswordSalt")?;
-        let key_password = derive_key_passphrase(self.password.as_bytes(), &salt)?;
-        let passphrase =
-            decrypt_armored_with_password(&response.share.share_passphrase, &key_password)?;
-        Ok(PrivateKey::from_armored(
-            &response.share.share_key,
-            &passphrase,
-        )?)
+        let password = self.password.clone();
+        let armored_passphrase = response.share.share_passphrase.clone();
+        let armored_share_key = response.share.share_key.clone();
+        blocking(move || {
+            let key_password = derive_key_passphrase(password.as_bytes(), &salt)?;
+            let passphrase = decrypt_armored_with_password(&armored_passphrase, &key_password)?;
+            Ok(PrivateKey::from_armored(&armored_share_key, &passphrase)?)
+        })
+        .await
     }
+}
+
+/// Run CPU-bound crypto off the runtime, mapping a join failure into a
+/// [`ProtonError`]. The public-link handshake is the one path in the crate whose
+/// crypto is not already behind `crypto::blocking` (that helper is about link
+/// decryption and takes an `AccountClient`, which a visitor has no equivalent of).
+async fn blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        ProtonError::invalid_operation(format!("public link crypto task failed: {e}"))
+    })?
 }
 
 /// The client a public-link session is currently issuing requests through,

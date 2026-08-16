@@ -239,6 +239,14 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 
 `proton-sdk-rs` implements **Milestone 2 (Authenticated Read/Write)** and advanced desktop features. Parity with the official C# SDK (pinned at the upstream commit documented in [UPSTREAM_SYNC.md](file:///home/narl/dev/private/proton-sdk-rs/UPSTREAM_SYNC.md)) is actively maintained.
 
+The C# SDK is the parity *reference*, not the ceiling. Several subsystems have no C# public API and were
+ported from the official TypeScript SDK instead, and a few surfaces exist in neither upstream — they were
+built here because a real files-on-demand client (`proton-drive-linux`) needs them. Divergences are logged
+per-sync in [UPSTREAM_SYNC.md](file:///home/narl/dev/private/proton-sdk-rs/UPSTREAM_SYNC.md).
+
+**Legend** — ✅ ported from the C# SDK · 🟦 no C# public API, ported from the TypeScript SDK · ⭐ exists in
+neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
+
 ### Feature Matrix
 
 | Module | Feature | Status | Notes / Upstream Parity |
@@ -247,40 +255,57 @@ Moving a file or folder within the same volume is an offline cryptographic opera
 | | TOTP 2FA | ✅ | Support for applying second-factor TOTP codes. |
 | | Token Refresh | ✅ | Scope refresh and transparent 401 token refresh. |
 | | Resume Session | ✅ | Restore clients instantly via serialized tokens. |
+| **Account** | Addresses & Keys | ✅ | Address enumeration, address-key unlocking, public-key lookup by email (`AccountClient`). |
+| | Key-salt Injection | ⭐ | `with_key_salts` lets a client hand in cached salts and chain an entity repository onto it, so a warm start skips the salt round-trip. |
+| | Quota | ✅ | `quota()` — used/total space with `available()` / `used_fraction()` helpers. |
 | **HTTP Client** | Retries & Jitter | ✅ | Exponential backoff for 408, 429, and 5xx, respecting `Retry-After`. |
 | | Telemetry | ✅ | Pluggable request tracking (`ITelemetry` analogue). |
 | **Drive / Volume** | Volume Resolution | ✅ | Auto-resolves volume lists; auto-creates the `my-files` root volume on first login. |
 | | Node Listing | ✅ | `get_node`, `enumerate_folder_children`, `enumerate_trash` with key resolution. |
+| | Metadata-only Listing | ⭐ | `enumerate_nodes_light` skips content-key resolution for listings that only need names and sizes. |
+| | Path Helpers | ⭐ | `get_node_by_path`, `get_node_path`, `get_node_hierarchy`, `create_folder_path`, `get_available_name` — a filesystem front-end wants paths, not UID walks. |
 | | File Operations | ✅ | Rename, trash, restore, delete, empty trash — batch calls report one outcome per node (`trash_nodes`), or stream them as each batch lands (`trash_nodes_streaming`). |
-| | Move Operations | ✅ | Same-volume move. Batch moves are chunked automatically. |
-| | Cross-volume Move | ❌ | Not supported (throwing `NotImplementedException` in the C# public API too). |
+| | Move Operations | ✅ | Same-volume move. Batch moves are chunked automatically, one outcome per node. |
+| | Cross-volume Move | ❌ | Not supported here, and not by `proton-drive-linux` either — the C# public API throws `NotImplementedException`, and a cross-volume move means re-uploading content under the destination volume's keys. |
+| **Events / Sync** | Event Enumeration | ✅ | `enumerate_events` + `latest_event_id` per volume scope; `invalidate_caches_for_event` keeps the entity cache coherent. |
+| | Event Manager | 🟦 | Background poll loop (`EventManager`) with a broadcast channel and a foreground/background interval switch, modelled on the TS `eventScheduler`. |
 | **Uploads** | Block Uploading | ✅ | Encrypts and uploads chunks (4 MiB default) to block storage. |
 | | Streaming Upload | ✅ | Streams uploads from any type implementing `std::io::Read`. |
-| | Revision Control | ✅ | Create drafts, upload blocks, and seal new file revisions. |
+| | Revision Control | ✅ | Create drafts, upload blocks, and seal new file revisions; `upload_file_replacing_draft_from` reclaims an abandoned draft. |
+| | Atomic Small Uploads | ✅ | Single-request upload for small buffered files, opt-in via `with_small_file_upload` (no remote feature-flag provider in this crate). |
+| | Upload Concurrency | ⭐ | `with_max_inflight_blocks` bounds in-flight block uploads/downloads per client. |
 | | AEAD Block Support | ✅ | SEIPDv2 / AES-256-GCM AEAD encryption alongside legacy SEIPDv1 (AES-256-CFB). |
 | | Inline Thumbnails | ✅ | Generates and encrypts inline-signed thumbnails. |
 | **Downloads** | Block Downloading | ✅ | Streams block retrieval, decryption, and signature checks. |
+| | Seekable Range Reads | ⭐ | `open_revision` → `RevisionReader::read_at` and `download_range` serve arbitrary byte ranges by fetching only the covering blocks — what makes FUSE files-on-demand possible. Neither upstream SDK has it. |
+| | Thumbnail Retrieval | ✅ | `download_thumbnail`, plus the plural `enumerate_thumbnails` batch API. |
 | | Content Integrity | ✅ | Verification of file manifests and block-level SHA-256 digests. |
 | | Signature Verification | ✅ | Detached signature verification (non-fatal, reports status). |
+| **Revisions** | Revision History | 🟦 | `enumerate_revisions` / `get_revision`, plus `download_revision` and `download_revision_to` for any past revision. |
+| | Restore & Delete | 🟦 | `restore_revision`, `delete_revision`. |
 | **Devices** | Device Registration | ✅ | Create and register desktop/sync clients (`create_device`). |
 | | Device Listing | ✅ | List registered devices and their sync root folders (`enumerate_devices`). |
 | | Device Operations | ✅ | Rename and delete registered devices. |
-| **Sharing & Links** | Member Management | ✅ | Invite users (`invite_users`), list members, update roles, and remove members. |
-| | Public Share Links | ✅ | Create public shareable links (`create_public_link`) with password protection and expiry. |
+| **Sharing & Links** | Share Creation | 🟦 | `share_node` bootstraps a share on a node (no C# public API for it). |
+| | Member Management | ✅ | Invite users (`invite_users`), list members, update roles, and remove members. |
+| | Public Share Links | 🟦 | Create public shareable links (`create_public_link`) with password protection and expiry; `get_public_link`, `remove_public_link`. |
 | | External Invites | ✅ | Invite non-Proton users (`invite_external_users`) and track registration status. |
-| | Bookmarks | ✅ | Save and list public link bookmarks (`create_bookmark`, `list_bookmarks`). |
-| | Incoming Invites | ✅ | List, accept, or reject invitations shared *with* the current user. |
-| | Public Link (consume) | ✅ | Open someone else's link with no Proton account (`ProtonDrivePublicLinkClient`): SRP handshake, custom passwords, browse and download the shared subtree. |
-| | Public Link streaming | ✅ | Seekable range reads over a shared file (`open_revision` → `RevisionReader::read_at`), plus thumbnails and in-place session renewal — a visitor can stream a large file without downloading it. |
+| | Bookmarks | ✅ | Save, list, and delete public link bookmarks (`create_bookmark`, `list_bookmarks`, `delete_bookmark`). |
+| | Incoming Invites | ✅ | List, accept, or reject invitations shared *with* the current user; `leave_shared_node`. |
+| | Shared Listings | ✅ | `enumerate_shared_by_me_node_uids`, `enumerate_shared_with_me` (drive and photos volumes). |
+| | Public Link (consume) | 🟦 | Open someone else's link with no Proton account (`ProtonDrivePublicLinkClient`): SRP handshake, custom passwords, browse and download the shared subtree. |
+| | Public Link streaming | ⭐ | Seekable range reads over a shared file (`open_revision` → `RevisionReader::read_at`), plus thumbnails, batch enumeration and in-place session renewal — a visitor streams a large file without downloading it. No TS or C# counterpart. |
 | **Photos** | Photos Timeline | ✅ | `ProtonPhotosClient` maps photostream, timeline enumeration, and photo downloads. |
 | | Photo Uploads | ✅ | Uploading photos with `PhotoUploadMetadata` (capture time, tags, grouping). |
 | | Albums (read) | ✅ | List albums (`enumerate_album_node_uids`) and their photos (`enumerate_album`); album nodes carry `Node::album`. |
 | | Photo Tags | ✅ | Add/remove classification tags (`update_photos`, or `update_photos_streaming` for per-photo outcomes as they finish); `Favorite` on photos in our own timeline. |
-| | Shared Photos | ✅ | Photos/albums shared *with* us (`enumerate_shared_with_me_node_uids`, `enumerate_shared_with_me_album_uids`). |
-| | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported. |
-| | Album Writes | ❌ | Creating albums and adding/removing photos is not ported. |
+| | Shared Photos | ✅ | Photos/albums shared *with* us (`enumerate_shared_with_me_node_uids`, `enumerate_shared_with_me_album_uids`) and by us (`enumerate_shared_node_uids`). |
+| | Duplicate Detection | ✅ | `find_duplicates` matches candidates on name/content HMAC before re-uploading. |
+| | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported (upstream `03b1cb7f`). |
+| | Album Writes | ❌ | Creating albums and adding/removing photos — no C# public API upstream either. |
 | | Photos Volume Create| ❌ | Volume creation is not yet ported. |
-| **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`, or `with_entity_repository` to chain one onto a `with_key_salts` client); keys/secrets remain strictly in memory. |
+| **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`, or `with_entity_repository` to chain one onto a `with_key_salts` client); keys/secrets remain strictly in memory. Retained deliberately — upstream C# removed its entity cache. |
+| **Validation** | Node Names | ✅ | Empty or >255-char names are rejected client-side before create/rename (counted in `char`s; C# counts UTF-16 units). |
 
 ---
 

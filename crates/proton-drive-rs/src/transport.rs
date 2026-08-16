@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use proton_sdk::error::{ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
 use proton_sdk::ids::{LinkId, VolumeId};
@@ -143,6 +144,18 @@ impl RevisionTransport {
     }
 
     /// The revision's metadata and its full, ordered block table.
+    ///
+    /// Pages after the first are fetched several at a time rather than one per
+    /// round trip: a 4 GiB file is 21 pages, and walking them serially costs 21
+    /// RTTs before the first byte of content can be requested. The window is
+    /// speculative — a page's `FromBlockIndex` is derived from its position
+    /// rather than from the previous page's contents, which the contiguity check
+    /// below already requires to hold — so a short page inside a batch simply
+    /// ends the walk and the surplus responses are discarded.
+    ///
+    /// The window ramps `2 → 4 → …→ MAX_PAGE_WINDOW` so that a file only just
+    /// over a page boundary wastes one speculative request rather than five,
+    /// while a genuinely large table still reaches full width after two batches.
     pub(crate) async fn list_blocks(
         &self,
         volume_id: &VolumeId,
@@ -150,29 +163,39 @@ impl RevisionTransport {
         revision_id: &str,
     ) -> Result<(RevisionDto, Vec<BlockDto>)> {
         const PAGE_SIZE: i32 = 50;
+        const MAX_PAGE_WINDOW: usize = 6;
 
-        let mut blocks: Vec<BlockDto> = Vec::new();
-        let mut metadata: Option<RevisionDto> = None;
-        let mut from_index: i32 = 1;
-
-        loop {
+        let page = |page_index: i32| {
+            let from_index = page_index * PAGE_SIZE + 1;
             let path = format!(
                 "v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}?FromBlockIndex={from_index}&PageSize={PAGE_SIZE}&NoBlockUrls=0"
             );
-            let response: RevisionResponse = self.get(&path).await?;
-            let mut revision = response.revision;
-            let page = std::mem::take(&mut revision.blocks);
-            let page_len = page.len();
+            async move { self.get::<RevisionResponse>(&path).await }
+        };
 
-            if metadata.is_none() {
-                metadata = Some(revision);
-            }
-            blocks.extend(page);
+        let mut first = page(0).await?.revision;
+        let mut blocks: Vec<BlockDto> = std::mem::take(&mut first.blocks);
+        let mut complete = blocks.len() < PAGE_SIZE as usize;
+        let metadata = first;
 
-            if page_len < PAGE_SIZE as usize {
-                break;
+        let mut next_page: i32 = 1;
+        let mut window: usize = 2;
+        while !complete {
+            let batch: Vec<i32> = (next_page..next_page + window as i32).collect();
+            next_page += window as i32;
+
+            let mut responses = stream::iter(batch.into_iter().map(page)).buffered(window);
+            window = (window * 2).min(MAX_PAGE_WINDOW);
+            while let Some(response) = responses.try_next().await? {
+                if complete {
+                    // A page in this batch already came up short; anything after
+                    // it is past the end of the block table.
+                    continue;
+                }
+                let page_blocks = response.revision.blocks;
+                complete = page_blocks.len() < PAGE_SIZE as usize;
+                blocks.extend(page_blocks);
             }
-            from_index = blocks.iter().map(|b| b.index).max().unwrap_or(from_index) + 1;
         }
 
         blocks.sort_by_key(|b| b.index);
@@ -184,8 +207,6 @@ impl RevisionTransport {
             }
         }
 
-        let metadata = metadata
-            .ok_or_else(|| ProtonError::invalid_operation("revision returned no metadata"))?;
         Ok((metadata, blocks))
     }
 }

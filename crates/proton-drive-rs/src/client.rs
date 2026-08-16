@@ -3426,21 +3426,41 @@ impl ProtonDriveClient {
             _ => generated.clone(),
         };
 
-        // Wrap the share session key with the SRP-salted passphrase, and store the
-        // password encrypted to the owner's address key.
-        let key_salt = generate_key_salt();
-        let salted_passphrase = derive_key_passphrase(full_password.as_bytes(), &key_salt)?;
-        let share_passphrase_key_packet =
-            base64_encode(share_session_key.encrypt_with_password(&salted_passphrase)?);
-        let armored_password = address_key.encrypt(full_password.as_bytes())?;
-
-        // SRP verifier over the link password, against a fresh signed modulus.
+        // The modulus is fetched first so that everything CPU-bound below can go
+        // to the blocking pool in one hop.
         let modulus = self.fetch_srp_modulus().await?;
-        let verifier = generate_verifier(
-            full_password.as_bytes(),
-            &modulus.modulus,
-            DEFAULT_BIT_LENGTH,
-        )?;
+
+        // Wrap the share session key with the SRP-salted passphrase, store the
+        // password encrypted to the owner's address key, and build the SRP
+        // verifier over the link password.
+        //
+        // All of that is pure CPU and none of it is cheap: `derive_key_passphrase`
+        // is a deliberately slow bcrypt, and `generate_verifier` a 2048-bit modular
+        // exponentiation. Inline, they stalled every other task on the reactor
+        // thread for the duration — so, like the rest of the crate's PGP work, they
+        // run on the blocking pool.
+        let key_salt = generate_key_salt();
+        let signed_modulus = modulus.modulus.clone();
+        let password_bytes = full_password.clone();
+        let salt_for_task = key_salt;
+        let (share_passphrase_key_packet, armored_password, verifier) =
+            tokio::task::spawn_blocking(move || {
+                let salted_passphrase =
+                    derive_key_passphrase(password_bytes.as_bytes(), &salt_for_task)?;
+                let key_packet =
+                    base64_encode(share_session_key.encrypt_with_password(&salted_passphrase)?);
+                let armored_password = address_key.encrypt(password_bytes.as_bytes())?;
+                let verifier = generate_verifier(
+                    password_bytes.as_bytes(),
+                    &signed_modulus,
+                    DEFAULT_BIT_LENGTH,
+                )?;
+                Ok::<_, ProtonError>((key_packet, armored_password, verifier))
+            })
+            .await
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("public link crypto task failed: {e}"))
+            })??;
 
         let flags = if custom_password.map(|p| !p.is_empty()).unwrap_or(false) {
             3 // random + custom password
@@ -3868,12 +3888,23 @@ impl ProtonDriveClient {
             .own_address_keys(&detail.invitation.invitee_email)
             .await
             .ok()?;
-        let passphrase = keys
-            .iter()
-            .find_map(|k| k.decrypt_armored_message(&detail.share.passphrase).ok())?;
-        let share_key = PrivateKey::from_armored(&detail.share.share_key, &passphrase).ok()?;
-        let name_bytes = share_key.decrypt_armored_message(&detail.link.name).ok()?;
-        String::from_utf8(name_bytes).ok()
+        // Unlocking the share key runs its S2K — tens of milliseconds of pure
+        // CPU, and this is called once per invitation in a listing. Off the
+        // reactor, like every other key unlock in the crate
+        // (`crypto::decrypt_link_verified`).
+        let armored_passphrase = detail.share.passphrase.clone();
+        let armored_share_key = detail.share.share_key.clone();
+        let armored_name = detail.link.name.clone();
+        tokio::task::spawn_blocking(move || {
+            let passphrase = keys
+                .iter()
+                .find_map(|k| k.decrypt_armored_message(&armored_passphrase).ok())?;
+            let share_key = PrivateKey::from_armored(&armored_share_key, &passphrase).ok()?;
+            let name_bytes = share_key.decrypt_armored_message(&armored_name).ok()?;
+            String::from_utf8(name_bytes).ok()
+        })
+        .await
+        .ok()?
     }
 
     /// The current user's own address keys for `email`: all its private keys (for

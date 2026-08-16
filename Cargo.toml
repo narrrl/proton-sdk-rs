@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narrrl/proton-sdk-rs"
@@ -24,7 +24,10 @@ opt-level = 2
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream", "multipart", "gzip"] }
+# `http2` is in reqwest's default set, which `default-features = false` drops:
+# without it every concurrent block download pays its own TCP+TLS handshake
+# instead of multiplexing over one connection.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream", "multipart", "gzip", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"
