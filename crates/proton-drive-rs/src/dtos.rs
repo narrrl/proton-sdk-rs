@@ -327,6 +327,120 @@ pub struct SharedAlbumDto {
     pub link_id: LinkId,
 }
 
+/// `POST photos/volumes/{vid}/albums` — create an album. Ported from the
+/// TypeScript SDK (`PhotosAPIService.createAlbum`); C# has no public album
+/// write API. The album is a folder node on the photos volume, so its `Link`
+/// block carries exactly what a folder create does.
+#[derive(Debug, Serialize)]
+pub struct AlbumCreationRequest {
+    /// TS sends `Locked: false` — a locked album is one that cannot take new
+    /// photos, which a freshly created album never is.
+    #[serde(rename = "Locked")]
+    pub locked: bool,
+    #[serde(rename = "Link")]
+    pub link: AlbumCreationLink,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlbumCreationLink {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "NodeKey")]
+    pub key: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "NodePassphraseSignature")]
+    pub passphrase_signature: String,
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: String,
+    #[serde(rename = "NodeHashKey")]
+    pub node_hash_key: String,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumCreationResponse {
+    #[serde(rename = "Album")]
+    pub album: AlbumCreationAlbum,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumCreationAlbum {
+    #[serde(rename = "Link")]
+    pub link: AlbumCreationLinkResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumCreationLinkResponse {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+}
+
+/// `POST photos/volumes/{vid}/albums/{lid}/add-multiple` — add photos that
+/// already live on the album's own volume. Ported from the TypeScript SDK
+/// (`PhotosAPIService.addPhotosToAlbum`). Each entry re-encrypts one photo's
+/// name and passphrase to the album key; a main photo's related photos are
+/// flattened into the same list.
+#[derive(Debug, Serialize)]
+pub struct AddPhotosToAlbumRequest {
+    #[serde(rename = "AlbumData")]
+    pub album_data: Vec<AddPhotoToAlbumEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddPhotoToAlbumEntry {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    /// Name hash under the *album's* hash key.
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    /// The photo's name re-encrypted to the album key.
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+    /// The photo's node passphrase re-encrypted to the album key.
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    /// HMAC of the plaintext SHA-1 under the album's hash key.
+    #[serde(rename = "ContentHash")]
+    pub content_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddPhotosToAlbumResponse {
+    #[serde(rename = "Responses", default)]
+    pub responses: Vec<AddPhotoToAlbumOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddPhotoToAlbumOutcome {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Response")]
+    pub response: AddPhotoToAlbumOutcomeBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddPhotoToAlbumOutcomeBody {
+    #[serde(rename = "Code", default)]
+    pub code: i32,
+    #[serde(rename = "Error", default)]
+    pub error: Option<String>,
+    /// Carries `Missing` — related photos the server demands alongside this one.
+    #[serde(rename = "Details", default)]
+    pub details: Option<AddPhotoToAlbumOutcomeDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddPhotoToAlbumOutcomeDetails {
+    #[serde(rename = "Missing", default)]
+    pub missing: Vec<LinkId>,
+}
+
 /// `POST`/`DELETE photos/volumes/{vid}/links/{lid}/tags` (C# `PhotoTagsRequest`).
 #[derive(Debug, Serialize)]
 pub struct PhotoTagsRequest {

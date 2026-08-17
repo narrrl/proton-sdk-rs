@@ -44,32 +44,34 @@ use crate::crypto::{
 };
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
-    AcceptInvitationRequest, AggregateLinksResponse, AlbumItemListResponse, AlbumListResponse,
-    BlockCreationRequest, BlockDto, BlockUploadPreparationRequest, BlockUploadPreparationResponse,
-    BlockUploadTarget, BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto,
-    BookmarksResponse, CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest,
-    CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse,
-    DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse,
-    DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto,
-    ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
-    ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
-    FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
-    FolderCreationRequest, FolderCreationResponse, InvitationDetailsResponse,
-    InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
-    InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
-    InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
-    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
-    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
-    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
-    PhotosAttributesDto, RenameLinkRequest, RevisionConflict, RevisionCreationRequest,
-    RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
-    RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
-    ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse, ShareTargetType, ShareUrlDto,
-    ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse, SharedWithMeResponse,
-    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
-    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
-    TimelinePhotoListResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
-    VolumeEventListResponse, VolumeTrashResponse,
+    AcceptInvitationRequest, AddPhotoToAlbumEntry, AddPhotosToAlbumRequest,
+    AddPhotosToAlbumResponse, AggregateLinksResponse, AlbumCreationLink, AlbumCreationRequest,
+    AlbumCreationResponse, AlbumItemListResponse, AlbumListResponse, BlockCreationRequest,
+    BlockDto, BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
+    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
+    CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
+    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
+    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
+    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
+    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
+    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
+    FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
+    FolderCreationResponse, InvitationDetailsResponse, InvitationsListResponse,
+    InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
+    InviteProtonUserInvitationDto, InviteProtonUserRequest, InviteProtonUserResponse,
+    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
+    LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
+    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
+    NodeNameAvailabilityResponse, PhotoTagsRequest, PhotosAttributesDto, RenameLinkRequest,
+    RevisionConflict, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
+    RevisionListItemDto, RevisionListResponse, RevisionMetadataResponse, RevisionUpdateRequest,
+    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto,
+    ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedAlbumsResponse,
+    SharedByMeResponse, SharedWithMeResponse, SmallFileUploadMetadataRequest,
+    SmallRevisionUploadMetadataRequest, SmallUploadResponse, ThumbnailBlockListRequest,
+    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
+    UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
+    VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -5614,6 +5616,483 @@ impl ProtonDriveClient {
                 )
             })
             .collect())
+    }
+
+    /// Batch form of [`find_photo_duplicates`](Self::find_photo_duplicates):
+    /// one `POST volumes/{vid}/photos/duplicates` per [`DUPLICATE_BATCH`] input
+    /// pairs instead of one per photo.
+    ///
+    /// Each input is `(name, sha1_hex)` — the *plaintext* SHA-1 of the photo's
+    /// contents, lowercase hex, which the caller usually already computed while
+    /// reading the file. The result is one match list per input, in input order.
+    ///
+    /// Not an upstream port: the TS/C# SDKs only expose the one-photo call, but
+    /// the endpoint already takes a `NameHashes` array, and a Google Takeout
+    /// import asks this question tens of thousands of times.
+    pub(crate) async fn find_photo_duplicates_many(
+        &self,
+        items: &[(String, String)],
+    ) -> Result<Vec<Vec<NodeUid>>> {
+        const ACTIVE_LINK_STATE: i32 = 1;
+        /// Name hashes per duplicates request.
+        const DUPLICATE_BATCH: usize = 150;
+
+        let mut out = vec![Vec::new(); items.len()];
+        if items.is_empty() {
+            return Ok(out);
+        }
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
+        }
+        let photos_root = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+        let root_key = self.folder_node_key(&photos_root).await?;
+        let hash_key = self
+            .parent_hash_key_ctx(&photos_root, &root_key, true)
+            .await?;
+
+        // Two inputs can share a name (the same photo under two Takeout album
+        // folders), so a name hash maps to *every* input position that produced
+        // it, and each position is matched on its own content hash.
+        let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut name_hashes: Vec<String> = Vec::new();
+        let mut content_hashes: Vec<String> = Vec::with_capacity(items.len());
+        for (index, (name, sha1_hex)) in items.iter().enumerate() {
+            let name_hash = hex::encode(hmac_sha256(&hash_key, name.as_bytes()));
+            positions
+                .entry(name_hash.clone())
+                .or_insert_with(|| {
+                    name_hashes.push(name_hash.clone());
+                    Vec::new()
+                })
+                .push(index);
+            content_hashes.push(hex::encode(hmac_sha256(
+                &hash_key,
+                sha1_hex.to_ascii_lowercase().as_bytes(),
+            )));
+        }
+
+        for chunk in name_hashes.chunks(DUPLICATE_BATCH) {
+            let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
+            let response: FindPhotoDuplicatesResponse = self
+                .http
+                .post(
+                    &path,
+                    &FindPhotoDuplicatesRequest {
+                        name_hashes: chunk.to_vec(),
+                    },
+                )
+                .await?;
+
+            for duplicate in response.duplicate_hashes {
+                let Some(link_id) = duplicate.link_id else {
+                    continue;
+                };
+                if duplicate.link_state != Some(ACTIVE_LINK_STATE)
+                    || duplicate.name_hash.is_empty()
+                    || duplicate.content_hash.is_empty()
+                {
+                    continue;
+                }
+                // The server echoes the name hash it matched; find the inputs
+                // that asked for it and keep the ones whose content agrees too.
+                let Some(indices) = positions.get(&duplicate.name_hash.to_ascii_lowercase()) else {
+                    continue;
+                };
+                for &index in indices {
+                    if duplicate
+                        .content_hash
+                        .eq_ignore_ascii_case(&content_hashes[index])
+                    {
+                        out[index]
+                            .push(NodeUid::new(photos_root.volume_id.clone(), link_id.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Which of `names` any *active* photo on the volume already carries.
+    ///
+    /// The cheap half of [`find_photo_duplicates_many`](Self::find_photo_duplicates_many):
+    /// it matches on the name hash alone, so it needs no content digest and
+    /// therefore no reading of the candidate files. A `true` is "maybe a
+    /// duplicate, hash it and ask again"; a `false` is conclusive.
+    pub(crate) async fn photo_name_collisions(&self, names: &[String]) -> Result<Vec<bool>> {
+        const ACTIVE_LINK_STATE: i32 = 1;
+        const DUPLICATE_BATCH: usize = 150;
+
+        let mut out = vec![false; names.len()];
+        if names.is_empty() {
+            return Ok(out);
+        }
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
+        }
+        let photos_root = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+        let root_key = self.folder_node_key(&photos_root).await?;
+        let hash_key = self
+            .parent_hash_key_ctx(&photos_root, &root_key, true)
+            .await?;
+
+        let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut name_hashes: Vec<String> = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let name_hash = hex::encode(hmac_sha256(&hash_key, name.as_bytes()));
+            positions
+                .entry(name_hash.clone())
+                .or_insert_with(|| {
+                    name_hashes.push(name_hash.clone());
+                    Vec::new()
+                })
+                .push(index);
+        }
+
+        for chunk in name_hashes.chunks(DUPLICATE_BATCH) {
+            let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
+            let response: FindPhotoDuplicatesResponse = self
+                .http
+                .post(
+                    &path,
+                    &FindPhotoDuplicatesRequest {
+                        name_hashes: chunk.to_vec(),
+                    },
+                )
+                .await?;
+            for duplicate in response.duplicate_hashes {
+                if duplicate.link_id.is_none() || duplicate.link_state != Some(ACTIVE_LINK_STATE) {
+                    continue;
+                }
+                if let Some(indices) = positions.get(&duplicate.name_hash.to_ascii_lowercase()) {
+                    for &index in indices {
+                        out[index] = true;
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Create an album named `name` on the account's photos volume.
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.createAlbum` +
+    /// `AlbumsCryptoService.createAlbum`); C# exposes no album write API. An
+    /// album is a folder node parented to the photos root, so the crypto is the
+    /// folder create: a generated node key locked to a fresh passphrase that is
+    /// encrypted to the photos root key and signed by the photos share's
+    /// membership address, plus the album's own child-name hash key.
+    pub(crate) async fn create_album(&self, name: &str) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("create_album");
+        validate_node_name(name)?;
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "account has no photos volume",
+            ));
+        }
+        let photos_root = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+
+        let root_key = self.folder_node_key(&photos_root).await?;
+        let root_hash_key = self
+            .parent_hash_key_ctx(&photos_root, &root_key, true)
+            .await?;
+        let (_address_id, email, signing_key) = self.photos_membership_address().await?;
+
+        let node = generate_node_key()?;
+        let node_hash_key = generate_node_hash_key(&node.key)?;
+
+        let request = AlbumCreationRequest {
+            locked: false,
+            link: AlbumCreationLink {
+                name: root_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?,
+                name_hash: hex::encode(hmac_sha256(&root_hash_key, name.as_bytes())),
+                key: node.locked_armored,
+                passphrase: root_key.encrypt(&node.passphrase)?,
+                passphrase_signature: signing_key.sign_detached(&node.passphrase)?,
+                signature_email: email,
+                node_hash_key,
+                extended_attributes: None,
+            },
+        };
+
+        let path = format!("photos/volumes/{}/albums", photos_root.volume_id);
+        let created: AlbumCreationResponse = self.http.post(&path, &request).await?;
+
+        timer.success();
+        Ok(NodeUid::new(
+            photos_root.volume_id,
+            created.album.link.link_id,
+        ))
+    }
+
+    /// Add photos that already live on the album's volume to `album_uid`,
+    /// returning one outcome per input photo in input order.
+    ///
+    /// Ported from the TypeScript SDK (`AddToAlbumProcess.processSameVolumeQueue`
+    /// with `PhotoTransferPayloadBuilder`). Each photo's name and node passphrase
+    /// are re-encrypted to the album key and its name/content hashes recomputed
+    /// under the album's hash key; the photo itself is not re-uploaded and stays
+    /// in the timeline. A main photo's related photos (live-photo video, burst
+    /// siblings) travel with it, because the server refuses the group otherwise.
+    ///
+    /// Photos on a *different* volume (an album shared with us) need the TS
+    /// `copyPhoto` path, which is not ported — those fail their own outcome
+    /// rather than the whole call.
+    pub(crate) async fn add_photos_to_album(
+        &self,
+        album_uid: &NodeUid,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        /// Photos per `add-multiple` request, related photos included (TS
+        /// `ADD_PHOTOS_BATCH_SIZE`).
+        const ADD_BATCH: usize = 10;
+
+        let mut timer = self.telemetry.start("add_photos_to_album");
+        let mut outcomes: Vec<(NodeUid, Result<()>)> = Vec::with_capacity(photo_uids.len());
+        if photo_uids.is_empty() {
+            timer.success();
+            return Ok(outcomes);
+        }
+
+        let album_key = self.folder_node_key(album_uid).await?;
+        let album_hash_key = self
+            .parent_hash_key_ctx(album_uid, &album_key, true)
+            .await?;
+        let (_address_id, email, signing_key) = self.photos_membership_address().await?;
+
+        let mut wanted: Vec<&NodeUid> = Vec::new();
+        for uid in photo_uids {
+            if uid.volume_id != album_uid.volume_id {
+                outcomes.push((
+                    uid.clone(),
+                    Err(ProtonError::invalid_operation(format!(
+                        "photo {uid} is on another volume than album {album_uid}; \
+                         copying photos across volumes is not implemented"
+                    ))),
+                ));
+                continue;
+            }
+            wanted.push(uid);
+        }
+
+        // One `add-multiple` batch at a time: build each photo's payload, fan
+        // the related photos in beside it, then post and map the per-link
+        // outcomes back onto the *main* photos the caller asked about.
+        let mut batch: Vec<NodeUid> = Vec::new();
+        let mut entries: Vec<AddPhotoToAlbumEntry> = Vec::new();
+        let mut queue: std::collections::VecDeque<NodeUid> = wanted.into_iter().cloned().collect();
+
+        while let Some(uid) = queue.pop_front() {
+            let payload = match self
+                .album_photo_entries(&uid, &album_key, &album_hash_key, &email, &signing_key)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    outcomes.push((uid, Err(error)));
+                    continue;
+                }
+            };
+
+            // A photo plus its related photos must not be split across requests.
+            if !entries.is_empty() && entries.len() + payload.len() > ADD_BATCH {
+                self.post_album_additions(album_uid, &entries, &batch, &mut outcomes)
+                    .await?;
+                entries.clear();
+                batch.clear();
+            }
+            entries.extend(payload);
+            batch.push(uid);
+        }
+        if !entries.is_empty() {
+            self.post_album_additions(album_uid, &entries, &batch, &mut outcomes)
+                .await?;
+        }
+
+        timer.success();
+        Ok(outcomes)
+    }
+
+    /// Build the `AlbumData` entries for one photo: the photo itself first, then
+    /// each of its related photos (TS `preparePhotoPayload`).
+    async fn album_photo_entries(
+        &self,
+        uid: &NodeUid,
+        album_key: &PrivateKey,
+        album_hash_key: &[u8],
+        email: &str,
+        signing_key: &PrivateKey,
+    ) -> Result<Vec<AddPhotoToAlbumEntry>> {
+        let node = self
+            .get_photos_node(uid)
+            .await?
+            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?;
+
+        let related: Vec<NodeUid> = node
+            .photo
+            .as_ref()
+            .map(|photo| photo.related_photo_uids.clone())
+            .unwrap_or_default();
+
+        let mut entries = vec![
+            self.album_photo_entry(uid, album_key, album_hash_key, email, signing_key)
+                .await?,
+        ];
+        for related_uid in related {
+            entries.push(
+                self.album_photo_entry(&related_uid, album_key, album_hash_key, email, signing_key)
+                    .await?,
+            );
+        }
+        Ok(entries)
+    }
+
+    /// Re-encrypt one photo's name and passphrase to the album key.
+    ///
+    /// The passphrase is *rewrapped*, not re-encrypted from plaintext: only its
+    /// key packet changes recipient, so the locked node key still unlocks and
+    /// the original `NodePassphraseSignature` stays valid (which is why the
+    /// entry carries no signature of its own — TS sends one only for photos
+    /// whose key author is anonymous).
+    async fn album_photo_entry(
+        &self,
+        uid: &NodeUid,
+        album_key: &PrivateKey,
+        album_hash_key: &[u8],
+        email: &str,
+        signing_key: &PrivateKey,
+    ) -> Result<AddPhotoToAlbumEntry> {
+        let node = self
+            .get_photos_node(uid)
+            .await?
+            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?;
+        let NodeKind::File { content_sha1, .. } = &node.kind else {
+            return Err(ProtonError::invalid_operation(format!(
+                "{uid} is not a photo file"
+            )));
+        };
+        let sha1 = content_sha1.clone().ok_or_else(|| {
+            ProtonError::invalid_operation(format!(
+                "photo {uid} has no content digest; it cannot be added to an album"
+            ))
+        })?;
+
+        let details = self
+            .get_link_details_ctx(&uid.volume_id, std::slice::from_ref(&uid.link_id), true)
+            .await?;
+        let link = &details
+            .links
+            .first()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?
+            .link;
+
+        let parent_key = self
+            .resolve_parent_key_ctx(&uid.volume_id, link, true)
+            .await?;
+        let passphrase = parent_key.rewrap_message_to(&link.passphrase, album_key)?;
+
+        Ok(AddPhotoToAlbumEntry {
+            link_id: uid.link_id.clone(),
+            name_hash: hex::encode(hmac_sha256(album_hash_key, node.name.as_bytes())),
+            name: album_key.encrypt_and_sign(signing_key, node.name.as_bytes(), true, false)?,
+            name_signature_email: email.to_string(),
+            passphrase,
+            content_hash: hex::encode(hmac_sha256(
+                album_hash_key,
+                sha1.to_ascii_lowercase().as_bytes(),
+            )),
+        })
+    }
+
+    /// Post one `add-multiple` batch and record an outcome for every photo in
+    /// `batch` (the main photos; a related photo's failure fails its main one).
+    async fn post_album_additions(
+        &self,
+        album_uid: &NodeUid,
+        entries: &[AddPhotoToAlbumEntry],
+        batch: &[NodeUid],
+        outcomes: &mut Vec<(NodeUid, Result<()>)>,
+    ) -> Result<()> {
+        /// `ResponseCode::Success` as it arrives inside a per-link sub-response.
+        const SUCCESS_CODE: i32 = 1000;
+
+        let path = format!(
+            "photos/volumes/{}/albums/{}/add-multiple",
+            album_uid.volume_id, album_uid.link_id
+        );
+        let response: AddPhotosToAlbumResponse = self
+            .http
+            .post(
+                &path,
+                &AddPhotosToAlbumRequest {
+                    album_data: entries.to_vec(),
+                },
+            )
+            .await?;
+
+        // Only the links the server reports on failed; everything else in the
+        // batch succeeded (TS builds the same error map and yields ok for the
+        // rest).
+        let mut failures: HashMap<String, String> = HashMap::new();
+        for outcome in response.responses {
+            let body = &outcome.response;
+            // `Code == 1000` and no `Error` is the only success shape; a missing
+            // code (0) counts as a failure, as it does in TS.
+            if body.code == SUCCESS_CODE && body.error.is_none() {
+                continue;
+            }
+            let missing = body
+                .details
+                .as_ref()
+                .map(|details| details.missing.as_slice())
+                .unwrap_or_default();
+            let message = if !missing.is_empty() {
+                let missing: Vec<String> = missing.iter().map(|id| id.to_string()).collect();
+                format!(
+                    "server wants related photos added with it: {}",
+                    missing.join(", ")
+                )
+            } else {
+                body.error
+                    .clone()
+                    .unwrap_or_else(|| format!("add to album failed with code {}", body.code))
+            };
+            failures.insert(outcome.link_id.to_string(), message);
+        }
+
+        for uid in batch {
+            match failures.get(&uid.link_id.to_string()) {
+                Some(message) => outcomes.push((
+                    uid.clone(),
+                    Err(ProtonError::invalid_operation(message.clone())),
+                )),
+                None => outcomes.push((uid.clone(), Ok(()))),
+            }
+        }
+        Ok(())
     }
 
     /// Page the albums on the account's photos volume.

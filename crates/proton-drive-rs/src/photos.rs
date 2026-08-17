@@ -258,6 +258,62 @@ impl ProtonPhotosClient {
         self.drive.find_photo_duplicates(name, contents).await
     }
 
+    /// Batch [`find_duplicates`](Self::find_duplicates) over many photos the
+    /// caller has already hashed: each input is `(name, sha1_hex)` — the
+    /// lowercase-hex plaintext SHA-1 of that photo's contents — and the result
+    /// holds one match list per input, in input order.
+    ///
+    /// Prefer this when checking a whole library (a Google Takeout import): it
+    /// asks the duplicates endpoint about 150 names per request rather than one,
+    /// and never needs the photo bytes in memory.
+    pub async fn find_duplicates_many(
+        &self,
+        items: &[(String, String)],
+    ) -> Result<Vec<Vec<NodeUid>>> {
+        self.drive.find_photo_duplicates_many(items).await
+    }
+
+    /// Which of `names` an active photo on the volume already carries — the
+    /// name-hash-only prefilter in front of
+    /// [`find_duplicates_many`](Self::find_duplicates_many).
+    ///
+    /// A `true` means "there is a same-named photo, so hash this file and check
+    /// its content too"; a `false` is conclusive and saves reading the file at
+    /// all. Importing a photo library is mostly `false`s.
+    pub async fn name_collisions(&self, names: &[String]) -> Result<Vec<bool>> {
+        self.drive.photo_name_collisions(names).await
+    }
+
+    /// Create an album named `name` on the account's photos volume, returning
+    /// its [`NodeUid`].
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.createAlbum`) — C# has no
+    /// public album write API. Errors when the account has no photos volume;
+    /// the name is *not* deduplicated, so two albums may share a name unless the
+    /// caller checks [`enumerate_album_node_uids`](Self::enumerate_album_node_uids)
+    /// first.
+    pub async fn create_album(&self, name: &str) -> Result<NodeUid> {
+        self.drive.create_album(name).await
+    }
+
+    /// Add photos already on the album's volume to `album_uid`, one outcome per
+    /// input photo in input order (a photo that fails does not stop the others).
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.addPhotos`). The photos
+    /// stay in the timeline — an album membership re-encrypts a photo's name and
+    /// passphrase to the album key, it does not copy content. Related photos
+    /// (live-photo video, burst siblings) are sent alongside their main photo
+    /// because the server rejects the group otherwise. Photos on another volume
+    /// (from an album shared with us) need the unported `copyPhoto` path and
+    /// fail their own outcome.
+    pub async fn add_photos_to_album(
+        &self,
+        album_uid: &NodeUid,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        self.drive.add_photos_to_album(album_uid, photo_uids).await
+    }
+
     /// The albums on the account's photos volume, as [`NodeUid`]s.
     /// C# `ProtonPhotosClient.EnumerateAlbumNodeUidsAsync`. Empty when the
     /// account has no photos volume. Materialize with
@@ -356,6 +412,38 @@ mod tests {
         assert_eq!(parsed.photos[0].id.to_string(), "abc");
         assert_eq!(parsed.photos[0].capture_time, 1_700_000_000);
         assert_eq!(parsed.photos[1].content_hash.as_deref(), Some("ff"));
+    }
+
+    #[test]
+    fn album_creation_response_deserializes_server_shape() {
+        let raw = r#"{ "Album": { "Link": { "LinkID": "album-1" } } }"#;
+        let parsed: crate::dtos::AlbumCreationResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.album.link.link_id.to_string(), "album-1");
+    }
+
+    #[test]
+    fn add_photos_response_reports_missing_related_photos() {
+        // The per-link sub-responses of `albums/{lid}/add-multiple`: one plain
+        // success, one failure naming the related photos the server wants sent
+        // alongside the main one.
+        let raw = r#"{
+            "Responses": [
+                { "LinkID": "photo-1", "Response": { "Code": 1000 } },
+                { "LinkID": "photo-2", "Response": {
+                    "Code": 2000, "Error": "missing", "Details": { "Missing": ["photo-3"] }
+                } }
+            ]
+        }"#;
+        let parsed: crate::dtos::AddPhotosToAlbumResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.responses.len(), 2);
+        assert_eq!(parsed.responses[0].response.code, 1000);
+        assert!(parsed.responses[0].response.error.is_none());
+        let failed = &parsed.responses[1].response;
+        assert_eq!(failed.error.as_deref(), Some("missing"));
+        assert_eq!(
+            failed.details.as_ref().unwrap().missing[0].to_string(),
+            "photo-3"
+        );
     }
 
     #[test]
