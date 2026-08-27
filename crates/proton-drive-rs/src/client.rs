@@ -49,7 +49,8 @@ use crate::dtos::{
     AlbumCreationResponse, AlbumItemListResponse, AlbumListResponse, BlockCreationRequest,
     BlockDto, BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
     BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
-    CommonExtendedAttributes, ContextShareResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
+    CommonExtendedAttributes, ContextShareResponse, CopyPhotoContent, CopyPhotoRelatedItem,
+    CopyPhotoRequest, CopyPhotoResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
     CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
     DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
     DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
@@ -70,8 +71,8 @@ use crate::dtos::{
     SharedByMeResponse, SharedWithMeResponse, SmallFileUploadMetadataRequest,
     SmallRevisionUploadMetadataRequest, SmallUploadResponse, ThumbnailBlockListRequest,
     ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
-    UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
-    VolumeTrashResponse,
+    TransferPhotoLinkItem, TransferPhotosRequest, TransferPhotosResponse, UpdatePermissionsRequest,
+    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -5971,12 +5972,6 @@ impl ProtonDriveClient {
     }
 
     /// Re-encrypt one photo's name and passphrase to the album key.
-    ///
-    /// The passphrase is *rewrapped*, not re-encrypted from plaintext: only its
-    /// key packet changes recipient, so the locked node key still unlocks and
-    /// the original `NodePassphraseSignature` stays valid (which is why the
-    /// entry carries no signature of its own — TS sends one only for photos
-    /// whose key author is anonymous).
     async fn album_photo_entry(
         &self,
         uid: &NodeUid,
@@ -5985,6 +5980,36 @@ impl ProtonDriveClient {
         email: &str,
         signing_key: &PrivateKey,
     ) -> Result<AddPhotoToAlbumEntry> {
+        let payload = self
+            .photo_target_payload(uid, album_key, album_hash_key, email, signing_key)
+            .await?;
+        Ok(AddPhotoToAlbumEntry {
+            link_id: payload.uid.link_id,
+            name_hash: payload.name_hash,
+            name: payload.name,
+            name_signature_email: payload.name_signature_email,
+            passphrase: payload.passphrase,
+            content_hash: payload.content_hash,
+        })
+    }
+
+    /// Re-encrypt one photo's name, passphrase and hashes for a target node —
+    /// an album or the timeline root (C# `PhotosCrypto.EncryptPhotoForTarget`
+    /// via `PhotoTransferPayloadBuilder`, TS `preparePhotoPayload`).
+    ///
+    /// The passphrase is *rewrapped*, not re-encrypted from plaintext: only its
+    /// key packet changes recipient, so the locked node key still unlocks and
+    /// the original `NodePassphraseSignature` stays valid (which is why the
+    /// payload carries no signature of its own — both upstreams sign one only
+    /// for photos whose key author is anonymous).
+    async fn photo_target_payload(
+        &self,
+        uid: &NodeUid,
+        target_key: &PrivateKey,
+        target_hash_key: &[u8],
+        email: &str,
+        signing_key: &PrivateKey,
+    ) -> Result<PhotoTargetPayload> {
         let node = self
             .get_photos_node(uid)
             .await?
@@ -5996,7 +6021,7 @@ impl ProtonDriveClient {
         };
         let sha1 = content_sha1.clone().ok_or_else(|| {
             ProtonError::invalid_operation(format!(
-                "photo {uid} has no content digest; it cannot be added to an album"
+                "photo {uid} has no content digest; it cannot be re-encrypted for another node"
             ))
         })?;
 
@@ -6012,18 +6037,24 @@ impl ProtonDriveClient {
         let parent_key = self
             .resolve_parent_key_ctx(&uid.volume_id, link, true)
             .await?;
-        let passphrase = parent_key.rewrap_message_to(&link.passphrase, album_key)?;
+        let passphrase = parent_key.rewrap_message_to(&link.passphrase, target_key)?;
 
-        Ok(AddPhotoToAlbumEntry {
-            link_id: uid.link_id.clone(),
-            name_hash: hex::encode(hmac_sha256(album_hash_key, node.name.as_bytes())),
-            name: album_key.encrypt_and_sign(signing_key, node.name.as_bytes(), true, false)?,
+        Ok(PhotoTargetPayload {
+            uid: uid.clone(),
+            parent_uid: link
+                .parent_id
+                .clone()
+                .map(|parent_id| NodeUid::new(uid.volume_id.clone(), parent_id)),
+            original_name_hash: link.name_hash.clone(),
+            name_hash: hex::encode(hmac_sha256(target_hash_key, node.name.as_bytes())),
+            name: target_key.encrypt_and_sign(signing_key, node.name.as_bytes(), true, false)?,
             name_signature_email: email.to_string(),
             passphrase,
             content_hash: hex::encode(hmac_sha256(
-                album_hash_key,
+                target_hash_key,
                 sha1.to_ascii_lowercase().as_bytes(),
             )),
+            related: Vec::new(),
         })
     }
 
@@ -6093,6 +6124,360 @@ impl ProtonDriveClient {
             }
         }
         Ok(())
+    }
+
+    /// Copy photos into this account's own timeline, keeping them even after
+    /// the originals stop being shared. One outcome per input photo.
+    ///
+    /// Mirrors C# `PhotoOperations.SavePhotosToTimelineAsync` (itself the JS
+    /// `saveToTimeline`): a photo already on our photos volume is *moved* into
+    /// the timeline root via `PUT photos/volumes/{vid}/links/transfer-multiple`,
+    /// batched so no request carries more than ten links; a photo on another
+    /// volume — one from a shared-with-me album — is *copied* through
+    /// `POST volumes/{vid}/links/{lid}/copy`, one request each. Both re-encrypt
+    /// the photo's name and passphrase for the timeline root, related photos
+    /// included.
+    ///
+    /// When the server answers that the photo's group is incomplete it names
+    /// the related photos it wants; that photo is re-queued **once** with them
+    /// and only its second answer becomes an outcome. A photo already parented
+    /// to the timeline root fails its own outcome, as upstream reports it.
+    /// Outcome order therefore follows completion, not input.
+    pub(crate) async fn save_photos_to_timeline(
+        &self,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        /// Photos whose payloads are built before a round of requests goes out
+        /// (C# `SaveToTimelineBatchSize`).
+        const SAVE_BATCH: usize = 20;
+        /// Links — main photos plus related ones — per `transfer-multiple`
+        /// request (C# `MaxLinksPerTransferBatch`).
+        const MAX_LINKS_PER_TRANSFER: usize = 10;
+
+        let mut timer = self.telemetry.start("save_photos_to_timeline");
+        timer.attr("photo_count", photo_uids.len());
+        if photo_uids.is_empty() {
+            timer.success();
+            return Ok(Vec::new());
+        }
+
+        // The timeline root is the target for every photo, so a missing photos
+        // volume fails the whole call rather than each photo in turn.
+        if !self.ensure_photos().await? {
+            return Err(ProtonError::invalid_operation(
+                "this account has no photos volume to save photos to",
+            ));
+        }
+        let target_uid = self
+            .cache
+            .lock()
+            .await
+            .photos_root
+            .clone()
+            .expect("ensure_photos populated the photos root");
+        let target_key = self.folder_node_key(&target_uid).await?;
+        let target_hash_key = self
+            .parent_hash_key_ctx(&target_uid, &target_key, true)
+            .await?;
+        let (_address_id, email, signing_key) = self.photos_membership_address().await?;
+        let target = TimelineTarget {
+            uid: target_uid,
+            key: target_key,
+            hash_key: target_hash_key,
+            email,
+            signing_key,
+        };
+
+        let mut outcomes: Vec<(NodeUid, Result<()>)> = Vec::with_capacity(photo_uids.len());
+        // Each entry is a photo plus the related photos the server asked for on
+        // a previous attempt; `retried` is what keeps that a single retry.
+        let mut queue: VecDeque<(NodeUid, Vec<NodeUid>)> = photo_uids
+            .iter()
+            .cloned()
+            .map(|uid| (uid, Vec::new()))
+            .collect();
+        let mut retried: HashSet<NodeUid> = HashSet::new();
+
+        while !queue.is_empty() {
+            let mut same_volume: Vec<PhotoTargetPayload> = Vec::new();
+            let mut cross_volume: Vec<PhotoTargetPayload> = Vec::new();
+            for _ in 0..SAVE_BATCH {
+                let Some((uid, extra_related)) = queue.pop_front() else {
+                    break;
+                };
+                match self
+                    .timeline_photo_payload(&uid, &extra_related, &target)
+                    .await
+                {
+                    Ok(payload) if payload.uid.volume_id == target.uid.volume_id => {
+                        same_volume.push(payload)
+                    }
+                    Ok(payload) => cross_volume.push(payload),
+                    Err(error) => outcomes.push((uid, Err(error))),
+                }
+            }
+
+            // A photo and its related photos must not be split across requests,
+            // so the batch closes before the one that would overflow it.
+            let mut batch: Vec<PhotoTargetPayload> = Vec::new();
+            let mut links = 0usize;
+            for payload in same_volume {
+                let count = 1 + payload.related.len();
+                if !batch.is_empty() && links + count > MAX_LINKS_PER_TRANSFER {
+                    self.transfer_photos_to_timeline(
+                        &target,
+                        &batch,
+                        &mut queue,
+                        &mut retried,
+                        &mut outcomes,
+                    )
+                    .await?;
+                    batch.clear();
+                    links = 0;
+                }
+                links += count;
+                batch.push(payload);
+            }
+            if !batch.is_empty() {
+                self.transfer_photos_to_timeline(
+                    &target,
+                    &batch,
+                    &mut queue,
+                    &mut retried,
+                    &mut outcomes,
+                )
+                .await?;
+            }
+
+            for payload in cross_volume {
+                self.copy_photo_to_timeline(
+                    &target,
+                    &payload,
+                    &mut queue,
+                    &mut retried,
+                    &mut outcomes,
+                )
+                .await;
+            }
+        }
+
+        timer.success();
+        Ok(outcomes)
+    }
+
+    /// One photo's timeline payload: the photo itself plus its related photos,
+    /// re-encrypted for the timeline root (C#
+    /// `PhotoTransferPayloadBuilder.BuildPayloadsAsync`).
+    ///
+    /// `extra_related` are the ones the server demanded on a previous attempt,
+    /// merged with what the photo itself declares. A related photo that cannot
+    /// be built is skipped rather than failing its main photo, as upstream does.
+    async fn timeline_photo_payload(
+        &self,
+        uid: &NodeUid,
+        extra_related: &[NodeUid],
+        target: &TimelineTarget,
+    ) -> Result<PhotoTargetPayload> {
+        let mut payload = self
+            .photo_target_payload(
+                uid,
+                &target.key,
+                &target.hash_key,
+                &target.email,
+                &target.signing_key,
+            )
+            .await?;
+        if payload.parent_uid.as_ref() == Some(&target.uid) {
+            return Err(ProtonError::invalid_operation(format!(
+                "photo {uid} is already in the timeline"
+            )));
+        }
+
+        let node = self
+            .get_photos_node(uid)
+            .await?
+            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?;
+        let mut related: Vec<NodeUid> = node
+            .photo
+            .as_ref()
+            .map(|photo| photo.related_photo_uids.clone())
+            .unwrap_or_default();
+        for extra in extra_related {
+            if !related.contains(extra) {
+                related.push(extra.clone());
+            }
+        }
+
+        for related_uid in related {
+            if let Ok(related_payload) = self
+                .photo_target_payload(
+                    &related_uid,
+                    &target.key,
+                    &target.hash_key,
+                    &target.email,
+                    &target.signing_key,
+                )
+                .await
+            {
+                payload.related.push(related_payload);
+            }
+        }
+        Ok(payload)
+    }
+
+    /// Post one `transfer-multiple` batch and record an outcome for each of its
+    /// main photos (C# `TransferSameVolumeBatchAsync` + `RecordTransferOutcomes`).
+    async fn transfer_photos_to_timeline(
+        &self,
+        target: &TimelineTarget,
+        payloads: &[PhotoTargetPayload],
+        queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
+        retried: &mut HashSet<NodeUid>,
+        outcomes: &mut Vec<(NodeUid, Result<()>)>,
+    ) -> Result<()> {
+        /// `ResponseCode::Success` as it arrives inside a per-link sub-response.
+        const SUCCESS_CODE: i32 = 1000;
+
+        let mut links: Vec<TransferPhotoLinkItem> = Vec::new();
+        let mut sent: Vec<&PhotoTargetPayload> = Vec::new();
+        for payload in payloads {
+            // The endpoint matches each link on the hash it currently has, so a
+            // photo whose link carries none cannot be moved.
+            let items: Option<Vec<TransferPhotoLinkItem>> = std::iter::once(payload)
+                .chain(payload.related.iter())
+                .map(transfer_link_item)
+                .collect();
+            match items {
+                Some(items) => {
+                    links.extend(items);
+                    sent.push(payload);
+                }
+                None => outcomes.push((
+                    payload.uid.clone(),
+                    Err(ProtonError::invalid_operation(format!(
+                        "photo {} has no name hash on its current parent; it cannot be moved",
+                        payload.uid
+                    ))),
+                )),
+            }
+        }
+        if links.is_empty() {
+            return Ok(());
+        }
+
+        let path = format!(
+            "photos/volumes/{}/links/transfer-multiple",
+            target.uid.volume_id
+        );
+        let response: TransferPhotosResponse = self
+            .http
+            .put(
+                &path,
+                &TransferPhotosRequest {
+                    parent_link_id: target.uid.link_id.clone(),
+                    links,
+                    name_signature_email: target.email.clone(),
+                    signature_email: None,
+                },
+            )
+            .await?;
+
+        // Only the links the server reports on failed; a main photo without an
+        // entry succeeded, and a related photo's own failure is not reported
+        // (the incomplete-group case is keyed on the main link), exactly as C#
+        // and JS map it.
+        let mut failures: HashMap<String, (Vec<NodeUid>, ProtonError)> = HashMap::new();
+        for outcome in response.responses {
+            let body = &outcome.response;
+            if body.code == SUCCESS_CODE && body.error.is_none() {
+                continue;
+            }
+            let missing: Vec<NodeUid> = body
+                .details
+                .as_ref()
+                .map(|details| details.missing.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|link_id| NodeUid::new(target.uid.volume_id.clone(), link_id.clone()))
+                .collect();
+            let error = if missing.is_empty() {
+                ProtonError::invalid_operation(
+                    body.error
+                        .clone()
+                        .unwrap_or_else(|| format!("transfer failed with code {}", body.code)),
+                )
+            } else {
+                missing_related_photos_error(&missing)
+            };
+            failures.insert(outcome.link_id.to_string(), (missing, error));
+        }
+
+        for payload in sent {
+            let failure = failures.remove(&payload.uid.link_id.to_string());
+            record_timeline_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
+        }
+        Ok(())
+    }
+
+    /// Copy one photo that lives on another volume into the timeline (C#
+    /// `CopyCrossVolumePhotoAsync`, JS `copyPhoto`).
+    async fn copy_photo_to_timeline(
+        &self,
+        target: &TimelineTarget,
+        payload: &PhotoTargetPayload,
+        queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
+        retried: &mut HashSet<NodeUid>,
+        outcomes: &mut Vec<(NodeUid, Result<()>)>,
+    ) {
+        let path = format!(
+            "volumes/{}/links/{}/copy",
+            payload.uid.volume_id, payload.uid.link_id
+        );
+        let request = CopyPhotoRequest {
+            target_volume_id: target.uid.volume_id.clone(),
+            target_parent_link_id: target.uid.link_id.clone(),
+            name_hash: payload.name_hash.clone(),
+            name: payload.name.clone(),
+            name_signature_email: payload.name_signature_email.clone(),
+            passphrase: payload.passphrase.clone(),
+            passphrase_signature: None,
+            signature_email: None,
+            photos: CopyPhotoContent {
+                content_hash: payload.content_hash.clone(),
+                related_photos: payload
+                    .related
+                    .iter()
+                    .map(|related| CopyPhotoRelatedItem {
+                        link_id: related.uid.link_id.clone(),
+                        name_hash: related.name_hash.clone(),
+                        name: related.name.clone(),
+                        passphrase: related.passphrase.clone(),
+                        content_hash: related.content_hash.clone(),
+                    })
+                    .collect(),
+            },
+        };
+
+        let failure = match self
+            .http
+            .post::<_, CopyPhotoResponse>(&path, &request)
+            .await
+        {
+            Ok(_) => None,
+            // The incomplete-group answer arrives as an ordinary API error whose
+            // `Details.Missing` names the related photos on the *source* volume.
+            Err(ProtonError::Api(error)) => {
+                let missing = missing_related_links(&error, &payload.uid.volume_id);
+                let error = if missing.is_empty() {
+                    ProtonError::Api(error)
+                } else {
+                    missing_related_photos_error(&missing)
+                };
+                Some((missing, error))
+            }
+            Err(error) => Some((Vec::new(), error)),
+        };
+        record_timeline_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
     }
 
     /// Page the albums on the account's photos volume.
@@ -7589,6 +7974,101 @@ fn share_membership_from_dto(dto: &ShareMembershipSummaryDto) -> ShareMembership
     }
 }
 
+/// One `transfer-multiple` link item, or `None` when the photo's link carries
+/// no name hash for the parent it is leaving — the endpoint needs it to match.
+fn transfer_link_item(payload: &PhotoTargetPayload) -> Option<TransferPhotoLinkItem> {
+    Some(TransferPhotoLinkItem {
+        link_id: payload.uid.link_id.clone(),
+        name_hash: payload.name_hash.clone(),
+        original_name_hash: payload.original_name_hash.clone()?,
+        name: payload.name.clone(),
+        passphrase: payload.passphrase.clone(),
+        content_hash: payload.content_hash.clone(),
+        passphrase_signature: None,
+    })
+}
+
+/// The related photos an error envelope's `Details.Missing` names, on the volume
+/// the failing photo lives on (C# `MissingRelatedPhotosException`).
+fn missing_related_links(error: &ProtonApiError, volume_id: &VolumeId) -> Vec<NodeUid> {
+    error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("Missing"))
+        .and_then(|missing| missing.as_array())
+        .map(|missing| {
+            missing
+                .iter()
+                .filter_map(|link_id| link_id.as_str())
+                .map(|link_id| NodeUid::new(volume_id.clone(), LinkId::from(link_id.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn missing_related_photos_error(missing: &[NodeUid]) -> ProtonError {
+    let missing: Vec<String> = missing.iter().map(|uid| uid.to_string()).collect();
+    ProtonError::invalid_operation(format!(
+        "server wants related photos saved with it: {}",
+        missing.join(", ")
+    ))
+}
+
+/// Turn one photo's answer into an outcome, or re-queue it once when the server
+/// asked for its related photos (C# `PhotoOperations.RecordOutcome`). `failure`
+/// carries the related photos the server named, when it named any.
+fn record_timeline_outcome(
+    uid: NodeUid,
+    failure: Option<(Vec<NodeUid>, ProtonError)>,
+    queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
+    retried: &mut HashSet<NodeUid>,
+    outcomes: &mut Vec<(NodeUid, Result<()>)>,
+) {
+    match failure {
+        None => outcomes.push((uid, Ok(()))),
+        // `insert` is false once this photo has already been re-queued, which is
+        // what stops a server that keeps asking from looping forever.
+        Some((missing, _error)) if !missing.is_empty() && retried.insert(uid.clone()) => {
+            queue.push_back((uid, missing));
+        }
+        Some((_, error)) => outcomes.push((uid, Err(error))),
+    }
+}
+
+/// The timeline root and the keys photos are re-encrypted for on their way into
+/// it (C# `PhotoOperations.TimelineTarget`).
+struct TimelineTarget {
+    uid: NodeUid,
+    key: PrivateKey,
+    hash_key: Vec<u8>,
+    /// The photos share membership address: what signs the re-encrypted names.
+    email: String,
+    signing_key: PrivateKey,
+}
+
+/// One photo re-encrypted for a target node, plus its related photos (C#
+/// `TransferEncryptedPhotoPayload`). Feeds both the album `add-multiple` entries
+/// and the timeline transfer/copy requests, which all want the same ciphertext
+/// and hashes in slightly different wire shapes.
+#[derive(Debug, Clone)]
+struct PhotoTargetPayload {
+    uid: NodeUid,
+    /// Where the photo lives now — the timeline path rejects a photo already
+    /// parented to the target.
+    parent_uid: Option<NodeUid>,
+    /// The photo's name hash under its *current* parent's hash key, straight
+    /// from the link. Only the transfer endpoint needs it.
+    original_name_hash: Option<String>,
+    name_hash: String,
+    name: String,
+    name_signature_email: String,
+    passphrase: String,
+    content_hash: String,
+    /// Live-photo video and burst siblings, re-encrypted the same way. The
+    /// server refuses a photo whose group is incomplete.
+    related: Vec<PhotoTargetPayload>,
+}
+
 /// The Drive-owned items of one `v2/sharedwithme` page, in the order the API
 /// returned them.
 ///
@@ -7617,9 +8097,10 @@ mod tests {
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
         MAX_NODE_NAME_LENGTH, NodeAction, aggregate_outcomes, alternate_names, assemble_manifest,
         context_share_path, drive_items, epoch_to_iso8601, is_expired_upload_token,
-        is_listable_revision_state, is_upload_timeout, join_node_path, path_segments,
-        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
-        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
+        is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
+        path_segments, record_timeline_outcome, run_context_share_mutation,
+        share_membership_from_dto, small_upload_applicable, take_block_target,
+        take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
@@ -8270,5 +8751,88 @@ mod tests {
             "boom"
         )));
         assert!(!is_upload_timeout(&api_error(ResponseCode::Success, 504)));
+    }
+
+    #[test]
+    fn a_photo_the_server_wants_related_photos_for_is_requeued_once() {
+        let uid = NodeUid::new(VolumeId::new("vol"), LinkId::new("photo"));
+        let related = NodeUid::new(VolumeId::new("vol"), LinkId::new("related"));
+        let mut queue = std::collections::VecDeque::new();
+        let mut retried = std::collections::HashSet::new();
+        let mut outcomes = Vec::new();
+
+        let failure = || {
+            Some((
+                vec![related.clone()],
+                ProtonError::invalid_operation("missing"),
+            ))
+        };
+
+        // First answer: re-queued with the related photo, no outcome yet.
+        record_timeline_outcome(
+            uid.clone(),
+            failure(),
+            &mut queue,
+            &mut retried,
+            &mut outcomes,
+        );
+        assert_eq!(
+            queue.pop_front(),
+            Some((uid.clone(), vec![related.clone()]))
+        );
+        assert!(outcomes.is_empty());
+
+        // Second: the retry is spent, so it becomes a failed outcome instead of
+        // going round again.
+        record_timeline_outcome(
+            uid.clone(),
+            failure(),
+            &mut queue,
+            &mut retried,
+            &mut outcomes,
+        );
+        assert!(queue.is_empty());
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.is_err());
+    }
+
+    #[test]
+    fn a_photo_that_succeeds_records_one_successful_outcome() {
+        let uid = NodeUid::new(VolumeId::new("vol"), LinkId::new("photo"));
+        let mut queue = std::collections::VecDeque::new();
+        let mut retried = std::collections::HashSet::new();
+        let mut outcomes = Vec::new();
+
+        record_timeline_outcome(uid.clone(), None, &mut queue, &mut retried, &mut outcomes);
+
+        assert!(queue.is_empty());
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.is_ok());
+    }
+
+    #[test]
+    fn missing_related_links_reads_the_error_details() {
+        let volume_id = VolumeId::new("vol");
+        let error = ProtonApiError {
+            code: ResponseCode::InvalidRequirements,
+            http_status: 422,
+            message: "missing related photos".into(),
+            details: Some(serde_json::json!({ "Missing": ["a", "b"] })),
+        };
+
+        assert_eq!(
+            missing_related_links(&error, &volume_id),
+            vec![
+                NodeUid::new(volume_id.clone(), LinkId::new("a")),
+                NodeUid::new(volume_id.clone(), LinkId::new("b")),
+            ]
+        );
+
+        // An error that names nothing is an ordinary failure, not a retry.
+        let plain = ProtonApiError {
+            details: None,
+            ..error
+        };
+        assert!(missing_related_links(&plain, &volume_id).is_empty());
     }
 }

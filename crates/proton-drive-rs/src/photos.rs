@@ -15,10 +15,11 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 use proton_sdk::error::Result;
-use proton_sdk::ids::NodeUid;
+use proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_sdk::session::ProtonApiSession;
 
 use crate::client::ProtonDriveClient;
+use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, Thumbnail, ThumbnailType};
 
 /// One photos-timeline entry: a photo node and its capture time (epoch
@@ -359,6 +360,34 @@ impl ProtonPhotosClient {
         updates: &[PhotoTagsUpdate],
     ) -> Result<Vec<(NodeUid, Result<()>)>> {
         self.drive.update_photos(updates).await
+    }
+
+    /// Copy photos into this account's own timeline, keeping them even after
+    /// the originals stop being shared. One outcome per input photo.
+    ///
+    /// C# `ProtonPhotosClient.SavePhotosToTimelineAsync`: a photo already on our
+    /// photos volume is moved into the timeline root, one from another volume
+    /// (a shared-with-me album) is copied. Related photos travel with their main
+    /// photo. A photo already in the timeline fails its own outcome, and a photo
+    /// whose group the server reports as incomplete is retried once with the
+    /// related photos it named — so outcomes arrive in completion order, not
+    /// input order.
+    pub async fn save_photos_to_timeline(
+        &self,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        self.drive.save_photos_to_timeline(photo_uids).await
+    }
+
+    /// Drive events on a photos scope, from `cursor` onwards
+    /// (C# `ProtonPhotosClient.EnumerateEventsAsync`, which delegates to the
+    /// Drive client exactly as this does).
+    pub async fn enumerate_events(
+        &self,
+        scope: &DriveEventScopeId,
+        cursor: Option<&DriveEventId>,
+    ) -> Result<Vec<DriveEvent>> {
+        self.drive.enumerate_events(scope, cursor).await
     }
 
     /// [`update_photos`](Self::update_photos) as a stream: each photo's outcome

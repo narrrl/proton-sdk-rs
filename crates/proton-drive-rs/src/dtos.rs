@@ -413,32 +413,136 @@ pub struct AddPhotoToAlbumEntry {
 #[derive(Debug, Deserialize)]
 pub struct AddPhotosToAlbumResponse {
     #[serde(rename = "Responses", default)]
-    pub responses: Vec<AddPhotoToAlbumOutcome>,
+    pub responses: Vec<PhotoLinkOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AddPhotoToAlbumOutcome {
+pub struct PhotoLinkOutcome {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
     #[serde(rename = "Response")]
-    pub response: AddPhotoToAlbumOutcomeBody,
+    pub response: PhotoLinkOutcomeBody,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AddPhotoToAlbumOutcomeBody {
+pub struct PhotoLinkOutcomeBody {
     #[serde(rename = "Code", default)]
     pub code: i32,
     #[serde(rename = "Error", default)]
     pub error: Option<String>,
     /// Carries `Missing` — related photos the server demands alongside this one.
     #[serde(rename = "Details", default)]
-    pub details: Option<AddPhotoToAlbumOutcomeDetails>,
+    pub details: Option<PhotoLinkOutcomeDetails>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AddPhotoToAlbumOutcomeDetails {
+pub struct PhotoLinkOutcomeDetails {
     #[serde(rename = "Missing", default)]
     pub missing: Vec<LinkId>,
+}
+
+/// `PUT photos/volumes/{vid}/links/transfer-multiple` — move photos that
+/// already live on our own photos volume into another node on it (C#
+/// `PhotosApiClient.TransferPhotosAsync`, JS `transferPhotos`). Used to save
+/// photos into the timeline root; a main photo's related photos travel in the
+/// same `Links` list.
+#[derive(Debug, Serialize)]
+pub struct TransferPhotosRequest {
+    #[serde(rename = "ParentLinkID")]
+    pub parent_link_id: LinkId,
+    #[serde(rename = "Links")]
+    pub links: Vec<TransferPhotoLinkItem>,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+    /// Sent explicitly as null: the API wants it only for an anonymous node,
+    /// which this path never moves (C# sends the same explicit null).
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferPhotoLinkItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    /// Name hash under the *target's* hash key.
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    /// The photo's current name hash, under the hash key of the parent it is
+    /// moving out of — the server matches the link on it.
+    #[serde(rename = "OriginalHash")]
+    pub original_name_hash: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "ContentHash")]
+    pub content_hash: String,
+    /// As `SignatureEmail` above: anonymous nodes only.
+    #[serde(rename = "NodePassphraseSignature")]
+    pub passphrase_signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferPhotosResponse {
+    #[serde(rename = "Responses", default)]
+    pub responses: Vec<PhotoLinkOutcome>,
+}
+
+/// `POST volumes/{vid}/links/{lid}/copy` — copy a photo that lives on *another*
+/// volume (one shared with us) into our own (C# `PhotosApiClient.CopyPhotoAsync`,
+/// JS `copyPhoto`). Unlike the transfer endpoint this takes one photo per
+/// request, with its related photos nested in `Photos`.
+#[derive(Debug, Serialize)]
+pub struct CopyPhotoRequest {
+    #[serde(rename = "TargetVolumeID")]
+    pub target_volume_id: VolumeId,
+    #[serde(rename = "TargetParentLinkID")]
+    pub target_parent_link_id: LinkId,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(
+        rename = "NodePassphraseSignature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub passphrase_signature: Option<String>,
+    #[serde(rename = "SignatureEmail", skip_serializing_if = "Option::is_none")]
+    pub signature_email: Option<String>,
+    #[serde(rename = "Photos")]
+    pub photos: CopyPhotoContent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CopyPhotoContent {
+    #[serde(rename = "ContentHash")]
+    pub content_hash: String,
+    #[serde(rename = "RelatedPhotos")]
+    pub related_photos: Vec<CopyPhotoRelatedItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CopyPhotoRelatedItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(rename = "ContentHash")]
+    pub content_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CopyPhotoResponse {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
 }
 
 /// `POST`/`DELETE photos/volumes/{vid}/links/{lid}/tags` (C# `PhotoTagsRequest`).

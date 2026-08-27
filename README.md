@@ -302,7 +302,8 @@ neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
 | | Shared Photos | ✅ | Photos/albums shared *with* us (`enumerate_shared_with_me_node_uids`, `enumerate_shared_with_me_album_uids`) and by us (`enumerate_shared_node_uids`). |
 | | Duplicate Detection | ✅ | `find_duplicates` matches candidates on name/content HMAC before re-uploading. |
 | | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported (upstream `03b1cb7f`). |
-| | Album Writes | ❌ | Creating albums and adding/removing photos — no C# public API upstream either. |
+| | Save to Timeline | ✅ | `save_photos_to_timeline` moves photos already on our photos volume into the timeline root and copies cross-volume ones (from albums shared with us). |
+| | Album Writes | ⚠️ | `create_album` and `add_photos_to_album` are ported from the TypeScript SDK (C# has no public album write API); album rename, cover photo and delete are not. |
 | | Photos Volume Create| ❌ | Volume creation is not yet ported. |
 | **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`, or `with_entity_repository` to chain one onto a `with_key_salts` client); keys/secrets remain strictly in memory. Retained deliberately — upstream C# removed its entity cache. |
 | **Validation** | Node Names | ✅ | Empty or >255-char names are rejected client-side before create/rename (counted in `char`s; C# counts UTF-16 units). |
