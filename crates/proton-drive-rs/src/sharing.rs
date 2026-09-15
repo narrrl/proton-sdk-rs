@@ -5,12 +5,13 @@
 //! expose; the behavior is ported from the TypeScript SDK (`internal/sharing`).
 //! Reading shared-with-me nodes and leaving them lives on the client already.
 
+use proton_sdk::crypto::VerificationStatus;
 use proton_sdk::ids::{NodeUid, ShareId, ShareMembershipId};
 use serde::{Deserialize, Serialize};
 
 /// A sharing permission role. The wire form is a permissions bitmask
 /// (`Read = 4`, `Write = 2`, `Admin = 16`); Proton only uses three combinations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberRole {
     /// Read-only (`4`).
     Viewer,
@@ -87,6 +88,21 @@ pub struct ShareMembership {
     /// The raw permissions bitmask, kept so an unrecognised value can still be
     /// logged or round-tripped rather than being flattened into a role.
     pub permissions: i32,
+    /// When the node was shared with us, epoch seconds (C# `Membership.InviteTime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_time: Option<i64>,
+    /// Who *claims* to have shared it. Trust it only as far as
+    /// [`inviter_verification`](Self::inviter_verification) says — C# hands this
+    /// back as a `SignatureVerificationError` carrying the claimed author when
+    /// the invitation signature does not check out (possibly forged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_email: Option<String>,
+    /// The inviter's `drive.share-member.inviter` signature over our share
+    /// passphrase key packet, checked against the claimed inviter's keys
+    /// (C# `NodeCrypto.VerifyMembershipInviter`). Non-fatal metadata; `None` on
+    /// a membership persisted before the check existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_verification: Option<VerificationStatus>,
 }
 
 impl ShareMembership {
@@ -282,6 +298,9 @@ mod tests {
             share_id: "s1".into(),
             membership_id: "m1".into(),
             permissions,
+            invite_time: None,
+            inviter_email: None,
+            inviter_verification: None,
         };
 
         let editor = membership(6);
@@ -306,6 +325,9 @@ mod tests {
             share_id: "share-1".into(),
             membership_id: "member-1".into(),
             permissions: 22,
+            invite_time: None,
+            inviter_email: None,
+            inviter_verification: None,
         };
         let json = serde_json::to_value(&membership).unwrap();
         assert_eq!(

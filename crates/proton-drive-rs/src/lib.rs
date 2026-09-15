@@ -56,8 +56,8 @@ pub use event_manager::{
 };
 pub use events::{DriveEvent, DriveEventScopeId};
 pub use node::{
-    AlbumProperties, FileThumbnail, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail,
-    ThumbnailType,
+    AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoProperties, RevisionState,
+    Thumbnail, ThumbnailType,
 };
 pub use photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,

@@ -324,7 +324,7 @@ pub(crate) fn sign_detached(signer: &PrivateKey, data: &[u8]) -> Result<String, 
 /// separation (`context@proton.ch`, critical). Proton signs sharing invitations,
 /// members and external invitations under distinct contexts so a signature made
 /// for one purpose cannot be replayed as another.
-const SIGNATURE_CONTEXT_NOTATION: &[u8] = b"context@proton.ch";
+pub(crate) const SIGNATURE_CONTEXT_NOTATION: &[u8] = b"context@proton.ch";
 
 /// Like [`sign_detached`] but stamps a GopenPGP signature *context* — a critical
 /// `context@proton.ch` notation — into the hashed subpackets, and returns the

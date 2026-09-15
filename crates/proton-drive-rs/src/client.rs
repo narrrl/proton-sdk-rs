@@ -20,10 +20,11 @@ use proton_sdk::api::ResponseCode;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
-    ContentKey, DEFAULT_BIT_LENGTH, VerificationKeyRing, VerificationStatus, accept_invitation,
-    build_standard_share_material, build_volume_creation_material, decrypt_armored_with_keys,
-    derive_key_passphrase, encrypt_external_invitation, encrypt_invitation, generate_node_hash_key,
-    generate_node_key, generate_node_key_aead, generate_verifier, verify_detached,
+    ContentKey, DEFAULT_BIT_LENGTH, SHARING_INVITER_CONTEXT, VerificationKeyRing,
+    VerificationStatus, accept_invitation, build_standard_share_material,
+    build_volume_creation_material, decrypt_armored_with_keys, derive_key_passphrase,
+    encrypt_external_invitation, encrypt_invitation, generate_node_hash_key, generate_node_key,
+    generate_node_key_aead, generate_verifier, verify_detached, verify_detached_with_context,
 };
 use proton_sdk::error::{ProtonApiError, ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
@@ -76,8 +77,8 @@ use crate::dtos::{
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
-    AlbumProperties, FileThumbnail, Node, NodeKind, PhotoProperties, RevisionState, Thumbnail,
-    ThumbnailType,
+    AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoProperties, RevisionState,
+    Thumbnail, ThumbnailType,
 };
 use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
@@ -2637,7 +2638,14 @@ impl ProtonDriveClient {
         let (_address_id, email, signing_key) = self.membership_address().await?;
 
         let parts = self
-            .build_move_parts(uid, &link, &dest_parent_key, &dest_hash_key, &signing_key)
+            .build_move_parts(
+                uid,
+                &link,
+                None,
+                &dest_parent_key,
+                &dest_hash_key,
+                &signing_key,
+            )
             .await?;
 
         let request = MoveLinkRequest {
@@ -2645,12 +2653,14 @@ impl ProtonDriveClient {
             passphrase: parts.passphrase,
             // The rewrap preserves the plaintext, so the existing detached
             // signature stays valid and is not re-sent (C# `MoveSingleAsync`
-            // sends `PassphraseSignature = null` for non-anonymous nodes; only
-            // an anonymous move re-signs). Passing the link's own value back is
-            // wrong: the API returns it as an empty string for these nodes, and
-            // a serialized empty `NodePassphraseSignature` is rejected 400
-            // "should not be empty" — the batch path already hardcodes `None`.
-            passphrase_signature: None,
+            // sends `PassphraseSignature = null` for signed nodes). Passing the
+            // link's own value back is wrong: the API returns it as an empty
+            // string for these nodes, and a serialized empty
+            // `NodePassphraseSignature` is rejected 400 "should not be empty".
+            // An anonymously signed node has no signer to keep, so the mover
+            // signs its passphrase and names itself as `SignatureEmail`.
+            signature_email: parts.anonymous_signature.as_ref().map(|_| email.clone()),
+            passphrase_signature: parts.anonymous_signature,
             name: parts.encrypted_name,
             name_signature_email: email,
             name_hash: parts.name_hash,
@@ -2668,22 +2678,18 @@ impl ProtonDriveClient {
         Ok(())
     }
 
-    /// Move several nodes under a single destination parent in one batched
-    /// request. Mirrors C# `ProtonDriveClient.MoveNodesAsync` /
-    /// `NodeOperations.MoveMultipleAsync` (`PUT volumes/{vid}/links/move-multiple`,
-    /// note: no `v2/` prefix — upstream still runs a per-node loop here and
-    /// FIXMEs the batch endpoint we already use). Same-volume only — cross-volume
-    /// is rejected, matching the C# batch path, which also throws for differing
-    /// volumes. Each node's passphrase is rewrapped to the destination key and its
-    /// name re-encrypted + signed, exactly as the single [`move_node`]. Batched in
-    /// chunks of [`MAX_BATCH_COUNT`]. Live validation pending.
+    /// Move several nodes under a single destination parent, keeping their
+    /// names. Collects [`move_nodes_streaming`](Self::move_nodes_streaming) —
+    /// see it for batching, retries and anonymously signed nodes. Mirrors C#
+    /// `ProtonDriveClient.MoveNodesAsync` (`PUT volumes/{vid}/links/move-multiple`,
+    /// no `v2/` prefix). Same-volume only. Live validation pending.
     ///
-    /// One outcome per input uid, in input order, like C#'s
-    /// `IReadOnlyDictionary<NodeUid, Result<Exception>>`: a node that fails —
+    /// One outcome per input uid, in input order: a node that fails —
     /// cross-volume, unknown link, crypto, or a per-link error code in the batch
-    /// envelope — does not stop the others. The outer `Err` is reserved for
-    /// failures that make the whole call impossible (destination key, hash key,
-    /// signing address, link lookup).
+    /// envelope — does not stop the others, and a uid listed twice is moved once
+    /// with both positions reporting that outcome. The outer `Err` is reserved
+    /// for failures that make the whole call impossible (destination key, hash
+    /// key, signing address, link lookup).
     pub async fn move_nodes(
         &self,
         uids: &[NodeUid],
@@ -2691,168 +2697,39 @@ impl ProtonDriveClient {
     ) -> Result<Vec<(NodeUid, Result<()>)>> {
         let mut timer = self.telemetry.start("move_nodes");
         timer.attr("node_count", uids.len());
-        if uids.is_empty() {
-            timer.success();
-            return Ok(Vec::new());
-        }
 
-        // Cross-volume nodes never reach the request — C# `MoveSingleAsync` throws
-        // for them, and here that throw is one node's outcome, not the call's.
-        let cross_volume: Vec<bool> = uids
+        let mut seen: HashSet<&NodeUid> = HashSet::with_capacity(uids.len());
+        let items: Vec<NodeMoveItem> = uids
             .iter()
-            .map(|uid| uid.volume_id != new_parent.volume_id)
-            .collect();
-
-        // Each remaining link is moved once even if the caller listed it twice;
-        // every position sharing it reports the same outcome below.
-        let mut seen: HashSet<LinkId> = HashSet::with_capacity(uids.len());
-        let mut targets: Vec<LinkId> = Vec::with_capacity(uids.len());
-        for (uid, &skip) in uids.iter().zip(&cross_volume) {
-            if !skip && seen.insert(uid.link_id.clone()) {
-                targets.push(uid.link_id.clone());
-            }
-        }
-
-        let mut link_outcomes: HashMap<LinkId, Result<()>> = HashMap::with_capacity(targets.len());
-        if !targets.is_empty() {
-            let dest_parent_key = self.folder_node_key(new_parent).await?;
-            let dest_hash_key = self.parent_hash_key(new_parent, &dest_parent_key).await?;
-            let (_address_id, email, signing_key) = self.membership_address().await?;
-
-            // Resolve every node's link details once (all share the destination
-            // volume), keyed by link id so each chunk can look its node up.
-            let mut links: HashMap<LinkId, LinkDto> = HashMap::with_capacity(targets.len());
-            for chunk in targets.chunks(MAX_BATCH_COUNT) {
-                let details = self.get_link_details(&new_parent.volume_id, chunk).await?;
-                for detail in details.links {
-                    links.insert(detail.link.id.clone(), detail.link);
-                }
-            }
-
-            for chunk in targets.chunks(MAX_BATCH_COUNT) {
-                let mut items = Vec::with_capacity(chunk.len());
-                // The links this request actually carries, so the per-link
-                // responses can be routed back.
-                let mut sent: Vec<LinkId> = Vec::with_capacity(chunk.len());
-                for link_id in chunk {
-                    let uid = NodeUid::new(new_parent.volume_id.clone(), link_id.clone());
-                    let Some(link) = links.get(link_id) else {
-                        link_outcomes.insert(
-                            link_id.clone(),
-                            Err(ProtonError::invalid_operation(format!(
-                                "node {uid} not found"
-                            ))),
-                        );
-                        continue;
-                    };
-                    let parts = match self
-                        .build_move_parts(
-                            &uid,
-                            link,
-                            &dest_parent_key,
-                            &dest_hash_key,
-                            &signing_key,
-                        )
-                        .await
-                    {
-                        Ok(parts) => parts,
-                        Err(e) => {
-                            link_outcomes.insert(link_id.clone(), Err(e));
-                            continue;
-                        }
-                    };
-                    items.push(MoveMultipleLinksItem {
-                        link_id: link_id.clone(),
-                        name: parts.encrypted_name,
-                        passphrase: parts.passphrase,
-                        name_hash: parts.name_hash,
-                        original_hash: parts.original_hash,
-                        // The rewrap preserves the plaintext; the existing detached
-                        // passphrase signature stays valid, so none is re-sent (C#
-                        // omits it for non-anonymous nodes).
-                        passphrase_signature: None,
-                    });
-                    sent.push(link_id.clone());
-                }
-                if items.is_empty() {
-                    continue;
-                }
-
-                let request = MoveMultipleLinksRequest {
-                    parent_link_id: new_parent.link_id.clone(),
-                    links: items,
-                    name_signature_email: email.clone(),
-                    signature_email: None,
-                };
-                let path = format!("volumes/{}/links/move-multiple", new_parent.volume_id);
-                let client = self.clone();
-                let result = run_context_share_mutation(
-                    self.context_share_gate.clone(),
-                    self.cache.clone(),
-                    async move { client.http.put(&path, &request).await },
-                )
-                .await;
-                let response: AggregateLinksResponse = match result {
-                    Ok(response) => response,
-                    Err(e) => {
-                        // The chunk failed as a whole; charge it to every node it
-                        // carried and keep going with the remaining chunks, so one
-                        // bad chunk cannot mask the rest (C#'s per-node loop never
-                        // stops early either).
-                        let message = e.to_string();
-                        for link_id in sent {
-                            link_outcomes.insert(
-                                link_id,
-                                Err(ProtonError::invalid_operation(message.clone())),
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                let mut per_link: HashMap<LinkId, Result<()>> =
-                    aggregate_outcomes(response).into_iter().collect();
-                for link_id in sent {
-                    let outcome = per_link.remove(&link_id).unwrap_or_else(|| {
-                        Err(ProtonError::invalid_operation(format!(
-                            "move returned no response for link {link_id}"
-                        )))
-                    });
-                    link_outcomes.insert(link_id, outcome);
-                }
-            }
-        }
-
-        // A repeated uid cannot take the owned `Result` twice, so keep each
-        // link's error text to rebuild the outcome for its later positions.
-        let repeats: HashMap<LinkId, Option<String>> = link_outcomes
-            .iter()
-            .map(|(link_id, outcome)| {
-                (
-                    link_id.clone(),
-                    outcome.as_ref().err().map(|e| e.to_string()),
-                )
+            .filter(|uid| seen.insert(*uid))
+            .map(|uid| NodeMoveItem {
+                uid: uid.clone(),
+                target_name: None,
             })
             .collect();
+        let mut outcomes: HashMap<NodeUid, Result<()>> = self
+            .move_nodes_streaming(items, new_parent.clone())
+            .try_collect()
+            .await?;
 
+        // A repeated uid cannot take the owned `Result` twice, so keep each
+        // node's error text to rebuild the outcome for its later positions.
+        let mut repeats: HashMap<&NodeUid, Option<String>> = HashMap::new();
         let results: Vec<(NodeUid, Result<()>)> = uids
             .iter()
-            .zip(&cross_volume)
-            .map(|(uid, &skip)| {
-                let outcome = if skip {
-                    Err(ProtonError::invalid_operation(
-                        "cross-volume move is not supported",
-                    ))
-                } else if let Some(outcome) = link_outcomes.remove(&uid.link_id) {
-                    outcome
-                } else {
-                    match repeats.get(&uid.link_id) {
+            .map(|uid| {
+                let outcome = match outcomes.remove(uid) {
+                    Some(outcome) => {
+                        repeats.insert(uid, outcome.as_ref().err().map(|e| e.to_string()));
+                        outcome
+                    }
+                    None => match repeats.get(uid) {
                         Some(None) => Ok(()),
                         Some(Some(message)) => Err(ProtonError::invalid_operation(message.clone())),
                         None => Err(ProtonError::invalid_operation(format!(
                             "move produced no outcome for node {uid}"
                         ))),
-                    }
+                    },
                 };
                 (uid.clone(), outcome)
             })
@@ -2865,15 +2742,273 @@ impl ProtonDriveClient {
         Ok(results)
     }
 
-    /// Build the per-node move crypto shared by [`move_node`] and [`move_nodes`]:
-    /// resolve the source parent, rewrap the passphrase to `dest_parent_key`,
-    /// re-encrypt + sign the name to the destination, and compute the new name
-    /// hash (under `dest_hash_key`) and the original hash (under the source
-    /// parent's hash key). Mirrors the body of C# `MoveSingleAsync`.
+    /// Move nodes under one parent — renaming each on the way when its
+    /// [`NodeMoveItem::target_name`] says so — yielding every node's outcome as
+    /// the batch carrying it comes back. Mirrors C#
+    /// `NodeMoveOperation.MoveMultipleAsync` (upstream `5cbbb0ad`, streamed since
+    /// `e33712b9`). Live validation pending.
+    ///
+    /// - Batches hold at most [`MAX_BATCH_COUNT`] links and never mix
+    ///   anonymously signed nodes with signed ones: an anonymous node's
+    ///   passphrase is signed afresh by the mover, and the request's
+    ///   `SignatureEmail` then names the mover for every link in it.
+    /// - A link rejected with `InvalidRequirements` (2000) — the `OriginalHash`
+    ///   sent no longer matches — is retried once with the name hash the server
+    ///   holds, provided the node still sits under the parent, with the name, the
+    ///   move was prepared against. Otherwise it fails as out of sync.
+    /// - Per-node failures are outcomes: cross-volume, an invalid target name, a
+    ///   link that does not exist, crypto, a per-link error code (kept as
+    ///   [`ProtonError::Api`], so `AlreadyExists`, `TooManyChildren` and the rest
+    ///   stay matchable). A batch whose request fails outright charges that to
+    ///   every node it carried, and the stream carries on.
+    /// - The outer `Err` ends the stream: the move could not start at all
+    ///   (destination key, hash key, signing address, link lookup).
+    ///
+    /// Outcome order follows completion, not input. A uid listed twice is moved
+    /// once; its second entry gets an error of its own.
+    pub fn move_nodes_streaming<'a>(
+        &'a self,
+        items: Vec<NodeMoveItem>,
+        new_parent: NodeUid,
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        stream::once(self.prepare_moves(items, new_parent)).flat_map(move |prepared| match prepared
+        {
+            Ok(run) => self.submit_moves(run).left_stream(),
+            Err(e) => stream::iter([Err(e)]).right_stream(),
+        })
+    }
+
+    /// Validate, look up and encrypt every move up front; what fails here is
+    /// already an outcome.
+    async fn prepare_moves(&self, items: Vec<NodeMoveItem>, parent: NodeUid) -> Result<MoveRun> {
+        let mut outcomes = VecDeque::new();
+        let mut seen: HashSet<LinkId> = HashSet::with_capacity(items.len());
+        let mut targets = Vec::with_capacity(items.len());
+        for item in items {
+            let rejected = if item.uid.volume_id != parent.volume_id {
+                Some(ProtonError::invalid_operation(
+                    "cross-volume move is not supported",
+                ))
+            } else if let Some(Err(e)) = item.target_name.as_deref().map(validate_node_name) {
+                Some(e)
+            } else if !seen.insert(item.uid.link_id.clone()) {
+                Some(ProtonError::invalid_operation(format!(
+                    "node {} is listed more than once in one move",
+                    item.uid
+                )))
+            } else {
+                None
+            };
+            match rejected {
+                Some(e) => outcomes.push_back((item.uid, Err(e))),
+                None => targets.push(item),
+            }
+        }
+
+        let mut run = MoveRun {
+            parent,
+            email: String::new(),
+            queue: VecDeque::with_capacity(targets.len()),
+            outcomes,
+        };
+        if targets.is_empty() {
+            return Ok(run);
+        }
+
+        let dest_parent_key = self.folder_node_key(&run.parent).await?;
+        let dest_hash_key = self.parent_hash_key(&run.parent, &dest_parent_key).await?;
+        let (_address_id, email, signing_key) = self.membership_address().await?;
+        run.email = email;
+
+        let link_ids: Vec<LinkId> = targets
+            .iter()
+            .map(|item| item.uid.link_id.clone())
+            .collect();
+        let mut links: HashMap<LinkId, LinkDto> = HashMap::with_capacity(link_ids.len());
+        for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
+            let details = self.get_link_details(&run.parent.volume_id, chunk).await?;
+            for detail in details.links {
+                links.insert(detail.link.id.clone(), detail.link);
+            }
+        }
+
+        for item in targets {
+            let Some(link) = links.get(&item.uid.link_id) else {
+                let error = ProtonError::invalid_operation(format!("node {} not found", item.uid));
+                run.outcomes.push_back((item.uid, Err(error)));
+                continue;
+            };
+            let parts = match self
+                .build_move_parts(
+                    &item.uid,
+                    link,
+                    item.target_name.as_deref(),
+                    &dest_parent_key,
+                    &dest_hash_key,
+                    &signing_key,
+                )
+                .await
+            {
+                Ok(parts) => parts,
+                Err(e) => {
+                    run.outcomes.push_back((item.uid, Err(e)));
+                    continue;
+                }
+            };
+            run.queue.push_back(PreparedMove {
+                item: MoveMultipleLinksItem {
+                    link_id: item.uid.link_id.clone(),
+                    name: parts.encrypted_name,
+                    passphrase: parts.passphrase,
+                    name_hash: parts.name_hash,
+                    original_hash: parts.original_hash,
+                    passphrase_signature: parts.anonymous_signature.clone(),
+                },
+                anonymous: parts.anonymous_signature.is_some(),
+                source_parent: link.parent_id.clone(),
+                current_name: parts.current_name,
+                retried: false,
+                uid: item.uid,
+            });
+        }
+        Ok(run)
+    }
+
+    /// Send the prepared moves batch by batch, reporting as each lands.
+    fn submit_moves<'a>(
+        &'a self,
+        run: MoveRun,
+    ) -> impl futures::Stream<Item = Result<(NodeUid, Result<()>)>> + 'a {
+        stream::unfold(run, move |mut run| async move {
+            loop {
+                if let Some(outcome) = run.outcomes.pop_front() {
+                    return Some((Ok(outcome), run));
+                }
+                let batch = take_move_batch(&mut run.queue);
+                if batch.is_empty() {
+                    return None;
+                }
+                self.submit_move_batch(&mut run, batch).await;
+            }
+        })
+    }
+
+    async fn submit_move_batch(&self, run: &mut MoveRun, batch: Vec<PreparedMove>) {
+        let anonymous = batch.first().is_some_and(|prepared| prepared.anonymous);
+        let request = MoveMultipleLinksRequest {
+            parent_link_id: run.parent.link_id.clone(),
+            links: batch.iter().map(|prepared| prepared.item.clone()).collect(),
+            name_signature_email: run.email.clone(),
+            signature_email: anonymous.then(|| run.email.clone()),
+        };
+        let path = format!("volumes/{}/links/move-multiple", run.parent.volume_id);
+        let client = self.clone();
+        let result: Result<AggregateLinksResponse> = run_context_share_mutation(
+            self.context_share_gate.clone(),
+            self.cache.clone(),
+            async move { client.http.put(&path, &request).await },
+        )
+        .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(e) => {
+                // The batch failed as a whole; charge it to every node it
+                // carried and keep going, so one bad batch cannot mask the rest.
+                // An API error keeps its code on every node: a one-link batch
+                // rejected as a whole is how a name collision usually arrives,
+                // and callers branch on that code.
+                for prepared in batch {
+                    let error = match &e {
+                        ProtonError::Api(api) => ProtonError::Api(api.clone()),
+                        other => ProtonError::invalid_operation(other.to_string()),
+                    };
+                    run.outcomes.push_back((prepared.uid, Err(error)));
+                }
+                return;
+            }
+        };
+
+        let mut per_link: HashMap<LinkId, Result<()>> =
+            aggregate_outcomes(response).into_iter().collect();
+        for mut prepared in batch {
+            match per_link.remove(&prepared.uid.link_id) {
+                Some(Err(ProtonError::Api(error)))
+                    if error.code == ResponseCode::InvalidRequirements && !prepared.retried =>
+                {
+                    match self.remote_original_hash(&prepared).await {
+                        Ok(hash) => {
+                            prepared.item.original_hash = hash;
+                            prepared.retried = true;
+                            run.queue.push_back(prepared);
+                        }
+                        Err(e) => run.outcomes.push_back((prepared.uid, Err(e))),
+                    }
+                }
+                Some(outcome) => run.outcomes.push_back((prepared.uid, outcome)),
+                None => {
+                    let error = ProtonError::invalid_operation(format!(
+                        "move returned no response for node {}",
+                        prepared.uid
+                    ));
+                    run.outcomes.push_back((prepared.uid, Err(error)));
+                }
+            }
+        }
+    }
+
+    /// The name hash the server holds for a node whose move it rejected as out
+    /// of date (C# `PrepareItemWithRemoteNameDigestAsync`). Only a node still
+    /// under the parent, and with the name, the move was prepared against
+    /// qualifies: anything else changed underneath the move, and retrying would
+    /// undo that change.
+    async fn remote_original_hash(&self, prepared: &PreparedMove) -> Result<String> {
+        let out_of_sync = || {
+            ProtonError::invalid_operation(format!(
+                "node {} changed while it was being moved",
+                prepared.uid
+            ))
+        };
+        let details = self
+            .get_link_details(
+                &prepared.uid.volume_id,
+                std::slice::from_ref(&prepared.uid.link_id),
+            )
+            .await?;
+        let link = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ProtonError::invalid_operation(format!("node {} not found", prepared.uid))
+            })?
+            .link;
+        let (Some(parent_id), Some(hash)) = (&link.parent_id, &link.name_hash) else {
+            return Err(out_of_sync());
+        };
+        if Some(parent_id) != prepared.source_parent.as_ref() || hash.is_empty() {
+            return Err(out_of_sync());
+        }
+        let parent_uid = NodeUid::new(prepared.uid.volume_id.clone(), parent_id.clone());
+        let parent_key = self.folder_node_key(&parent_uid).await?;
+        if parent_key.decrypt_armored_message(&link.name)? != prepared.current_name {
+            return Err(out_of_sync());
+        }
+        Ok(hash.clone())
+    }
+
+    /// Build the per-node move crypto shared by [`move_node`] and
+    /// [`move_nodes_streaming`]: resolve the source parent, rewrap the passphrase
+    /// to `dest_parent_key`, encrypt + sign the name (`target_name`, else the
+    /// current one) to the destination, and compute the new name hash (under
+    /// `dest_hash_key`) and the original hash (under the source parent's hash
+    /// key). An anonymously signed node also gets its passphrase signed by
+    /// `signing_key`, as C# does from `PassphraseForAnonymousMove`. Mirrors the
+    /// body of C# `MoveSingleAsync` / `NodeMoveOperation.TryPrepareItemAsync`.
     async fn build_move_parts(
         &self,
         uid: &NodeUid,
         link: &LinkDto,
+        target_name: Option<&str>,
         dest_parent_key: &PrivateKey,
         dest_hash_key: &[u8],
         signing_key: &PrivateKey,
@@ -2888,20 +3023,30 @@ impl ProtonDriveClient {
         let source_hash_key = self
             .parent_hash_key(&source_parent_uid, &source_parent_key)
             .await?;
-        let name = source_parent_key.decrypt_armored_message(&link.name)?;
+        let current_name = source_parent_key.decrypt_armored_message(&link.name)?;
         let original_hash = self
             .original_name_hash(uid, link, &source_parent_key, &source_hash_key)
             .await?;
 
         let passphrase = source_parent_key.rewrap_message_to(&link.passphrase, dest_parent_key)?;
-        let encrypted_name = dest_parent_key.encrypt_and_sign(signing_key, &name, true, false)?;
-        let name_hash = hex::encode(hmac_sha256(dest_hash_key, &name));
+        let anonymous_signature = if link.signature_email.as_deref().is_none_or(str::is_empty) {
+            let plaintext = source_parent_key.decrypt_armored_message(&link.passphrase)?;
+            Some(signing_key.sign_detached(&plaintext)?)
+        } else {
+            None
+        };
+
+        let name = target_name.map_or(current_name.as_slice(), str::as_bytes);
+        let encrypted_name = dest_parent_key.encrypt_and_sign(signing_key, name, true, false)?;
+        let name_hash = hex::encode(hmac_sha256(dest_hash_key, name));
 
         Ok(MoveParts {
             passphrase,
             encrypted_name,
             name_hash,
             original_hash,
+            anonymous_signature,
+            current_name,
         })
     }
 
@@ -7246,6 +7391,19 @@ impl ProtonDriveClient {
             }
         };
 
+        // C# `DtoToMetadataConverter.BuildMembershipInfoAsync`: everything on
+        // our own volumes is ours to administer; elsewhere the role is the
+        // membership's, and a node below the shared root inherits.
+        let direct_role = if self.is_own_volume(volume_id).await {
+            MemberRole::Admin
+        } else {
+            MemberRole::from_permissions(details.membership.as_ref().map(|m| m.permissions))
+        };
+        let membership = match &details.membership {
+            Some(dto) => Some(self.verified_membership(dto).await),
+            None => None,
+        };
+
         // C# `DtoToMetadataConverter`: the `Sharing` block's presence marks the
         // node as shared; a `ShareURLID` inside it marks it as publicly shared.
         let node = Node {
@@ -7264,7 +7422,12 @@ impl ProtonDriveClient {
             signature_email: link.signature_email.clone(),
             // Present only when the node is shared *with* us; it is what says
             // whether we may write to it.
-            membership: details.membership.as_ref().map(share_membership_from_dto),
+            membership,
+            direct_role: Some(direct_role),
+            share_id: details
+                .sharing
+                .as_ref()
+                .map(|sharing| sharing.share_id.clone()),
             photo,
             album,
             verification,
@@ -7333,6 +7496,63 @@ impl ProtonDriveClient {
         }
         let current_name = parent_key.decrypt_armored_message(&link.name)?;
         Ok(hex::encode(hmac_sha256(parent_hash_key, &current_name)))
+    }
+
+    /// Whether `volume_id` is our main or photos volume (C#
+    /// `VolumeOperations.IsOwnVolumeAsync`). Both ids are cached after the first
+    /// lookup; a lookup that fails counts as "not ours", which only costs a node
+    /// its [`MemberRole::Admin`] and never fails the read.
+    async fn is_own_volume(&self, volume_id: &VolumeId) -> bool {
+        if self
+            .main_volume_id()
+            .await
+            .is_ok_and(|main| &main == volume_id)
+        {
+            return true;
+        }
+        if !self.ensure_photos().await.unwrap_or(false) {
+            return false;
+        }
+        self.cache
+            .lock()
+            .await
+            .photos_root
+            .as_ref()
+            .is_some_and(|root| &root.volume_id == volume_id)
+    }
+
+    /// Our membership in a share, with the inviter's signature over our share
+    /// passphrase key packet checked against the claimed inviter's keys (C#
+    /// `BuildMembershipInfoAsync` + `NodeCrypto.VerifyMembershipInviter`). The
+    /// check is metadata: the outcome is recorded, never raised.
+    async fn verified_membership(&self, dto: &ShareMembershipSummaryDto) -> ShareMembership {
+        let mut membership = share_membership_from_dto(dto);
+        let status = match (
+            &dto.member_share_passphrase_key_packet,
+            &dto.inviter_share_passphrase_key_packet_signature,
+        ) {
+            (Some(packet), Some(signature)) => match BASE64.decode(packet) {
+                Ok(packet) => {
+                    let email = dto.inviter_email.as_deref().unwrap_or("");
+                    let keys = if email.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.account.public_keys(email).await
+                    };
+                    verify_detached_with_context(
+                        signature,
+                        &packet,
+                        &VerificationKeyRing::from_public_keys(&keys),
+                        SHARING_INVITER_CONTEXT,
+                    )
+                }
+                Err(_) => VerificationStatus::Failed,
+            },
+            // The invitation carries nothing to verify.
+            _ => VerificationStatus::NotSigned,
+        };
+        membership.inviter_verification = Some(status);
+        membership
     }
 }
 
@@ -7641,6 +7861,55 @@ struct MoveParts {
     encrypted_name: String,
     name_hash: String,
     original_hash: String,
+    /// A fresh signature over the passphrase, for an anonymously signed node.
+    anonymous_signature: Option<String>,
+    /// The name the node carries now, decrypted.
+    current_name: Vec<u8>,
+}
+
+/// A batch move in progress: what is left to send, and what is ready to report.
+struct MoveRun {
+    parent: NodeUid,
+    /// The membership address names — and anonymous nodes' passphrases — are
+    /// signed as.
+    email: String,
+    queue: VecDeque<PreparedMove>,
+    outcomes: VecDeque<(NodeUid, Result<()>)>,
+}
+
+/// One node's move, encrypted and ready for a batch (C# `PreparedNodeMoveItem`).
+struct PreparedMove {
+    uid: NodeUid,
+    item: MoveMultipleLinksItem,
+    /// Where the move was prepared from, and the name it carried then: what a
+    /// retry checks the server's copy against.
+    source_parent: Option<LinkId>,
+    current_name: Vec<u8>,
+    anonymous: bool,
+    /// Whether `item.original_hash` already came from the server, which makes a
+    /// second `InvalidRequirements` final.
+    retried: bool,
+}
+
+/// The next request's worth of moves, taken from the front of `queue`: at most
+/// [`MAX_BATCH_COUNT`], all signed the same way, the rest left in order (C#
+/// `MoveBatch.TryAddToCurrentBatch`). An anonymous node's request names the
+/// mover as `SignatureEmail`, which a signed node's must not.
+fn take_move_batch(queue: &mut VecDeque<PreparedMove>) -> Vec<PreparedMove> {
+    let Some(anonymous) = queue.front().map(|prepared| prepared.anonymous) else {
+        return Vec::new();
+    };
+    let mut batch = Vec::new();
+    let mut rest = VecDeque::with_capacity(queue.len());
+    for prepared in queue.drain(..) {
+        if batch.len() < MAX_BATCH_COUNT && prepared.anonymous == anonymous {
+            batch.push(prepared);
+        } else {
+            rest.push_back(prepared);
+        }
+    }
+    *queue = rest;
+    batch
 }
 
 /// Split a `1001 MultipleResponses` batch envelope into one outcome per link,
@@ -7971,6 +8240,10 @@ fn share_membership_from_dto(dto: &ShareMembershipSummaryDto) -> ShareMembership
         share_id: dto.share_id.clone(),
         membership_id: dto.membership_id.clone(),
         permissions: dto.permissions,
+        invite_time: dto.invite_time,
+        inviter_email: dto.inviter_email.clone(),
+        // Needs the inviter's keys; `verified_membership` fills it in.
+        inviter_verification: None,
     }
 }
 
@@ -8214,12 +8487,19 @@ mod tests {
             share_id: ShareId::new("share-1"),
             membership_id: ShareMembershipId::new("membership-1"),
             permissions: 38,
+            invite_time: Some(1_700_000_000),
+            inviter_email: Some("owner@proton.me".into()),
+            member_share_passphrase_key_packet: None,
+            inviter_share_passphrase_key_packet_signature: None,
         };
 
         let membership = share_membership_from_dto(&dto);
         assert_eq!(membership.share_id, dto.share_id);
         assert_eq!(membership.membership_id, dto.membership_id);
         assert_eq!(membership.permissions, 38);
+        assert_eq!(membership.invite_time, Some(1_700_000_000));
+        assert_eq!(membership.inviter_email.as_deref(), Some("owner@proton.me"));
+        assert_eq!(membership.inviter_verification, None);
         assert_eq!(membership.role(), MemberRole::Viewer);
         assert_eq!(membership.role_exact(), None);
     }

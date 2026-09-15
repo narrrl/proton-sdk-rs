@@ -1,11 +1,24 @@
 //! Public, decrypted node model returned to callers.
 
 use proton_sdk::crypto::VerificationStatus;
-use proton_sdk::ids::NodeUid;
+use proton_sdk::ids::{NodeUid, ShareId};
 use serde::{Deserialize, Serialize};
 
 use crate::photos::PhotoTag;
-use crate::sharing::ShareMembership;
+use crate::sharing::{MemberRole, ShareMembership};
+
+/// One node for [`move_nodes_streaming`](crate::ProtonDriveClient::move_nodes_streaming):
+/// which node, and the name it should carry afterwards.
+///
+/// Mirrors C# `NodeMoveItem` minus its `CurrentParentUid` / `CurrentName`: this
+/// client reads both off the link it is about to move rather than trusting a
+/// caller's possibly stale copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMoveItem {
+    pub uid: NodeUid,
+    /// The name after the move; `None` keeps the current one.
+    pub target_name: Option<String>,
+}
 
 /// A decrypted Drive node (folder or file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +51,19 @@ pub struct Node {
     /// one written before this field existed must keep deserializing.
     #[serde(default)]
     pub membership: Option<ShareMembership>,
+    /// Our role on this node itself (C# `Node.DirectRole`): [`MemberRole::Admin`]
+    /// on our own main or photos volume, the membership's role on a node shared
+    /// directly with us, [`MemberRole::Inherited`] on anything below it.
+    ///
+    /// `None` on a node persisted before this field existed, and on nodes built
+    /// without an account (a public-link visitor has no role to report).
+    #[serde(default)]
+    pub direct_role: Option<MemberRole>,
+    /// The share this node is the root of, when it is shared — the `Sharing`
+    /// block's `ShareID` (JS `deprecatedShareId`, carried by C# since `63a7fc1e`).
+    /// Kept for callers still addressing sharing by share rather than by node.
+    #[serde(default)]
+    pub share_id: Option<ShareId>,
     /// Photo-only metadata, present on a photos-volume file node. C# layers this
     /// as `PhotoNode : FileNode`; here it is an optional block so a `Node`
     /// persisted before photos existed still deserializes.
@@ -353,7 +379,12 @@ mod tests {
                 share_id: "share-1".into(),
                 membership_id: "member-1".into(),
                 permissions: 6,
+                invite_time: Some(1_700_000_000),
+                inviter_email: Some("owner@proton.me".into()),
+                inviter_verification: Some(VerificationStatus::Ok),
             }),
+            direct_role: Some(MemberRole::Editor),
+            share_id: Some("share-1".into()),
             photo: None,
             album: None,
             verification: NodeVerification::default(),

@@ -8,6 +8,8 @@
 //! `NodeCrypto` records the `PgpVerificationStatus` of each decrypt rather than
 //! throwing.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use pgp::composed::{
     Deserializable, DetachedSignature, Message, SignedPublicKey, SignedSecretKey,
     VerificationResult,
@@ -15,6 +17,7 @@ use pgp::composed::{
 use pgp::types::{Password, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use super::encrypt::SIGNATURE_CONTEXT_NOTATION;
 use super::errors::CryptoError;
 
 /// Outcome of an authorship/signature check.
@@ -137,6 +140,48 @@ pub fn verify_detached(
     VerificationStatus::Failed
 }
 
+/// Verify a detached signature made under a GopenPGP signature *context* (the
+/// `context@proton.ch` notation) — the counterpart of the sharing signers in
+/// `encrypt.rs`, and of C# `PgpVerificationContext`.
+///
+/// The signature may be armored or base64 of the binary packet: the sharing
+/// endpoints are not consistent about which they return. A signature that
+/// verifies but was made under another context — or none — is `Failed`, since
+/// accepting it would let a signature made for one purpose stand in for another.
+pub fn verify_detached_with_context(
+    signature: &str,
+    data: &[u8],
+    ring: &VerificationKeyRing,
+    context: &str,
+) -> VerificationStatus {
+    if ring.is_empty() {
+        return VerificationStatus::NoVerifier;
+    }
+    let parsed = DetachedSignature::from_string(signature)
+        .map(|(signature, _headers)| signature)
+        .ok()
+        .or_else(|| {
+            let bytes = BASE64.decode(signature.trim()).ok()?;
+            DetachedSignature::from_bytes(&bytes[..]).ok()
+        });
+    let Some(signature) = parsed else {
+        return VerificationStatus::Failed;
+    };
+    let in_context = signature.signature.notations().iter().any(|notation| {
+        notation.name.as_ref() == SIGNATURE_CONTEXT_NOTATION
+            && notation.value.as_ref() == context.as_bytes()
+    });
+    if !in_context {
+        return VerificationStatus::Failed;
+    }
+    for key in &ring.keys {
+        if signature.verify(key, data).is_ok() {
+            return VerificationStatus::Ok;
+        }
+    }
+    VerificationStatus::Failed
+}
+
 /// Decrypt an armored PGP message and verify its inline signature (if any)
 /// against `ring`. Always returns the plaintext; the status is metadata.
 pub(crate) fn decrypt_and_verify(
@@ -240,6 +285,64 @@ mod tests {
         assert_eq!(
             verify_detached(&sig, data, &VerificationKeyRing::empty()),
             VerificationStatus::NoVerifier
+        );
+    }
+
+    #[test]
+    fn context_signature_verifies_only_under_its_own_context() {
+        use crate::crypto::encrypt::sign_detached_binary_with_context;
+        use crate::crypto::{SHARING_INVITER_CONTEXT, SHARING_MEMBER_CONTEXT};
+
+        let signer = generate_node_key().expect("generate signer key");
+        let data = b"share passphrase key packet";
+        let binary = sign_detached_binary_with_context(&signer.key, data, SHARING_INVITER_CONTEXT)
+            .expect("sign");
+        let base64 = BASE64.encode(&binary);
+        let ring = VerificationKeyRing::from_private(&signer.key);
+
+        assert_eq!(
+            verify_detached_with_context(&base64, data, &ring, SHARING_INVITER_CONTEXT),
+            VerificationStatus::Ok
+        );
+        // The right key over the right bytes, made for a different purpose.
+        assert_eq!(
+            verify_detached_with_context(&base64, data, &ring, SHARING_MEMBER_CONTEXT),
+            VerificationStatus::Failed
+        );
+        assert_eq!(
+            verify_detached_with_context(&base64, b"other packet", &ring, SHARING_INVITER_CONTEXT),
+            VerificationStatus::Failed
+        );
+        assert_eq!(
+            verify_detached_with_context(
+                &base64,
+                data,
+                &VerificationKeyRing::empty(),
+                SHARING_INVITER_CONTEXT
+            ),
+            VerificationStatus::NoVerifier
+        );
+    }
+
+    #[test]
+    fn a_signature_without_a_context_is_not_a_context_signature() {
+        let signer = generate_node_key().expect("generate signer key");
+        let data = b"share passphrase key packet";
+        let armored = signer.key.sign_detached(data).expect("sign");
+        let ring = VerificationKeyRing::from_private(&signer.key);
+
+        assert_eq!(
+            verify_detached(&armored, data, &ring),
+            VerificationStatus::Ok
+        );
+        assert_eq!(
+            verify_detached_with_context(
+                &armored,
+                data,
+                &ring,
+                crate::crypto::SHARING_INVITER_CONTEXT
+            ),
+            VerificationStatus::Failed
         );
     }
 

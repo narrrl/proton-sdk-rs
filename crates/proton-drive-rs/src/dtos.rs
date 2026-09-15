@@ -179,6 +179,18 @@ pub struct ShareMembershipSummaryDto {
     pub membership_id: ShareMembershipId,
     #[serde(rename = "Permissions", default)]
     pub permissions: i32,
+    /// When the node was shared with us, epoch seconds.
+    #[serde(rename = "InviteTime", default)]
+    pub invite_time: Option<i64>,
+    #[serde(rename = "InviterEmail", default)]
+    pub inviter_email: Option<String>,
+    /// base64 PKESK: the share passphrase session key encrypted to us.
+    #[serde(rename = "MemberSharePassphraseKeyPacket", default)]
+    pub member_share_passphrase_key_packet: Option<String>,
+    /// The inviter's signature over that key packet, made under the
+    /// `drive.share-member.inviter` context.
+    #[serde(rename = "InviterSharePassphraseKeyPacketSignature", default)]
+    pub inviter_share_passphrase_key_packet_signature: Option<String>,
 }
 
 impl LinkDetailsDto {
@@ -566,8 +578,15 @@ pub struct LinkDto {
     pub creation_time: i64,
     #[serde(rename = "ModifyTime")]
     pub modification_time: i64,
-    #[serde(rename = "Trashed")]
+    /// The API's name for the trash time (upstream `cdc0f260` dropped C#'s
+    /// `[JsonPropertyName("Trashed")]`, which never matched it).
+    #[serde(rename = "TrashTime", default)]
     pub trash_time: Option<i64>,
+    /// The name this DTO used to read. Kept as its own field rather than a serde
+    /// `alias`, which would fail the whole link with "duplicate field" on a
+    /// response that carries both.
+    #[serde(rename = "Trashed", default)]
+    pub trashed_legacy: Option<i64>,
     #[serde(rename = "Name")]
     pub name: String,
     /// Lowercase-hex HMAC-SHA256 name hash under the parent's hash key (C#
@@ -593,7 +612,9 @@ impl LinkDto {
     }
 
     pub fn is_trashed(&self) -> bool {
-        self.state == LinkState::Trashed as i32 || self.trash_time.is_some()
+        self.state == LinkState::Trashed as i32
+            || self.trash_time.is_some()
+            || self.trashed_legacy.is_some()
     }
 }
 
@@ -1041,6 +1062,10 @@ pub struct MoveLinkRequest {
     pub name_hash: String,
     #[serde(rename = "OriginalHash")]
     pub original_hash: String,
+    /// Set only when moving an anonymously signed node, whose passphrase the
+    /// mover signs afresh (C# `MoveSingleLinkRequest.SignatureEmailAddress`).
+    #[serde(rename = "SignatureEmail", skip_serializing_if = "Option::is_none")]
+    pub signature_email: Option<String>,
 }
 
 /// `PUT volumes/{vid}/links/move-multiple` — batch move of several nodes under a
@@ -1062,7 +1087,7 @@ pub struct MoveMultipleLinksRequest {
 /// One entry of a [`MoveMultipleLinksRequest`]. Mirrors C# `MoveMultipleLinksItem`:
 /// per-node rewrapped passphrase + re-encrypted/signed name + new/original name
 /// hashes under the destination/source hash keys.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MoveMultipleLinksItem {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,

@@ -1189,6 +1189,8 @@ impl ProtonDrivePublicLinkClient {
             // A public-link visitor has no account membership — access comes
             // from the link's own share password, not from a share member row.
             membership: None,
+            direct_role: None,
+            share_id: None,
             // A public link points at a Drive folder or file; the photos volume
             // is not reachable this way, so there is no photo/album metadata.
             photo: None,
