@@ -121,6 +121,125 @@ struct BlockTable {
     generation: u64,
 }
 
+/// A revision's block table plus the ability to re-mint it.
+///
+/// Block URLs carry their own authorization and are handed out with a
+/// server-side lifetime we are never told, so any download long enough to
+/// outlive one has to re-list the revision mid-flight. That recovery is
+/// identical for a seekable [`RevisionReader`] and for a whole-file download, so
+/// it lives here and both go through it.
+pub(crate) struct BlockTargets {
+    transport: RevisionTransport,
+    uid: NodeUid,
+    revision_id: String,
+    blocks: RwLock<BlockTable>,
+    /// Serializes block-table refreshes so a burst of expired-URL failures
+    /// triggers one re-listing rather than one per block.
+    refresh: Mutex<()>,
+    /// How many blocks the caller resolved the revision as having. A re-list
+    /// that disagrees means the revision changed underneath the transfer, which
+    /// no amount of retrying fixes.
+    expected_blocks: usize,
+}
+
+impl BlockTargets {
+    pub(crate) fn new(
+        transport: RevisionTransport,
+        uid: NodeUid,
+        revision_id: String,
+        blocks: Vec<BlockDto>,
+        expected_blocks: usize,
+    ) -> Self {
+        Self {
+            transport,
+            uid,
+            revision_id,
+            blocks: RwLock::new(BlockTable {
+                blocks,
+                generation: 0,
+            }),
+            refresh: Mutex::new(()),
+            expected_blocks,
+        }
+    }
+
+    pub(crate) fn uid(&self) -> &NodeUid {
+        &self.uid
+    }
+
+    pub(crate) fn revision_id(&self) -> &str {
+        &self.revision_id
+    }
+
+    /// The storage URL and token for a block, plus the generation of the table
+    /// they came from.
+    async fn location(&self, index: usize) -> Result<(String, String, u64)> {
+        let table = self.blocks.read().await;
+        let block = table.blocks.get(index).ok_or_else(|| {
+            ProtonError::invalid_operation(format!(
+                "block {index} is missing from revision {}",
+                self.revision_id
+            ))
+        })?;
+        Ok((
+            block.bare_url.clone(),
+            block.token.clone(),
+            table.generation,
+        ))
+    }
+
+    /// Re-list the revision to obtain fresh block URLs, unless another task has
+    /// already replaced the generation the caller saw.
+    async fn refresh(&self, seen_generation: u64) -> Result<()> {
+        let _guard = self.refresh.lock().await;
+
+        if self.blocks.read().await.generation != seen_generation {
+            // Someone else refreshed while we waited; their table is at least as
+            // fresh as one we would fetch now.
+            return Ok(());
+        }
+
+        let (_, blocks) = self
+            .transport
+            .list_blocks(&self.uid.volume_id, &self.uid.link_id, &self.revision_id)
+            .await?;
+
+        if blocks.len() != self.expected_blocks {
+            return Err(ProtonError::invalid_operation(format!(
+                "revision {} changed block count while open ({} -> {})",
+                self.revision_id,
+                self.expected_blocks,
+                blocks.len()
+            )));
+        }
+
+        let mut table = self.blocks.write().await;
+        table.blocks = blocks;
+        table.generation += 1;
+        Ok(())
+    }
+
+    /// Fetch one block's ciphertext, re-listing the revision once if its storage
+    /// URL has expired.
+    ///
+    /// A block fetch carries a `pm-storage-token` and no session credential at
+    /// all, so it cannot fail for session reasons — only the URL expires. One
+    /// re-list is the whole budget: a second expiry on a URL minted seconds ago
+    /// is not an expiry, and replaying it would only loop.
+    pub(crate) async fn ciphertext(&self, index: usize) -> Result<Bytes> {
+        let (url, token, generation) = self.location(index).await?;
+        match self.transport.http().get_storage_blob(&url, &token).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if is_expired_block_url(&e) => {
+                self.refresh(generation).await?;
+                let (url, token, _) = self.location(index).await?;
+                self.transport.http().get_storage_blob(&url, &token).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// An open handle on a file revision: its content key plus the block table and
 /// per-block plaintext sizes, resolved once by
 /// [`ProtonDriveClient::open_revision`](crate::ProtonDriveClient::open_revision).
@@ -139,13 +258,10 @@ pub struct RevisionReader {
     /// can die under the reader — the renewal path. Deliberately *not* a whole
     /// client, so an anonymous public-link visitor can have one too.
     transport: RevisionTransport,
-    uid: NodeUid,
-    revision_id: String,
     content_key: ContentKey,
-    blocks: RwLock<BlockTable>,
-    /// Serializes block-table refreshes so a burst of expired-URL failures
-    /// triggers one re-listing rather than one per block.
-    refresh: Mutex<()>,
+    /// The block table and its expired-URL recovery, shared with the whole-file
+    /// download path.
+    targets: BlockTargets,
     /// Plaintext size of each block, in block order.
     block_sizes: Vec<u64>,
     file_size: u64,
@@ -161,16 +277,17 @@ impl RevisionReader {
         block_sizes: Vec<u64>,
     ) -> Self {
         let file_size = block_sizes.iter().sum();
-        Self {
-            transport,
+        let targets = BlockTargets::new(
+            transport.clone(),
             uid,
             revision_id,
+            blocks,
+            block_sizes.len(),
+        );
+        Self {
+            transport,
             content_key,
-            blocks: RwLock::new(BlockTable {
-                blocks,
-                generation: 0,
-            }),
-            refresh: Mutex::new(()),
+            targets,
             block_sizes,
             file_size,
         }
@@ -178,12 +295,12 @@ impl RevisionReader {
 
     /// The node this reader was opened on.
     pub fn uid(&self) -> &NodeUid {
-        &self.uid
+        self.targets.uid()
     }
 
     /// The revision this reader is pinned to.
     pub fn revision_id(&self) -> &str {
-        &self.revision_id
+        self.targets.revision_id()
     }
 
     /// Total plaintext size of the revision, summed from the block sizes
@@ -259,70 +376,10 @@ impl RevisionReader {
             .await
             .map_err(|e| ProtonError::invalid_operation(format!("block slots closed: {e}")))?;
 
-        let (url, token, generation) = self.block_location(index).await?;
-
-        // A block fetch carries a `pm-storage-token` and no session credential
-        // at all, so it cannot fail for session reasons — only the URL expires.
-        let ciphertext = match self.transport.http().get_storage_blob(&url, &token).await {
-            Ok(bytes) => bytes,
-            Err(e) if is_expired_block_url(&e) => {
-                self.refresh_blocks(generation).await?;
-                let (url, token, _) = self.block_location(index).await?;
-                self.transport.http().get_storage_blob(&url, &token).await?
-            }
-            Err(e) => return Err(e),
-        };
+        let ciphertext = self.targets.ciphertext(index).await?;
 
         let plaintext = decrypt_block_blocking(self.content_key.clone(), ciphertext).await?;
         Ok((plaintext, permit))
-    }
-
-    /// The storage URL and token for a block, plus the generation of the table
-    /// they came from.
-    async fn block_location(&self, index: usize) -> Result<(String, String, u64)> {
-        let table = self.blocks.read().await;
-        let block = table.blocks.get(index).ok_or_else(|| {
-            ProtonError::invalid_operation(format!(
-                "block {index} is missing from revision {}",
-                self.revision_id
-            ))
-        })?;
-        Ok((
-            block.bare_url.clone(),
-            block.token.clone(),
-            table.generation,
-        ))
-    }
-
-    /// Re-list the revision to obtain fresh block URLs, unless another task has
-    /// already replaced the generation the caller saw.
-    async fn refresh_blocks(&self, seen_generation: u64) -> Result<()> {
-        let _guard = self.refresh.lock().await;
-
-        if self.blocks.read().await.generation != seen_generation {
-            // Someone else refreshed while we waited; their table is at least as
-            // fresh as one we would fetch now.
-            return Ok(());
-        }
-
-        let (_, blocks) = self
-            .transport
-            .list_blocks(&self.uid.volume_id, &self.uid.link_id, &self.revision_id)
-            .await?;
-
-        if blocks.len() != self.block_sizes.len() {
-            return Err(ProtonError::invalid_operation(format!(
-                "revision {} changed block count while open ({} -> {})",
-                self.revision_id,
-                self.block_sizes.len(),
-                blocks.len()
-            )));
-        }
-
-        let mut table = self.blocks.write().await;
-        table.blocks = blocks;
-        table.generation += 1;
-        Ok(())
     }
 }
 
@@ -467,5 +524,34 @@ mod tests {
             8 << 20,
             "the size stat would show"
         );
+    }
+
+    /// What [`BlockTargets::ciphertext`] treats as "this URL expired, re-list
+    /// the revision once". A block fetch carries no session credential, so a
+    /// 401/403 there cannot mean our session — it means the URL's own
+    /// authorization lapsed. Anything else is a real failure and is returned
+    /// unchanged rather than costing a listing round trip.
+    #[test]
+    fn only_authorization_statuses_count_as_an_expired_block_url() {
+        use proton_sdk::api::ResponseCode;
+        use proton_sdk::error::ProtonApiError;
+
+        let api = |http_status: u16| {
+            ProtonError::Api(ProtonApiError {
+                code: ResponseCode::Unknown,
+                http_status,
+                message: String::new(),
+                details: None,
+            })
+        };
+        for status in [401, 403, 404] {
+            assert!(is_expired_block_url(&api(status)), "http {status}");
+        }
+        for status in [400, 429, 500, 503] {
+            assert!(!is_expired_block_url(&api(status)), "http {status}");
+        }
+        assert!(!is_expired_block_url(&ProtonError::invalid_operation(
+            "bug"
+        )));
     }
 }

@@ -59,7 +59,9 @@ use crate::dtos::{
     ThumbnailBlockListRequest, ThumbnailBlockListResponse,
 };
 use crate::node::{FileThumbnail, Node, NodeKind, RevisionState, ThumbnailType};
-use crate::revision::{MAX_CONCURRENT_BLOCK_DOWNLOADS, RevisionReader, decrypt_block_blocking};
+use crate::revision::{
+    BlockTargets, MAX_CONCURRENT_BLOCK_DOWNLOADS, RevisionReader, decrypt_block_blocking,
+};
 use crate::sharing::MemberRole;
 use crate::single_flight::SingleFlight;
 use crate::transport::{BlockSession, RevisionTransport, rank_block_sizes};
@@ -635,17 +637,27 @@ impl ProtonDrivePublicLinkClient {
         // Fetched and decrypted several at a time but yielded in block order, so
         // the writer still sees the file sequentially and no more than
         // `MAX_CONCURRENT_BLOCK_DOWNLOADS` blocks are ever resident.
-        let mut plaintexts = stream::iter(blocks.into_iter().map(|block| {
+        let block_count = blocks.len();
+        // Shared with the authenticated download path: block URLs expire on a
+        // server-side schedule we are not told, so a long transfer re-lists the
+        // revision once per expiry rather than failing.
+        let targets = Arc::new(BlockTargets::new(
+            self.transport.clone(),
+            uid.clone(),
+            revision_id,
+            blocks,
+            block_count,
+        ));
+
+        let mut plaintexts = stream::iter((0..block_count).map(|index| {
             let transport = self.transport.clone();
+            let targets = targets.clone();
             let content_key = content_key.clone();
             async move {
                 let permit = transport.block_slots().acquire_owned().await.map_err(|e| {
                     ProtonError::invalid_operation(format!("block slots closed: {e}"))
                 })?;
-                let ciphertext = transport
-                    .http()
-                    .get_storage_blob(&block.bare_url, &block.token)
-                    .await?;
+                let ciphertext = targets.ciphertext(index).await?;
                 let plaintext = decrypt_block_blocking(content_key, ciphertext).await?;
                 Ok::<_, ProtonError>((plaintext, permit))
             }

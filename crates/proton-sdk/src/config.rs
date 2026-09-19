@@ -28,16 +28,25 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Default base delay for exponential backoff between retries.
 pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
-/// Default upper bound for a single backoff sleep. A server-supplied
-/// `Retry-After` is honoured even if it exceeds this.
+/// Default upper bound for a single computed backoff sleep. A server-supplied
+/// `Retry-After` overrides it, up to [`DEFAULT_MAX_RETRY_AFTER`].
 pub const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Default upper bound for a server-supplied `Retry-After` wait.
+///
+/// The header is advice, and a caller is blocked on the sleep for its whole
+/// duration: an unbounded one is indistinguishable, from outside, from a hung
+/// process. Waiting less than asked risks another rate-limit answer, which the
+/// retry budget absorbs; waiting an hour risks a daemon that looks dead.
+pub const DEFAULT_MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Controls automatic retries on retryable responses (HTTP 408/429/502/503/504)
 /// and transient transport errors (timeout, connect).
 ///
 /// Mirrors the Polly-style retry pipeline in the C# SDK: a server-supplied
-/// `Retry-After` header wins; otherwise the delay is exponential backoff
-/// (`base_delay * 2^attempt`, capped at `max_delay`) with full jitter.
+/// `Retry-After` header wins (clamped to `max_retry_after`); otherwise the delay
+/// is exponential backoff (`base_delay * 2^attempt`, capped at `max_delay`) with
+/// full jitter.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Maximum number of retries after the initial attempt. `0` disables retry.
@@ -46,6 +55,9 @@ pub struct RetryPolicy {
     pub base_delay: Duration,
     /// Cap on a single computed backoff sleep.
     pub max_delay: Duration,
+    /// Cap on a server-supplied `Retry-After` wait. A longer header value is
+    /// clamped to this.
+    pub max_retry_after: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -54,6 +66,7 @@ impl Default for RetryPolicy {
             max_retries: DEFAULT_MAX_RETRIES,
             base_delay: DEFAULT_RETRY_BASE_DELAY,
             max_delay: DEFAULT_RETRY_MAX_DELAY,
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
         }
     }
 }

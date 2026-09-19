@@ -84,7 +84,8 @@ use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
 };
 use crate::revision::{
-    MAX_CONCURRENT_BLOCK_DOWNLOADS, Revision, RevisionReader, digest_and_decrypt_block_blocking,
+    BlockTargets, MAX_CONCURRENT_BLOCK_DOWNLOADS, Revision, RevisionReader,
+    digest_and_decrypt_block_blocking,
 };
 use crate::sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
@@ -1304,7 +1305,15 @@ impl ProtonDriveClient {
             }
         }
 
-        self.write_content_blocks(&blocks, &content_key, &mut manifest, output)
+        let block_count = blocks.len();
+        let targets = Arc::new(BlockTargets::new(
+            self.revision_transport(),
+            uid.clone(),
+            revision_id.clone(),
+            blocks,
+            block_count,
+        ));
+        self.write_content_blocks(targets, block_count, &content_key, &mut manifest, output)
             .await?;
 
         verify_manifest(&self.account, &revision, &node_key, &manifest).await;
@@ -1990,9 +1999,16 @@ impl ProtonDriveClient {
         // reader bounds or buffering arbitrary inputs.
         if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
         {
-            return self
+            match self
                 .upload_small_file(parent_uid, name, media_type, contents)
-                .await;
+                .await
+            {
+                Ok(uid) => return Ok(uid),
+                Err(error) if small_upload_should_fall_back(&error) => {
+                    tracing::debug!(%error, "small file upload conflicted; falling back to blocks");
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.upload_file_from(
             parent_uid,
@@ -2217,7 +2233,13 @@ impl ProtonDriveClient {
     pub async fn upload_new_revision(&self, file_uid: &NodeUid, contents: &[u8]) -> Result<()> {
         if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
         {
-            return self.upload_small_revision(file_uid, contents, None).await;
+            match self.upload_small_revision(file_uid, contents, None).await {
+                Ok(()) => return Ok(()),
+                Err(error) if small_upload_should_fall_back(&error) => {
+                    tracing::debug!(%error, "small revision upload conflicted; falling back to blocks");
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.upload_new_revision_from(
             file_uid,
@@ -5274,23 +5296,20 @@ impl ProtonDriveClient {
     /// `output` depend on that ordering.
     async fn write_content_blocks<W: std::io::Write>(
         &self,
-        blocks: &[BlockDto],
+        targets: Arc<BlockTargets>,
+        block_count: usize,
         content_key: &ContentKey,
         manifest: &mut Vec<u8>,
         output: &mut W,
     ) -> Result<()> {
-        // Each fetch owns its url/token rather than borrowing `blocks`. Borrowing
-        // here makes the resulting future carry a higher-ranked lifetime that
-        // `tokio::spawn` rejects ("implementation of `FnOnce` is not general
-        // enough") in *callers* of `download_file_to` — a downstream break, not a
-        // local one, so it does not show up in this crate's own build.
-        let fetches: Vec<(String, String)> = blocks
-            .iter()
-            .map(|block| (block.bare_url.clone(), block.token.clone()))
-            .collect();
-
-        let mut decrypted = stream::iter(fetches.into_iter().map(|(url, token)| {
-            let http = self.http.clone();
+        // Each fetch owns an `Arc` of the block table rather than borrowing it.
+        // Borrowing here makes the resulting future carry a higher-ranked
+        // lifetime that `tokio::spawn` rejects ("implementation of `FnOnce` is
+        // not general enough") in *callers* of `download_file_to` — a downstream
+        // break, not a local one, so it does not show up in this crate's own
+        // build.
+        let mut decrypted = stream::iter((0..block_count).map(|index| {
+            let targets = targets.clone();
             let content_key = content_key.clone();
             let slots = self.block_slots();
             async move {
@@ -5301,7 +5320,10 @@ impl ProtonDriveClient {
                 let permit = slots.acquire_owned().await.map_err(|e| {
                     ProtonError::invalid_operation(format!("block slots closed: {e}"))
                 })?;
-                let ciphertext = http.get_storage_blob(&url, &token).await?;
+                // Goes through the block table, not a snapshot of it: a download
+                // of a large file outlives its block URLs, and this re-lists the
+                // revision once per expiry instead of failing the transfer.
+                let ciphertext = targets.ciphertext(index).await?;
                 let (digest, plaintext) =
                     digest_and_decrypt_block_blocking(content_key, ciphertext).await?;
                 Ok::<_, ProtonError>((digest, plaintext, permit))
@@ -6985,7 +7007,15 @@ impl ProtonDriveClient {
             }
         }
 
-        self.write_content_blocks(&blocks, &content_key, &mut manifest, output)
+        let block_count = blocks.len();
+        let targets = Arc::new(BlockTargets::new(
+            self.revision_transport(),
+            uid.clone(),
+            revision_id.clone(),
+            blocks,
+            block_count,
+        ));
+        self.write_content_blocks(targets, block_count, &content_key, &mut manifest, output)
             .await?;
 
         verify_manifest(&self.account, &revision, &node_key, &manifest).await;
@@ -7969,6 +7999,26 @@ fn small_upload_applicable(plaintext_size: usize) -> bool {
     plaintext_size.saturating_mul(11) < SMALL_UPLOAD_SIZE_LIMIT * 10
 }
 
+/// Whether a failed one-request small upload should be retried on the regular
+/// block path.
+///
+/// Upstream (C# `SmallFileUploadFallback`) falls back on exactly three
+/// conditions: the endpoint declaring itself not applicable, a node of the same
+/// name already existing, and a revision-draft conflict. The Proton API reports
+/// the latter two as the same envelope code, `AlreadyExists` (2500), which the
+/// regular path then resolves — it knows how to delete a stale draft of ours and
+/// retry (`create_file_draft` / `create_revision_draft`), while the small
+/// endpoint is one shot and cannot.
+///
+/// Everything else propagates. A small upload is **not** idempotent: its single
+/// request creates the node, uploads the block and seals the revision together,
+/// so replaying it on a rate limit (429), a failed dependency (424), a 5xx or a
+/// dropped connection risks a duplicate file. Those are the caller's to retry,
+/// with the same knowledge of what already landed.
+fn small_upload_should_fall_back(error: &ProtonError) -> bool {
+    matches!(error, ProtonError::Api(e) if e.code == ResponseCode::AlreadyExists)
+}
+
 /// Block verification token: `verificationCode XOR ciphertextPrefix`, with the
 /// ciphertext prefix zero-padded or truncated to the code length. Mirrors C#
 /// `VerificationToken.Create`.
@@ -8157,6 +8207,14 @@ async fn upload_one_block(
             Err(error) => error,
         };
         if attempt >= MAX_BLOCK_UPLOAD_ATTEMPTS {
+            return Err(error);
+        }
+        // A permanent rejection of the revision (C# `RetryPolicy.IsRetriable`)
+        // fails the same way on every replay, so it ends the transfer here
+        // rather than spending the remaining attempts on it. 404 stays
+        // retriable: it is how an expired upload token arrives, and the branch
+        // below re-mints one.
+        if !error.is_retriable() {
             return Err(error);
         }
 
@@ -8372,8 +8430,8 @@ mod tests {
         context_share_path, drive_items, epoch_to_iso8601, is_expired_upload_token,
         is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
         path_segments, record_timeline_outcome, run_context_share_mutation,
-        share_membership_from_dto, small_upload_applicable, take_block_target,
-        take_thumbnail_target, to_drive_event, validate_node_name,
+        share_membership_from_dto, small_upload_applicable, small_upload_should_fall_back,
+        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
@@ -9114,5 +9172,36 @@ mod tests {
             ..error
         };
         assert!(missing_related_links(&plain, &volume_id).is_empty());
+    }
+
+    /// The one condition the regular block path can resolve and the one-request
+    /// endpoint cannot: a name/draft conflict, which the block path clears by
+    /// deleting our own stale draft.
+    #[test]
+    fn a_name_or_draft_conflict_falls_back_to_the_block_path() {
+        assert!(small_upload_should_fall_back(&api_error(
+            ResponseCode::AlreadyExists,
+            422
+        )));
+    }
+
+    /// A small upload is not idempotent, so a transient failure must not be
+    /// replayed by us — it could duplicate the file.
+    #[test]
+    fn transient_failures_do_not_fall_back() {
+        for (status, code) in [
+            (429, ResponseCode::TooManyRequests),
+            (424, ResponseCode::Unknown),
+            (503, ResponseCode::ServiceUnavailable),
+            (422, ResponseCode::InsufficientQuota),
+        ] {
+            assert!(
+                !small_upload_should_fall_back(&api_error(code, status)),
+                "http {status} should not fall back"
+            );
+        }
+        assert!(!small_upload_should_fall_back(
+            &ProtonError::invalid_operation("bug")
+        ));
     }
 }

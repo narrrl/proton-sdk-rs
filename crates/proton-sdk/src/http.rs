@@ -738,8 +738,9 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
 /// `multipart` can't be cloned), so every retry resends the full request.
 ///
 /// Retryable = HTTP 408/429/502/503/504 or a transient transport error
-/// (timeout / connect). A `Retry-After` header (delta-seconds) is honoured;
-/// otherwise the delay is exponential backoff with full jitter. Non-retryable
+/// (timeout / connect). A `Retry-After` header (delta-seconds) is honoured, up
+/// to `policy.max_retry_after`; otherwise the delay is exponential backoff with
+/// full jitter. Non-retryable
 /// responses and errors — including ordinary 4xx and the 401 that drives token
 /// refresh — pass straight through to the caller untouched.
 async fn send_retrying<F>(policy: &RetryPolicy, build: F) -> Result<reqwest::Response>
@@ -751,7 +752,9 @@ where
         match build().send().await {
             Ok(response) => {
                 if attempt < policy.max_retries && is_retryable_status(response.status()) {
-                    let delay = retry_after(&response).unwrap_or_else(|| backoff(policy, attempt));
+                    let delay = retry_after(&response)
+                        .map(|delay| delay.min(policy.max_retry_after))
+                        .unwrap_or_else(|| backoff(policy, attempt));
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
@@ -852,12 +855,28 @@ mod tests {
         assert_eq!(parse_retry_after_secs(""), None);
     }
 
+    /// A `Retry-After` longer than the policy allows is clamped: the caller is
+    /// blocked on this sleep, and an unbounded one looks exactly like a hang.
+    #[test]
+    fn retry_after_is_clamped_to_policy_ceiling() {
+        let policy = RetryPolicy::default();
+        let advised = parse_retry_after_secs("3600").expect("delta-seconds parses");
+        assert_eq!(
+            advised.min(policy.max_retry_after),
+            crate::config::DEFAULT_MAX_RETRY_AFTER
+        );
+        // A shorter wait is honoured verbatim.
+        let short = parse_retry_after_secs("5").expect("delta-seconds parses");
+        assert_eq!(short.min(policy.max_retry_after), Duration::from_secs(5));
+    }
+
     #[test]
     fn backoff_grows_then_caps_within_jitter_bounds() {
         let policy = RetryPolicy {
             max_retries: 5,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_millis(1000),
+            ..RetryPolicy::default()
         };
         // Full jitter: every sample stays within [0, ceiling] where the
         // ceiling is base*2^attempt capped at max_delay.
