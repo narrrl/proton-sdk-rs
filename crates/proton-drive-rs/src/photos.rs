@@ -315,6 +315,39 @@ impl ProtonPhotosClient {
         self.drive.add_photos_to_album(album_uid, photo_uids).await
     }
 
+    /// Rename the album `album_uid` to `name`.
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.updateAlbum`). Like
+    /// [`create_album`](Self::create_album), the name is not deduplicated.
+    pub async fn rename_album(&self, album_uid: &NodeUid, name: &str) -> Result<()> {
+        self.drive.rename_album(album_uid, name).await
+    }
+
+    /// Delete the album `album_uid`.
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.deleteAlbum`). With
+    /// `delete_photos` false the photos stay in the timeline; the server then
+    /// refuses to delete an album holding photos that exist only in it (API
+    /// code 200302). With it true those photos are deleted too.
+    pub async fn delete_album(&self, album_uid: &NodeUid, delete_photos: bool) -> Result<()> {
+        self.drive.delete_album(album_uid, delete_photos).await
+    }
+
+    /// Take photos out of `album_uid`, one outcome per input photo in input
+    /// order. The photos stay in the timeline; this is not a trash.
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.removePhotos`). The
+    /// server answers per batch of ten, so a failure fails its whole batch.
+    pub async fn remove_photos_from_album(
+        &self,
+        album_uid: &NodeUid,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        self.drive
+            .remove_photos_from_album(album_uid, photo_uids)
+            .await
+    }
+
     /// The albums on the account's photos volume, as [`NodeUid`]s.
     /// C# `ProtonPhotosClient.EnumerateAlbumNodeUidsAsync`. Empty when the
     /// account has no photos volume. Materialize with

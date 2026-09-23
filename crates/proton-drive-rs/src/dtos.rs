@@ -391,6 +391,39 @@ pub struct AlbumCreationLinkResponse {
     pub link_id: LinkId,
 }
 
+/// `PUT photos/volumes/{vid}/albums/{lid}` — rename an album or change its
+/// cover. Ported from the TypeScript SDK (`PhotosAPIService.updateAlbum`); a
+/// `None` field leaves that part of the album as it is.
+#[derive(Debug, Serialize)]
+pub struct AlbumUpdateRequest {
+    #[serde(rename = "CoverLinkID")]
+    pub cover_link_id: Option<LinkId>,
+    #[serde(rename = "Link")]
+    pub link: Option<AlbumUpdateLink>,
+}
+
+/// The new name of an album, encrypted to the photos root like a rename.
+#[derive(Debug, Serialize)]
+pub struct AlbumUpdateLink {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    #[serde(rename = "OriginalHash")]
+    pub original_hash: String,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+}
+
+/// `POST photos/volumes/{vid}/albums/{lid}/remove-multiple` — take photos out
+/// of an album; they stay in the timeline. Ported from the TypeScript SDK
+/// (`PhotosAPIService.removePhotosFromAlbum`).
+#[derive(Debug, Serialize)]
+pub struct RemovePhotosFromAlbumRequest {
+    #[serde(rename = "LinkIDs")]
+    pub link_ids: Vec<LinkId>,
+}
+
 /// `POST photos/volumes/{vid}/albums/{lid}/add-multiple` — add photos that
 /// already live on the album's own volume. Ported from the TypeScript SDK
 /// (`PhotosAPIService.addPhotosToAlbum`). Each entry re-encrypts one photo's
@@ -1664,6 +1697,42 @@ pub struct DeviceUpdateShareDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_rename_sends_the_name_and_no_cover() {
+        let request = AlbumUpdateRequest {
+            cover_link_id: None,
+            link: Some(AlbumUpdateLink {
+                name: "armored".to_string(),
+                name_hash: "new".to_string(),
+                original_hash: "old".to_string(),
+                name_signature_email: "me@example.com".to_string(),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("album update"),
+            serde_json::json!({
+                "CoverLinkID": null,
+                "Link": {
+                    "Name": "armored",
+                    "Hash": "new",
+                    "OriginalHash": "old",
+                    "NameSignatureEmail": "me@example.com",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn album_removal_lists_link_ids() {
+        let request = RemovePhotosFromAlbumRequest {
+            link_ids: vec![LinkId::new("a"), LinkId::new("b")],
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("album removal"),
+            serde_json::json!({ "LinkIDs": ["a", "b"] })
+        );
+    }
 
     #[test]
     fn context_share_response_parses_required_share_id() {

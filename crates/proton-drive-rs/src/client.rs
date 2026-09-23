@@ -47,16 +47,17 @@ use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
     AcceptInvitationRequest, AddPhotoToAlbumEntry, AddPhotosToAlbumRequest,
     AddPhotosToAlbumResponse, AggregateLinksResponse, AlbumCreationLink, AlbumCreationRequest,
-    AlbumCreationResponse, AlbumItemListResponse, AlbumListResponse, BlockCreationRequest,
-    BlockDto, BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
-    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
-    CommonExtendedAttributes, ContextShareResponse, CopyPhotoContent, CopyPhotoRelatedItem,
-    CopyPhotoRequest, CopyPhotoResponse, CreateBookmarkRequest, CreatePublicLinkRequest,
-    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
-    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
-    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
-    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
-    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
+    AlbumCreationResponse, AlbumItemListResponse, AlbumListResponse, AlbumUpdateLink,
+    AlbumUpdateRequest, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
+    BlockUploadPreparationResponse, BlockUploadTarget, BlockVerificationInputResponse,
+    BlockVerifier, BookmarkShareUrlDto, BookmarksResponse, CommonExtendedAttributes,
+    ContextShareResponse, CopyPhotoContent, CopyPhotoRelatedItem, CopyPhotoRequest,
+    CopyPhotoResponse, CreateBookmarkRequest, CreatePublicLinkRequest, CreatePublicLinkResponse,
+    CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto, DeviceCreationLinkDto,
+    DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse,
+    DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto,
+    ExternalInvitationResponseDto, ExternalInvitationsResponse, FileContentDigests,
+    FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
     FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
     FolderCreationResponse, InvitationDetailsResponse, InvitationsListResponse,
     InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
@@ -64,16 +65,17 @@ use crate::dtos::{
     LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
     LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
     MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
-    NodeNameAvailabilityResponse, PhotoTagsRequest, PhotosAttributesDto, RenameLinkRequest,
-    RevisionConflict, RevisionCreationRequest, RevisionCreationResponse, RevisionDto,
-    RevisionListItemDto, RevisionListResponse, RevisionMetadataResponse, RevisionUpdateRequest,
-    ShareInvitationDto, ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto,
-    ShareResponse, ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedAlbumsResponse,
-    SharedByMeResponse, SharedWithMeResponse, SmallFileUploadMetadataRequest,
-    SmallRevisionUploadMetadataRequest, SmallUploadResponse, ThumbnailBlockListRequest,
-    ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse,
-    TransferPhotoLinkItem, TransferPhotosRequest, TransferPhotosResponse, UpdatePermissionsRequest,
-    VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse, VolumeTrashResponse,
+    NodeNameAvailabilityResponse, PhotoTagsRequest, PhotosAttributesDto,
+    RemovePhotosFromAlbumRequest, RenameLinkRequest, RevisionConflict, RevisionCreationRequest,
+    RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
+    RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
+    ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse, ShareTargetType, ShareUrlDto,
+    ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse, SharedWithMeResponse,
+    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
+    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
+    TimelinePhotoListResponse, TransferPhotoLinkItem, TransferPhotosRequest,
+    TransferPhotosResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
+    VolumeEventListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -6291,6 +6293,130 @@ impl ProtonDriveClient {
             }
         }
         Ok(())
+    }
+
+    /// Rename the album `album_uid` to `name`.
+    ///
+    /// Ported from the TypeScript SDK (`AlbumsManager.updateAlbum` +
+    /// `AlbumsCryptoService.renameAlbum`). An album's name is encrypted to the
+    /// photos root like any child name, so this is a rename sent to the album
+    /// endpoint: the new name encrypted and signed by the photos share's
+    /// membership address, its hash under the root's hash key, and the current
+    /// hash as `OriginalHash`. The cover photo is left alone.
+    pub(crate) async fn rename_album(&self, album_uid: &NodeUid, name: &str) -> Result<()> {
+        let mut timer = self.telemetry.start("rename_album");
+        validate_node_name(name)?;
+        let details = self
+            .get_link_details_ctx(
+                &album_uid.volume_id,
+                std::slice::from_ref(&album_uid.link_id),
+                true,
+            )
+            .await?;
+        let link = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("album {album_uid} not found")))?
+            .link;
+        let parent_id = link
+            .parent_id
+            .clone()
+            .ok_or_else(|| ProtonError::invalid_operation("an album has a parent"))?;
+        let parent_uid = NodeUid::new(album_uid.volume_id.clone(), parent_id);
+
+        let parent_key = self.folder_node_key(&parent_uid).await?;
+        let parent_hash_key = self
+            .parent_hash_key_ctx(&parent_uid, &parent_key, true)
+            .await?;
+        let (_address_id, email, signing_key) = self.photos_membership_address().await?;
+        let original_hash = self
+            .original_name_hash(album_uid, &link, &parent_key, &parent_hash_key)
+            .await?;
+
+        let request = AlbumUpdateRequest {
+            cover_link_id: None,
+            link: Some(AlbumUpdateLink {
+                name: parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?,
+                name_hash: hex::encode(hmac_sha256(&parent_hash_key, name.as_bytes())),
+                original_hash,
+                name_signature_email: email,
+            }),
+        };
+        let path = format!(
+            "photos/volumes/{}/albums/{}",
+            album_uid.volume_id, album_uid.link_id
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Delete the album `album_uid`.
+    ///
+    /// Ported from the TypeScript SDK (`PhotosAPIService.deleteAlbum`). With
+    /// `delete_photos` false the photos stay in the timeline, and the server
+    /// refuses (code 200302) when the album holds photos that exist only in it,
+    /// such as ones saved from a shared album; with it true those are deleted
+    /// together with the album.
+    pub(crate) async fn delete_album(
+        &self,
+        album_uid: &NodeUid,
+        delete_photos: bool,
+    ) -> Result<()> {
+        let mut timer = self.telemetry.start("delete_album");
+        let path = format!(
+            "photos/volumes/{}/albums/{}?DeleteAlbumPhotos={}",
+            album_uid.volume_id,
+            album_uid.link_id,
+            u8::from(delete_photos)
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        timer.success();
+        Ok(())
+    }
+
+    /// Take photos out of `album_uid`, one outcome per input photo in input
+    /// order. The photos stay in the timeline.
+    ///
+    /// Ported from the TypeScript SDK (`PhotosAPIService.removePhotosFromAlbum`):
+    /// batches of ten, and since the server reports no per-photo result, a
+    /// failed batch fails every photo in it.
+    pub(crate) async fn remove_photos_from_album(
+        &self,
+        album_uid: &NodeUid,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        /// Photos per `remove-multiple` request (TS `batchSize`).
+        const REMOVE_BATCH: usize = 10;
+
+        let mut timer = self.telemetry.start("remove_photos_from_album");
+        let path = format!(
+            "photos/volumes/{}/albums/{}/remove-multiple",
+            album_uid.volume_id, album_uid.link_id
+        );
+        let mut outcomes = Vec::with_capacity(photo_uids.len());
+        for batch in photo_uids.chunks(REMOVE_BATCH) {
+            let request = RemovePhotosFromAlbumRequest {
+                link_ids: batch.iter().map(|uid| uid.link_id.clone()).collect(),
+            };
+            let result: Result<proton_sdk::api::ApiResponse> =
+                self.http.post(&path, &request).await;
+            match result {
+                Ok(_) => outcomes.extend(batch.iter().map(|uid| (uid.clone(), Ok(())))),
+                Err(error) => {
+                    let message = error.to_string();
+                    outcomes.extend(batch.iter().map(|uid| {
+                        (
+                            uid.clone(),
+                            Err(ProtonError::invalid_operation(message.clone())),
+                        )
+                    }));
+                }
+            }
+        }
+        timer.success();
+        Ok(outcomes)
     }
 
     /// Copy photos into this account's own timeline, keeping them even after
