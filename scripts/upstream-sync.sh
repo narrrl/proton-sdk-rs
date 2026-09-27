@@ -2,8 +2,8 @@
 #
 # upstream-sync.sh — list C#-relevant upstream commits since our pinned SHA.
 #
-# Our pure-Rust port mirrors the canonical C# SDK only, so we watch the subtree
-# client/cs/sdk/src and drop noise (chore/docs/test/ci/build) commits. The sdk/
+# Our pure-Rust port mirrors the canonical C# SDK only, so we watch the C#
+# subtree (see SUBTREE) and drop noise (chore/docs/test/ci/build) commits. The sdk/
 # checkout is gitignored; UPSTREAM_SYNC.md holds the last-reconciled SHA.
 #
 # Usage:
@@ -34,25 +34,27 @@ for arg in "$@"; do
   esac
 done
 
-[ -d "$SDK/.git" ] || { echo "error: $SDK is not a git checkout" >&2; exit 1; }
+git -C "$SDK" rev-parse --git-dir >/dev/null 2>&1 || { echo "error: $SDK is not a git checkout" >&2; exit 1; }
 
-PIN="$(grep -oE '[0-9a-f]{40}' "$PIN_FILE" | head -1)"
-[ -n "$PIN" ] || { echo "error: no 40-char SHA found in $PIN_FILE" >&2; exit 1; }
+# first 7-40 char SHA on the Pinned line; the rest of the file is history
+PIN="$(grep -m1 'Pinned' "$PIN_FILE" | grep -oE '[0-9a-f]{7,40}' | head -1 || true)"
+[ -n "$PIN" ] || { echo "error: no Pinned SHA found in $PIN_FILE" >&2; exit 1; }
 
 echo "fetching upstream..." >&2
 git -C "$SDK" fetch --quiet origin
 
-# Upstream force-pushes: a pin whose object is gone would make the log below
-# fail, which used to read as "up to date". Fail loudly instead.
-if ! git -C "$SDK" cat-file -e "${PIN}^{commit}" 2>/dev/null; then
-  echo "error: pinned commit $PIN is not in the upstream history." >&2
+# Upstream force-pushes: a dangling pin used to read as "up to date", and a
+# rewritten-away pin still resolves locally until gc. Require ancestry instead.
+PIN="$(git -C "$SDK" rev-parse --verify --quiet "${PIN}^{commit}" || true)"
+if [ -z "$PIN" ] || ! git -C "$SDK" merge-base --is-ancestor "$PIN" "$REMOTE_REF"; then
+  echo "error: pinned commit is not in the upstream history of $REMOTE_REF." >&2
   echo "       upstream rewrote its history; re-pin from a commit date in the log." >&2
   exit 1
 fi
 
-HEAD_SHA="$(git -C "$SDK" rev-parse --short "$REMOTE_REF")"
+HEAD_SHA="$(git -C "$SDK" rev-parse "$REMOTE_REF")"
 echo "pinned:  ${PIN:0:8}"
-echo "head:    $HEAD_SHA  ($REMOTE_REF)"
+echo "head:    ${HEAD_SHA:0:8}  ($REMOTE_REF)"
 echo "subtree: ${SUBTREE[*]}"
 echo
 
@@ -70,7 +72,11 @@ else
   relevant="$(echo "$commits" | grep -vE "$NOISE" || true)"
 fi
 
-dropped="$(echo "$commits" | grep -cE "$NOISE" || true)"
+if $keep_noise; then
+  dropped=0
+else
+  dropped="$(echo "$commits" | grep -cE "$NOISE" || true)"
+fi
 echo "cs commits since pin: $(echo "$commits" | grep -c . || true)  (noise dropped: ${dropped:-0})"
 echo
 
@@ -88,7 +94,7 @@ if $show_diffs; then
   echo "$relevant" | awk '{print $1}' | while read -r sha; do
     echo
     echo "----- $sha -----"
-    git -C "$SDK" show --stat --format="%H%n%an %ci%n%n    %s%n" "$sha" -- "${SUBTREE[@]}"
+    git -C "$SDK" show --stat --patch --format="%H%n%an %ci%n%n    %s%n" "$sha" -- "${SUBTREE[@]}"
   done
 fi
 
