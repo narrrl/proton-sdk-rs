@@ -706,6 +706,19 @@ pub struct ActiveRevisionDto {
 pub struct DecryptedExtendedAttributes {
     #[serde(rename = "Common", default)]
     pub common: Option<DecryptedCommonExtendedAttributes>,
+    /// Where a photo was taken, as the uploading client read it from the file's
+    /// EXIF. Only photos carry it, and not every client writes it.
+    #[serde(rename = "Location", default)]
+    pub location: Option<DecryptedLocationExtendedAttributes>,
+}
+
+/// `Location` in the decrypted `XAttr` payload: WGS 84 decimal degrees.
+#[derive(Debug, Default, Deserialize)]
+pub struct DecryptedLocationExtendedAttributes {
+    #[serde(rename = "Latitude", default)]
+    pub latitude: Option<f64>,
+    #[serde(rename = "Longitude", default)]
+    pub longitude: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

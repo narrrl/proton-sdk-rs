@@ -79,8 +79,8 @@ use crate::dtos::{
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
-    AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoProperties, RevisionState,
-    Thumbnail, ThumbnailType,
+    AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoLocation, PhotoProperties,
+    RevisionState, Thumbnail, ThumbnailType,
 };
 use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
@@ -7476,6 +7476,7 @@ impl ProtonDriveClient {
                 let mut claimed_size = None;
                 let mut claimed_modification_time = None;
                 let mut content_sha1 = None;
+                let mut location = None;
                 if let Some(node_key) = node_key.as_ref()
                     && let Some(rev) = file.active_revision.as_ref()
                     && let Some(xattr) = rev.extended_attributes.as_deref()
@@ -7490,6 +7491,9 @@ impl ProtonDriveClient {
                     {
                         Ok((attrs, status)) => {
                             verification.extended_attributes = Some(status);
+                            location = attrs
+                                .location
+                                .and_then(|l| PhotoLocation::from_claimed(l.latitude, l.longitude));
                             if let Some(common) = attrs.common {
                                 claimed_size = common.size;
                                 claimed_modification_time = common.modification_time;
@@ -7525,6 +7529,7 @@ impl ProtonDriveClient {
                         .iter()
                         .map(|album| NodeUid::new(volume_id.clone(), album.album_link_id.clone()))
                         .collect(),
+                    location,
                 });
                 NodeKind::File {
                     media_type: file.media_type.clone(),

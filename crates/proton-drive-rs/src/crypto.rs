@@ -315,5 +315,22 @@ mod tests {
 
         let decoded = decrypt_xattr(&node.key, &armored);
         assert!(decoded.common.is_none());
+        assert!(decoded.location.is_none());
+    }
+
+    #[test]
+    fn extended_attributes_carry_a_photo_location() {
+        let node = generate_node_key().expect("generate node key");
+        let xattr = r#"{"Common":{"Size":1},"Location":{"Latitude":52.52,"Longitude":-13.405},"Camera":{"Device":"Pixel"}}"#;
+        let armored = node
+            .key
+            .encrypt_and_sign(&node.key, xattr.as_bytes(), false, true)
+            .expect("encrypt xattr");
+
+        let location = decrypt_xattr(&node.key, &armored)
+            .location
+            .expect("location present");
+        assert_eq!(location.latitude, Some(52.52));
+        assert_eq!(location.longitude, Some(-13.405));
     }
 }

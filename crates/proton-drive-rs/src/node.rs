@@ -100,6 +100,33 @@ pub struct PhotoProperties {
     pub tags: Vec<PhotoTag>,
     /// The albums this photo has been added to.
     pub album_uids: Vec<NodeUid>,
+    /// Where the photo was taken, from the active revision's extended
+    /// attributes. `None` when the uploader wrote no location, the attributes
+    /// failed to decrypt, or the coordinates are not a valid position.
+    #[serde(default)]
+    pub location: Option<PhotoLocation>,
+}
+
+/// A photo's position in WGS 84 decimal degrees, as the uploading client
+/// claimed it (`XAttr` `Location`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PhotoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl PhotoLocation {
+    /// A position from claimed coordinates: both present, finite, and on the
+    /// globe. Anything else is no position at all rather than a wrong one.
+    pub fn from_claimed(latitude: Option<f64>, longitude: Option<f64>) -> Option<Self> {
+        let (latitude, longitude) = (latitude?, longitude?);
+        ((-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude)).then_some(
+            Self {
+                latitude,
+                longitude,
+            },
+        )
+    }
 }
 
 /// Album-only metadata on an album node. Mirrors the fields C# `AlbumNode` adds
@@ -410,5 +437,26 @@ mod tests {
         let back: Node = serde_json::from_str(legacy).unwrap();
         assert!(back.membership.is_none());
         assert_eq!(back.name, "My Documents");
+    }
+
+    #[test]
+    fn a_claimed_location_off_the_globe_is_no_location() {
+        assert_eq!(
+            PhotoLocation::from_claimed(Some(52.52), Some(13.405)),
+            Some(PhotoLocation {
+                latitude: 52.52,
+                longitude: 13.405
+            })
+        );
+        assert_eq!(PhotoLocation::from_claimed(Some(52.52), None), None);
+        assert_eq!(PhotoLocation::from_claimed(Some(91.0), Some(0.0)), None);
+        assert_eq!(PhotoLocation::from_claimed(Some(0.0), Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn photo_properties_cached_before_locations_still_parse() {
+        let legacy = r#"{"capture_time":1,"content_hash":null,"main_photo_uid":null,"related_photo_uids":[],"tags":[],"album_uids":[]}"#;
+        let back: PhotoProperties = serde_json::from_str(legacy).unwrap();
+        assert!(back.location.is_none());
     }
 }
