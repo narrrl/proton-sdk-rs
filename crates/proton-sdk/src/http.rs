@@ -27,6 +27,36 @@ const STORAGE_TOKEN_HEADER: &str = "pm-storage-token";
 const HV_TOKEN_HEADER: &str = "x-pm-human-verification-token";
 const HV_TOKEN_TYPE_HEADER: &str = "x-pm-human-verification-token-type";
 
+/// How often an open connection is pinged, and how long a ping may go
+/// unanswered before the connection is dropped.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long opening a new connection may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The HTTP client every request goes through.
+///
+/// HTTP/2 sends all requests to a host over one connection. When a NAT or a
+/// network switch drops that connection without a reset, every request on it
+/// waits for the full `request_timeout`, and the next request reuses the same
+/// dead connection. Pings detect a dead connection within
+/// `KEEP_ALIVE_INTERVAL + KEEP_ALIVE_TIMEOUT` and make the pool open a new one.
+///
+/// `gzip` makes reqwest advertise Accept-Encoding and transparently decode the
+/// response. The Proton API honours it for the JSON envelope, which is the bulk
+/// of a metadata-heavy walk (link details, listings). Block bodies are already
+/// ciphertext and will not compress; the header costs nothing there.
+fn client_builder(config: &ProtonClientConfiguration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .connect_timeout(CONNECT_TIMEOUT.min(config.request_timeout))
+        .tcp_keepalive(KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true)
+        .gzip(true)
+}
+
 /// The mutable authentication tokens for a session, shared between every
 /// request and the refresh path.
 #[derive(Debug, Clone)]
@@ -97,15 +127,7 @@ impl ApiHttpClient {
         session_id: SessionId,
         tokens: Tokens,
     ) -> Result<Self> {
-        // `gzip` makes reqwest advertise Accept-Encoding and transparently decode
-        // the response. The Proton API honours it for the JSON envelope, which is
-        // the bulk of a metadata-heavy walk (link details, listings). Block bodies
-        // are already ciphertext and will not compress — the header costs nothing
-        // there, and storage responses are unaffected either way.
-        let http = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .gzip(true)
-            .build()?;
+        let http = client_builder(&config).build()?;
 
         let base_url = ensure_trailing_slash(&config.base_url);
 
@@ -609,10 +631,7 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     config: &ProtonClientConfiguration,
     path: &str,
 ) -> Result<T> {
-    let http = reqwest::Client::builder()
-        .timeout(config.request_timeout)
-        .gzip(true)
-        .build()?;
+    let http = client_builder(config).build()?;
 
     let base_url = ensure_trailing_slash(&config.base_url);
     let url = format!("{}{}", base_url, path.trim_start_matches('/'));
@@ -659,10 +678,7 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
     body: &B,
     verification: Option<&HumanVerificationCredential>,
 ) -> Result<T> {
-    let http = reqwest::Client::builder()
-        .timeout(config.request_timeout)
-        .gzip(true)
-        .build()?;
+    let http = client_builder(config).build()?;
 
     let base_url = ensure_trailing_slash(&config.base_url);
     let url = format!("{}{}", base_url, path.trim_start_matches('/'));
