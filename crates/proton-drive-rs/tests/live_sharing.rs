@@ -251,6 +251,34 @@ async fn shared_with_me_and_incoming_invitations_read() {
         .expect("enumerate_shared_with_me_node_uids must not error");
     eprintln!("[info] shared-with-me count: {}", shared.len());
 
+    // Share roots are parentless and each has its own share key. Enumerated
+    // together they must resolve exactly as they do one at a time — a batch
+    // that reuses one root's key for the rest drops them (proton-sdk-rs#2).
+    let mut one_by_one = Vec::new();
+    for uid in &shared {
+        let nodes = client
+            .enumerate_nodes(std::slice::from_ref(uid))
+            .await
+            .expect("enumerate_nodes (single root) must not error");
+        one_by_one.extend(nodes.into_iter().map(|node| node.uid));
+    }
+    let batched: Vec<NodeUid> = client
+        .enumerate_nodes(&shared)
+        .await
+        .expect("enumerate_nodes (all roots) must not error")
+        .into_iter()
+        .map(|node| node.uid)
+        .collect();
+    let light: Vec<NodeUid> = client
+        .enumerate_nodes_light(&shared)
+        .await
+        .expect("enumerate_nodes_light (all roots) must not error")
+        .into_iter()
+        .map(|node| node.uid)
+        .collect();
+    assert_eq!(batched, one_by_one, "batched roots must match one-by-one");
+    assert_eq!(light, one_by_one, "light roots must match one-by-one");
+
     let incoming = client
         .list_incoming_invitations()
         .await

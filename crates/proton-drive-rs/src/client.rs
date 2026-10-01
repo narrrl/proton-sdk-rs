@@ -260,11 +260,11 @@ pub struct ProtonDriveClient {
     /// lookups of the same node used to issue one link-details request and one
     /// S2K each; now the first runs and the rest wait on it.
     node_loads: Arc<SingleFlight<NodeUid, Option<Node>>>,
-    /// In-flight parent-key resolutions, keyed by the ancestor being resolved
-    /// *from* and the photos routing flag. Siblings enumerated concurrently all
-    /// want the same folder key, and resolving it walks (and decrypts) the whole
-    /// ancestor chain.
-    parent_key_loads: Arc<SingleFlight<(NodeUid, bool), PrivateKey>>,
+    /// In-flight parent-key resolutions, keyed by the volume, the key being
+    /// resolved, and the photos routing flag. Siblings enumerated concurrently
+    /// all want the same folder key, and resolving it walks (and decrypts) the
+    /// whole ancestor chain.
+    parent_key_loads: Arc<SingleFlight<(VolumeId, ParentKeyId, bool), PrivateKey>>,
     /// Serializes context-share lookups against moves and remote invalidations.
     ///
     /// Lookups hold a read guard through cache/network/cache; context-changing
@@ -805,8 +805,8 @@ impl ProtonDriveClient {
     /// [`MAX_CONCURRENT_NODE_BUILDS`] at a time — which, now that the link crypto
     /// runs on the blocking pool, spreads the per-node S2K over several cores.
     /// Parent keys are still resolved *before* that fan-out, one per distinct
-    /// parent: siblings share a parent, and resolving concurrently would walk and
-    /// decrypt the same ancestor chain many times over.
+    /// [`ParentKeyId`]: siblings share a parent, and resolving concurrently would
+    /// walk and decrypt the same ancestor chain many times over.
     ///
     /// Order is preserved (`buffered`, not `buffer_unordered`), as is the
     /// skip-and-warn behavior for a node whose parent key or own crypto fails.
@@ -831,27 +831,15 @@ impl ProtonDriveClient {
             .buffered(MAX_CONCURRENT_DETAIL_FETCHES);
 
             while let Some(details) = fetches.try_next().await? {
-                let mut parent_keys: HashMap<Option<LinkId>, PrivateKey> = HashMap::new();
-                for link_details in &details.links {
-                    let parent_id = link_details.link.parent_id.clone();
-                    if parent_keys.contains_key(&parent_id) {
-                        continue;
-                    }
-                    match self
-                        .resolve_parent_key(&volume_id, &link_details.link)
-                        .await
-                    {
-                        Ok(key) => {
-                            parent_keys.insert(parent_id, key);
-                        }
-                        Err(e) => {
-                            tracing::warn!(link_id = %link_details.link.id, error = %e, "skipping node: parent key unavailable");
-                        }
-                    }
-                }
+                let parent_keys = resolve_parent_keys(&details.links, |link| {
+                    self.resolve_parent_key(&volume_id, link)
+                })
+                .await;
 
                 let buildable = details.links.into_iter().filter_map(|link_details| {
-                    let parent_key = parent_keys.get(&link_details.link.parent_id)?.clone();
+                    let parent_key = parent_keys
+                        .get(&ParentKeyId::of(&link_details.link))?
+                        .clone();
                     Some((link_details, parent_key))
                 });
                 let mut built = stream::iter(buildable.map(|(link_details, parent_key)| {
@@ -7204,17 +7192,15 @@ impl ProtonDriveClient {
 
         // Siblings resolved concurrently all want this same key, and getting it
         // means walking and decrypting the whole ancestor chain — so one of them
-        // does it and the rest wait. Parentless links key on their own id: what
-        // they resolve to is that root's share key.
-        let target = NodeUid::new(
-            volume_id.clone(),
-            link.parent_id.clone().unwrap_or_else(|| link.id.clone()),
-        );
+        // does it and the rest wait. A root's share key and the node key its
+        // children want are different keys of the same link, so they must not
+        // join each other's load (`ParentKeyId` tells them apart).
+        let target = (volume_id.clone(), ParentKeyId::of(link), for_photos);
         let client = self.clone();
         let volume_id = volume_id.clone();
         let link = link.clone();
         self.parent_key_loads
-            .run((target, for_photos), async move {
+            .run(target, async move {
                 client
                     .resolve_parent_key_walk(&volume_id, &link, for_photos)
                     .await
@@ -7970,6 +7956,71 @@ fn group_by_volume(uids: &[NodeUid]) -> Vec<(VolumeId, Vec<LinkId>)> {
     groups
 }
 
+/// The key a link is decrypted with, named by where it comes from.
+///
+/// A link with a parent is decrypted with that folder's node key. A parentless
+/// link — My Files, a device root, a share root — is decrypted with the share
+/// key of *its own* root, so two parentless links never share a key. Keying on
+/// `parent_id` alone puts every root of a volume on `None`, which handed the
+/// first root's share key to the rest ("missing key"; proton-sdk-rs#2). And
+/// keying a root on its own id, as a bare link id, collides with its children,
+/// whose parent key is that same folder's *node* key rather than its share key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ParentKeyId {
+    /// The node key of this folder: the parent of a non-root link.
+    Parent(LinkId),
+    /// The share key of this root: what a parentless link decrypts against.
+    Root(LinkId),
+}
+
+impl ParentKeyId {
+    fn of(link: &LinkDto) -> Self {
+        match &link.parent_id {
+            Some(parent_id) => Self::Parent(parent_id.clone()),
+            None => Self::Root(link.id.clone()),
+        }
+    }
+}
+
+/// Resolve the parent key of every link in a batch, once per distinct
+/// [`ParentKeyId`], in link order. Look a link's key up with
+/// [`ParentKeyId::of`].
+///
+/// Serial on purpose: siblings share a parent, and resolving concurrently would
+/// walk and decrypt the same ancestor chain many times over. A key that fails to
+/// resolve is logged and left out, so only the links that need it are skipped.
+///
+/// Takes the batch as a slice rather than an iterator of links: a `map` closure
+/// projecting each link, held across the awaits, gives the future a
+/// higher-ranked lifetime that `tokio::spawn` rejects in callers
+/// (`tests/spawnable.rs` pins it).
+async fn resolve_parent_keys<'a, K, F, Fut>(
+    links: &'a [LinkDetailsDto],
+    mut resolve: F,
+) -> HashMap<ParentKeyId, K>
+where
+    F: FnMut(&'a LinkDto) -> Fut,
+    Fut: Future<Output = Result<K>>,
+{
+    let mut keys = HashMap::new();
+    for details in links {
+        let link = &details.link;
+        let id = ParentKeyId::of(link);
+        if keys.contains_key(&id) {
+            continue;
+        }
+        match resolve(link).await {
+            Ok(key) => {
+                keys.insert(id, key);
+            }
+            Err(e) => {
+                tracing::warn!(link_id = %link.id, error = %e, "skipping node: parent key unavailable");
+            }
+        }
+    }
+    keys
+}
+
 /// Map a wire `VolumeEventDto` to a public [`DriveEvent`]. C#
 /// `VolumeEventDtoExtensions.ToDriveEvent`: Create/Update/UpdateMetadata →
 /// `NodeUpdated`, Delete → `NodeDeleted`; any other type is rejected.
@@ -8557,16 +8608,18 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 mod tests {
     use super::{
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
-        MAX_NODE_NAME_LENGTH, NodeAction, aggregate_outcomes, alternate_names, assemble_manifest,
-        context_share_path, drive_items, epoch_to_iso8601, is_expired_upload_token,
-        is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
-        path_segments, record_timeline_outcome, run_context_share_mutation,
-        share_membership_from_dto, small_upload_applicable, small_upload_should_fall_back,
-        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
+        MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_names,
+        assemble_manifest, context_share_path, drive_items, epoch_to_iso8601,
+        is_expired_upload_token, is_listable_revision_state, is_upload_timeout, join_node_path,
+        missing_related_links, path_segments, record_timeline_outcome, resolve_parent_keys,
+        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
+        small_upload_should_fall_back, take_block_target, take_thumbnail_target, to_drive_event,
+        validate_node_name,
     };
     use crate::dtos::{
-        AggregateLinksResponse, BlockUploadTarget, LinkIdResponsePair, ShareMembershipSummaryDto,
-        SharedWithMeLinkDto, SharedWithMeResponse, VolumeEventDto, VolumeEventLinkDto,
+        AggregateLinksResponse, BlockUploadTarget, LinkDetailsDto, LinkDto, LinkIdResponsePair,
+        ShareMembershipSummaryDto, SharedWithMeLinkDto, SharedWithMeResponse, VolumeEventDto,
+        VolumeEventLinkDto,
     };
     use crate::node::RevisionState;
     use crate::sharing::MemberRole;
@@ -9334,5 +9387,147 @@ mod tests {
         assert!(!small_upload_should_fall_back(
             &ProtonError::invalid_operation("bug")
         ));
+    }
+
+    /// A folder link with only the fields parent-key resolution reads.
+    fn key_test_link(id: &str, parent_id: Option<&str>) -> LinkDetailsDto {
+        let link = LinkDto {
+            id: LinkId::new(id),
+            link_type: 1,
+            parent_id: parent_id.map(LinkId::new),
+            state: 1,
+            creation_time: 0,
+            modification_time: 0,
+            trash_time: None,
+            trashed_legacy: None,
+            name: String::new(),
+            name_hash: None,
+            key: String::new(),
+            passphrase: String::new(),
+            passphrase_signature: None,
+            signature_email: None,
+            name_signature_email: None,
+        };
+        LinkDetailsDto {
+            link,
+            folder: None,
+            file: None,
+            photo: None,
+            album: None,
+            sharing: None,
+            membership: None,
+        }
+    }
+
+    /// Resolve `links` against a fake resolver that names each key after the
+    /// link it was resolved for, recording every resolution. Roots resolve to
+    /// their share key, other links to their parent's node key — the two
+    /// distinct keys the real resolver returns. `fail` names links whose key
+    /// resolution errors.
+    async fn resolve_fake_keys(
+        links: &[LinkDetailsDto],
+        fail: &[&str],
+    ) -> (std::collections::HashMap<ParentKeyId, String>, Vec<String>) {
+        let mut calls = Vec::new();
+        let keys = resolve_parent_keys(links, |link: &LinkDto| {
+            calls.push(link.id.to_string());
+            let outcome = if fail.contains(&link.id.as_str()) {
+                Err(ProtonError::invalid_operation("missing key"))
+            } else {
+                Ok(match &link.parent_id {
+                    Some(parent_id) => format!("node-key:{parent_id}"),
+                    None => format!("share-key:{}", link.id),
+                })
+            };
+            std::future::ready(outcome)
+        })
+        .await;
+        (keys, calls)
+    }
+
+    fn key_for<'k>(
+        keys: &'k std::collections::HashMap<ParentKeyId, String>,
+        details: &LinkDetailsDto,
+    ) -> Option<&'k str> {
+        keys.get(&ParentKeyId::of(&details.link))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn parent_key_id_tells_roots_from_parents() {
+        let root = key_test_link("x", None).link;
+        let child = key_test_link("c", Some("x")).link;
+
+        assert_eq!(ParentKeyId::of(&root), ParentKeyId::Root(LinkId::new("x")));
+        assert_eq!(
+            ParentKeyId::of(&child),
+            ParentKeyId::Parent(LinkId::new("x"))
+        );
+        // A root's share key and its children's parent key are different keys
+        // of the same link; the single-flight key must keep them apart.
+        assert_ne!(ParentKeyId::of(&root), ParentKeyId::of(&child));
+        assert_ne!(
+            ParentKeyId::of(&root),
+            ParentKeyId::of(&key_test_link("y", None).link)
+        );
+    }
+
+    /// proton-sdk-rs#2: several share roots on one volume, enumerated together.
+    /// Each must get its own share key, not the first root's. Full and light
+    /// enumeration both resolve their keys through this function.
+    #[tokio::test]
+    async fn parent_keys_resolve_each_root_separately() {
+        let links = [
+            key_test_link("a", None),
+            key_test_link("b", None),
+            key_test_link("c", None),
+        ];
+        let (keys, calls) = resolve_fake_keys(&links, &[]).await;
+
+        assert_eq!(calls, ["a", "b", "c"]);
+        assert_eq!(key_for(&keys, &links[0]), Some("share-key:a"));
+        assert_eq!(key_for(&keys, &links[1]), Some("share-key:b"));
+        assert_eq!(key_for(&keys, &links[2]), Some("share-key:c"));
+    }
+
+    #[tokio::test]
+    async fn parent_keys_keep_a_root_apart_from_its_children() {
+        let links = [key_test_link("x", None), key_test_link("c", Some("x"))];
+        let (keys, calls) = resolve_fake_keys(&links, &[]).await;
+
+        assert_eq!(calls, ["x", "c"]);
+        assert_eq!(key_for(&keys, &links[0]), Some("share-key:x"));
+        assert_eq!(key_for(&keys, &links[1]), Some("node-key:x"));
+    }
+
+    #[tokio::test]
+    async fn parent_keys_resolve_a_shared_parent_once() {
+        let links = [
+            key_test_link("a", Some("p")),
+            key_test_link("b", Some("p")),
+            key_test_link("c", Some("q")),
+            key_test_link("d", Some("p")),
+        ];
+        let (keys, calls) = resolve_fake_keys(&links, &[]).await;
+
+        assert_eq!(calls, ["a", "c"], "one resolution per distinct parent");
+        assert_eq!(key_for(&keys, &links[1]), Some("node-key:p"));
+        assert_eq!(key_for(&keys, &links[2]), Some("node-key:q"));
+        assert_eq!(key_for(&keys, &links[3]), Some("node-key:p"));
+    }
+
+    #[tokio::test]
+    async fn parent_keys_skip_only_the_links_whose_key_failed() {
+        let links = [
+            key_test_link("a", None),
+            key_test_link("b", None),
+            key_test_link("c", None),
+        ];
+        let (keys, calls) = resolve_fake_keys(&links, &["b"]).await;
+
+        assert_eq!(calls, ["a", "b", "c"]);
+        assert_eq!(key_for(&keys, &links[0]), Some("share-key:a"));
+        assert_eq!(key_for(&keys, &links[1]), None);
+        assert_eq!(key_for(&keys, &links[2]), Some("share-key:c"));
     }
 }
