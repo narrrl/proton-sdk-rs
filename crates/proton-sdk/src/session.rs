@@ -57,6 +57,28 @@ pub struct ProtonApiSession {
     scopes: Vec<String>,
     password_mode: PasswordMode,
     is_waiting_for_second_factor: bool,
+    second_factor_methods: SecondFactorMethods,
+}
+
+/// Which second factors an account has enabled, as its login reported them.
+///
+/// Proton sends a bitmask: `1` an authenticator app (TOTP), `2` a security
+/// key (FIDO2). [`ProtonApiSession::apply_second_factor_code`] answers only
+/// the first, so a client without WebAuthn uses this to tell an account it
+/// cannot finish signing in apart from a code that was simply wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SecondFactorMethods {
+    pub totp: bool,
+    pub fido2: bool,
+}
+
+impl SecondFactorMethods {
+    fn from_wire(enabled: i32) -> Self {
+        Self {
+            totp: enabled & 1 != 0,
+            fido2: enabled & 2 != 0,
+        }
+    }
 }
 
 impl ProtonApiSession {
@@ -76,6 +98,8 @@ impl ProtonApiSession {
             scopes: params.scopes,
             password_mode: params.password_mode,
             is_waiting_for_second_factor: params.is_waiting_for_second_factor_code,
+            // Only a login reports them, and a resumed session is past that.
+            second_factor_methods: SecondFactorMethods::default(),
         })
     }
 
@@ -166,6 +190,7 @@ impl ProtonApiSession {
             refresh_token: auth.refresh_token,
         };
         let http = ApiHttpClient::new(config, auth.session_id.clone(), tokens)?;
+        let enabled = auth.second_factor.map_or(0, |f| f.enabled);
 
         Ok(Self {
             http,
@@ -174,10 +199,8 @@ impl ProtonApiSession {
             user_id: auth.user_id,
             scopes: auth.scopes,
             password_mode: PasswordMode::from_wire(auth.password_mode),
-            is_waiting_for_second_factor: auth
-                .second_factor
-                .map(|f| f.is_enabled())
-                .unwrap_or(false),
+            is_waiting_for_second_factor: enabled != 0,
+            second_factor_methods: SecondFactorMethods::from_wire(enabled),
         })
     }
 
@@ -241,6 +264,12 @@ impl ProtonApiSession {
     /// are fully authorized.
     pub fn is_waiting_for_second_factor(&self) -> bool {
         self.is_waiting_for_second_factor
+    }
+
+    /// The second factors the account has enabled, as its login reported
+    /// them. All `false` on a resumed session, which no longer needs one.
+    pub fn second_factor_methods(&self) -> SecondFactorMethods {
+        self.second_factor_methods
     }
 
     /// Snapshot current tokens for persistence (they may have rotated on refresh).
@@ -325,8 +354,36 @@ struct SecondFactorInfo {
     enabled: i32,
 }
 
-impl SecondFactorInfo {
-    fn is_enabled(&self) -> bool {
-        self.enabled != 0
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_factor_methods_read_from_the_login_bitmask() {
+        assert_eq!(
+            SecondFactorMethods::from_wire(0),
+            SecondFactorMethods::default()
+        );
+        assert_eq!(
+            SecondFactorMethods::from_wire(1),
+            SecondFactorMethods {
+                totp: true,
+                fido2: false
+            }
+        );
+        assert_eq!(
+            SecondFactorMethods::from_wire(2),
+            SecondFactorMethods {
+                totp: false,
+                fido2: true
+            }
+        );
+        assert_eq!(
+            SecondFactorMethods::from_wire(3),
+            SecondFactorMethods {
+                totp: true,
+                fido2: true
+            }
+        );
     }
 }

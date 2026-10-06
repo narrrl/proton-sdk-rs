@@ -134,6 +134,28 @@ impl AccountClient {
         }
     }
 
+    /// Build a client from per-key passphrases already derived — the output of
+    /// [`key_passphrases`](Self::key_passphrases) — with no mailbox password.
+    ///
+    /// Neither the mailbox password nor the key salts are needed after this:
+    /// the passphrases are what both exist to produce. A key whose id is
+    /// missing from the map does not unlock, exactly as a key without a salt.
+    pub fn with_key_passphrases(
+        session: &ProtonApiSession,
+        key_passphrases: HashMap<String, Vec<u8>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                http: session.http().clone(),
+                mailbox_password: Vec::new(),
+                cache: Mutex::new(Cache {
+                    key_passphrases: Some(key_passphrases),
+                    ..Cache::default()
+                }),
+            }),
+        }
+    }
+
     /// The account's key salts, fetched (and cached) unless already seeded.
     ///
     /// Requires the `locked` scope — call it on a freshly password-authenticated
@@ -314,9 +336,16 @@ impl AccountClient {
         Ok(keys)
     }
 
-    /// Derive (and cache) the per-key passphrases from the mailbox password and
-    /// the account's key salts.
-    async fn key_passphrases(&self) -> Result<HashMap<String, Vec<u8>>> {
+    /// The per-key passphrases, key id → passphrase, derived (and cached) from
+    /// the mailbox password and the account's key salts.
+    ///
+    /// Each one unlocks a key, so they are as secret as the password they come
+    /// from. Persisting these instead of the password, and resuming with
+    /// [`with_key_passphrases`](Self::with_key_passphrases), keeps the password
+    /// itself out of storage. Deriving needs the salts, so on a session
+    /// resumed without them call this right after login, as for
+    /// [`key_salts`](Self::key_salts).
+    pub async fn key_passphrases(&self) -> Result<HashMap<String, Vec<u8>>> {
         {
             let cache = self.inner.cache.lock().await;
             if let Some(passphrases) = &cache.key_passphrases {
@@ -433,4 +462,37 @@ fn encode_query_component(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProtonClientConfiguration;
+    use crate::session::{PasswordMode, ResumeParameters};
+
+    fn session() -> ProtonApiSession {
+        ProtonApiSession::resume(
+            ProtonClientConfiguration::new("test@1.0.0"),
+            ResumeParameters {
+                session_id: "session".to_owned().into(),
+                username: "user".to_owned(),
+                user_id: "user-id".to_owned().into(),
+                access_token: "access".to_owned(),
+                refresh_token: "refresh".to_owned(),
+                scopes: Vec::new(),
+                is_waiting_for_second_factor_code: false,
+                password_mode: PasswordMode::Single,
+            },
+        )
+        .expect("resume")
+    }
+
+    #[tokio::test]
+    async fn seeded_key_passphrases_are_used_without_deriving_or_a_request() {
+        let passphrases = HashMap::from([("key-1".to_owned(), b"derived".to_vec())]);
+        let client = AccountClient::with_key_passphrases(&session(), passphrases.clone());
+        // No salts were given and the base URL is unreachable from a test, so
+        // anything but the seeded map would fail here.
+        assert_eq!(client.key_passphrases().await.unwrap(), passphrases);
+    }
 }

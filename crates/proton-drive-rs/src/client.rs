@@ -508,9 +508,34 @@ impl ProtonDriveClient {
         mailbox_password: impl Into<Vec<u8>>,
         key_salts: Vec<KeySalt>,
     ) -> Self {
+        Self::with_account(
+            session,
+            AccountClient::with_key_salts(session, mailbox_password, key_salts),
+        )
+    }
+
+    /// Build a Drive client whose key chain unlocks from per-key passphrases
+    /// already derived, with no mailbox password at all.
+    ///
+    /// For a client that persists a session: storing the derived passphrases
+    /// ([`AccountClient::key_passphrases`], captured right after login) in
+    /// place of the mailbox password means the store never holds the
+    /// password itself — which, on a single-password account, is the login
+    /// password. They unlock the keys all the same, so keep them as secret.
+    pub fn with_key_passphrases(
+        session: &ProtonApiSession,
+        key_passphrases: HashMap<String, Vec<u8>>,
+    ) -> Self {
+        Self::with_account(
+            session,
+            AccountClient::with_key_passphrases(session, key_passphrases),
+        )
+    }
+
+    fn with_account(session: &ProtonApiSession, account: AccountClient) -> Self {
         Self {
             http: session.http().with_base_route("drive/"),
-            account: AccountClient::with_key_salts(session, mailbox_password, key_salts),
+            account,
             cache: Arc::new(Mutex::new(DriveCache::default())),
             entities: DriveEntityCache::new(InMemoryCacheRepository::shared()),
             telemetry: NoopTelemetry::shared(),
