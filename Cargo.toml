@@ -44,7 +44,7 @@ sha2 = "0.11"
 aes-gcm = "0.11"
 hkdf = "0.13"
 bcrypt = "0.19"
-pgp = "0.20"
+pgp = "0.21"
 # Match the chrono line rPGP pulls in; used to stamp detached-signature subpackets.
 chrono = "0.4"
 tracing = "0.1"
