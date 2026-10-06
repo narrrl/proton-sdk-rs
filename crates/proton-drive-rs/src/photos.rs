@@ -20,7 +20,7 @@ use proton_sdk::session::ProtonApiSession;
 
 use crate::client::ProtonDriveClient;
 use crate::events::{DriveEvent, DriveEventScopeId};
-use crate::node::{FileThumbnail, Node, Thumbnail, ThumbnailType};
+use crate::node::{FileThumbnail, Node, RecentlyAccessedReportItem, Thumbnail, ThumbnailType};
 
 /// One photos-timeline entry: a photo node and its capture time (epoch
 /// seconds). C# `PhotosTimelineItem(NodeUid Uid, DateTime CaptureTime)`.
@@ -142,6 +142,16 @@ impl ProtonPhotosClient {
     /// C# `ProtonPhotosClient.EnumerateNodesAsync`.
     pub async fn enumerate_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
         self.drive.enumerate_photos_nodes(uids).await
+    }
+
+    /// Tell the server which photos the user recently opened. See
+    /// [`ProtonDriveClient::report_recently_accessed`]; this posts to the
+    /// photos route.
+    pub async fn report_recently_accessed(
+        &self,
+        items: &[RecentlyAccessedReportItem],
+    ) -> Result<()> {
+        self.drive.report_photos_recently_accessed(items).await
     }
 
     /// Enumerate the photos timeline newest-first.

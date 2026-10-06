@@ -415,6 +415,26 @@ pub struct AlbumUpdateLink {
     pub name_signature_email: String,
 }
 
+/// `POST recently-accessed-items` (and its `photos/` twin) — tell the server
+/// which nodes the user opened. Upstream `ReportRecentlyAccessedItemsRequest`.
+#[derive(Debug, Serialize)]
+pub struct ReportRecentlyAccessedRequest {
+    #[serde(rename = "RecentlyAccessedItems")]
+    pub items: Vec<ReportRecentlyAccessedItem>,
+}
+
+/// One entry of [`ReportRecentlyAccessedRequest`].
+#[derive(Debug, Serialize)]
+pub struct ReportRecentlyAccessedItem {
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    /// Epoch seconds.
+    #[serde(rename = "AccessTime")]
+    pub access_time: i64,
+}
+
 /// `POST photos/volumes/{vid}/albums/{lid}/remove-multiple` — take photos out
 /// of an album; they stay in the timeline. Ported from the TypeScript SDK
 /// (`PhotosAPIService.removePhotosFromAlbum`).
@@ -637,6 +657,13 @@ pub struct LinkDto {
     pub signature_email: Option<String>,
     #[serde(rename = "NameSignatureEmail")]
     pub name_signature_email: Option<String>,
+    /// Created by a client other than Proton's own (upstream `f257c20e`, for
+    /// telemetry's `CreatedBy`). Absent on older backends, hence `false`.
+    #[serde(rename = "ThirdParty", default)]
+    pub third_party: bool,
+    /// Created through the SDK; only meaningful with [`third_party`](Self::third_party).
+    #[serde(rename = "Sdk", default)]
+    pub sdk: bool,
 }
 
 impl LinkDto {
@@ -696,6 +723,12 @@ pub struct ActiveRevisionDto {
     /// revision's extended attributes. Decrypts to [`DecryptedExtendedAttributes`].
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<String>,
+    /// As [`LinkDto::third_party`], for the revision (upstream `f257c20e`).
+    #[serde(rename = "ThirdParty", default)]
+    pub third_party: bool,
+    /// As [`LinkDto::sdk`], for the revision.
+    #[serde(rename = "Sdk", default)]
+    pub sdk: bool,
 }
 
 /// The decrypted `XAttr` JSON payload, read side. Mirrors C# `ExtendedAttributes`
@@ -1710,6 +1743,34 @@ pub struct DeviceUpdateShareDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recently_accessed_request_uses_the_wire_names() {
+        let request = ReportRecentlyAccessedRequest {
+            items: vec![ReportRecentlyAccessedItem {
+                volume_id: VolumeId::new("v"),
+                link_id: LinkId::new("l"),
+                access_time: 1_700_000_000,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("report"),
+            serde_json::json!({
+                "RecentlyAccessedItems": [
+                    {"VolumeID": "v", "LinkID": "l", "AccessTime": 1_700_000_000}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn link_creator_flags_default_to_first_party() {
+        let revision: ActiveRevisionDto = serde_json::from_value(serde_json::json!({
+            "RevisionID": "r", "CreateTime": 1, "EncryptedSize": 2, "XAttr": null
+        }))
+        .expect("revision");
+        assert!(!revision.third_party && !revision.sdk);
+    }
 
     #[test]
     fn album_rename_sends_the_name_and_no_cover() {

@@ -66,7 +66,8 @@ use crate::dtos::{
     LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
     MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
     NodeNameAvailabilityResponse, PhotoTagsRequest, PhotosAttributesDto,
-    RemovePhotosFromAlbumRequest, RenameLinkRequest, RevisionConflict, RevisionCreationRequest,
+    RemovePhotosFromAlbumRequest, RenameLinkRequest, ReportRecentlyAccessedItem,
+    ReportRecentlyAccessedRequest, RevisionConflict, RevisionCreationRequest,
     RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
     RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
     ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse, ShareTargetType, ShareUrlDto,
@@ -80,7 +81,7 @@ use crate::dtos::{
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
     AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoLocation, PhotoProperties,
-    RevisionState, Thumbnail, ThumbnailType,
+    RecentlyAccessedReportItem, RevisionState, Thumbnail, ThumbnailType,
 };
 use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
@@ -790,6 +791,55 @@ impl ProtonDriveClient {
         timer.attr("node_count", uids.len());
         timer.success();
         Ok(uids)
+    }
+
+    /// Tell the server which nodes the user recently opened.
+    ///
+    /// Mirrors upstream `ReportRecentlyAccessedAsync` (`POST recently-accessed-items`),
+    /// in batches of 50. An item without an access time is stamped with the
+    /// moment of the call. A failed batch ends the call; earlier batches stay
+    /// reported.
+    pub async fn report_recently_accessed(
+        &self,
+        items: &[RecentlyAccessedReportItem],
+    ) -> Result<()> {
+        self.report_recently_accessed_to("recently-accessed-items", items)
+            .await
+    }
+
+    /// As [`report_recently_accessed`](Self::report_recently_accessed), for
+    /// photos (`POST photos/recently-accessed-items`).
+    pub(crate) async fn report_photos_recently_accessed(
+        &self,
+        items: &[RecentlyAccessedReportItem],
+    ) -> Result<()> {
+        self.report_recently_accessed_to("photos/recently-accessed-items", items)
+            .await
+    }
+
+    async fn report_recently_accessed_to(
+        &self,
+        path: &str,
+        items: &[RecentlyAccessedReportItem],
+    ) -> Result<()> {
+        /// Items per request (upstream `RecentlyAccessedOperations.BatchSize`).
+        const REPORT_BATCH: usize = 50;
+
+        let now = now_epoch_seconds();
+        for batch in items.chunks(REPORT_BATCH) {
+            let request = ReportRecentlyAccessedRequest {
+                items: batch
+                    .iter()
+                    .map(|item| ReportRecentlyAccessedItem {
+                        volume_id: item.uid.volume_id.clone(),
+                        link_id: item.uid.link_id.clone(),
+                        access_time: item.access_time.unwrap_or(now),
+                    })
+                    .collect(),
+            };
+            let _: proton_sdk::api::ApiResponse = self.http.post(path, &request).await?;
+        }
+        Ok(())
     }
 
     /// Fetch decrypted metadata for many nodes in one pass.
@@ -9432,6 +9482,8 @@ mod tests {
             passphrase_signature: None,
             signature_email: None,
             name_signature_email: None,
+            third_party: false,
+            sdk: false,
         };
         LinkDetailsDto {
             link,

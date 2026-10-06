@@ -20,6 +20,16 @@ pub struct NodeMoveItem {
     pub target_name: Option<String>,
 }
 
+/// One node for [`report_recently_accessed`](crate::ProtonDriveClient::report_recently_accessed).
+///
+/// Mirrors upstream `RecentlyAccessedReportItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentlyAccessedReportItem {
+    pub uid: NodeUid,
+    /// When the node was accessed, epoch seconds; `None` means now.
+    pub access_time: Option<i64>,
+}
+
 /// A decrypted Drive node (folder or file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
