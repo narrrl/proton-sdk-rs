@@ -7,6 +7,7 @@
 //! in the C# SDK (which calls `SrpClient.HashPassword`).
 
 use bcrypt::HashParts;
+use zeroize::Zeroizing;
 
 use super::errors::CryptoError;
 
@@ -15,7 +16,10 @@ const BCRYPT_PREFIX_LEN: usize = 29;
 
 /// Derive the unlocking passphrase for a key from the mailbox password and the
 /// key's 16-byte salt.
-pub fn derive_key_passphrase(password: &[u8], salt: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn derive_key_passphrase(
+    password: &[u8],
+    salt: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if salt.len() != 16 {
         return Err(CryptoError::Unlock(format!(
             "key salt must be 16 bytes, got {}",
@@ -31,12 +35,12 @@ pub fn derive_key_passphrase(password: &[u8], salt: &[u8]) -> Result<Vec<u8>, Cr
 
     // `$2b$10$<22 char salt><31 char hash>` — drop everything up to and
     // including the encoded salt to obtain the passphrase bytes.
-    let hash = parts.to_string();
+    let hash = Zeroizing::new(parts.to_string());
     let passphrase = hash
         .get(BCRYPT_PREFIX_LEN..)
         .ok_or_else(|| CryptoError::Unlock("bcrypt hash shorter than expected".into()))?;
 
-    Ok(passphrase.as_bytes().to_vec())
+    Ok(Zeroizing::new(passphrase.as_bytes().to_vec()))
 }
 
 #[cfg(test)]

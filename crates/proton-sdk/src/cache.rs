@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::error::{ProtonError, Result};
 
@@ -289,7 +290,7 @@ impl CacheRepository for InMemoryCacheRepository {
 /// (matching the C# behavior).
 pub struct EncryptedCacheRepository {
     inner: Arc<dyn CacheRepository>,
-    encryption_key: Vec<u8>,
+    encryption_key: Zeroizing<Vec<u8>>,
 }
 
 const SALT_LEN: usize = 16;
@@ -303,7 +304,7 @@ impl EncryptedCacheRepository {
     pub fn new(inner: Arc<dyn CacheRepository>, encryption_key: impl Into<Vec<u8>>) -> Self {
         Self {
             inner,
-            encryption_key: encryption_key.into(),
+            encryption_key: Zeroizing::new(encryption_key.into()),
         }
     }
 

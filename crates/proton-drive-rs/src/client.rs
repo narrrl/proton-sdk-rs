@@ -15,7 +15,7 @@ use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, mpsc};
 
-use proton_sdk::account::{AccountClient, KeySalt};
+use proton_sdk::account::{AccountClient, KeyPassphrases, KeySalt};
 use proton_sdk::api::ResponseCode;
 use proton_sdk::cache::{CacheRepository, InMemoryCacheRepository};
 use proton_sdk::crypto::PrivateKey;
@@ -525,7 +525,7 @@ impl ProtonDriveClient {
     /// password. They unlock the keys all the same, so keep them as secret.
     pub fn with_key_passphrases(
         session: &ProtonApiSession,
-        key_passphrases: HashMap<String, Vec<u8>>,
+        key_passphrases: KeyPassphrases,
     ) -> Self {
         Self::with_account(
             session,

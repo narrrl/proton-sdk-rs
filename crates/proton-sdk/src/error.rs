@@ -23,6 +23,16 @@ pub enum ProtonError {
     #[error("cryptography error: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
 
+    /// The account's keys exist but none could be unlocked with the passphrases
+    /// this client holds: the mailbox password (or the stored passphrases) is
+    /// wrong or stale.
+    ///
+    /// Typed apart from [`InvalidOperation`](Self::InvalidOperation) because a
+    /// caller can act on it — ask for the password again — and must not retry
+    /// it: the same secret fails the same way every time.
+    #[error("none of the account's keys could be unlocked with this password")]
+    KeysLocked,
+
     /// The SDK was used in a way that violates an invariant.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
@@ -44,10 +54,14 @@ impl ProtonError {
     pub fn is_retriable(&self) -> bool {
         match self {
             Self::Api(error) => error.is_retriable(),
-            // A serialization or crypto failure is deterministic; an invariant
+            // A serialization or crypto failure is deterministic, a wrong
+            // passphrase fails the same way every time, and an invariant
             // violation is a bug. Only a transport failure is worth replaying.
             Self::Transport(_) => true,
-            Self::Serialization(_) | Self::Crypto(_) | Self::InvalidOperation(_) => false,
+            Self::Serialization(_)
+            | Self::Crypto(_)
+            | Self::KeysLocked
+            | Self::InvalidOperation(_) => false,
         }
     }
 }

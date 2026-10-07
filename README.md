@@ -137,6 +137,12 @@ graph TD
 3. **Share & Node Keys**: Nodes (files and folders) belong to shares. A share's passphrase is decrypted by the address key. The decrypted share passphrase is used to unlock the node's private key (usually X25519/Ed25519 or legacy RSA).
 4. **File Content Keys**: Files contain metadata and data blocks. The file's name and passphrase are encrypted. The symmetric **Content Key** (AES-256) is encapsulated in a PGP Public-Key Encrypted Session-Key (PKESK) packet addressed to the node key. See [content.rs](file:///home/narl/dev/private/proton-sdk-rs/crates/proton-sdk/src/crypto/content.rs).
 
+#### Resuming without the password
+
+A client that persists a session does not have to keep the mailbox password (on a single-password account, the login password). Capture `AccountClient::key_passphrases()` right after login and resume with `ProtonDriveClient::with_key_passphrases()`. A `KeyPassphrases` is wiped when dropped and prints as `KeyPassphrases(n redacted)`, but each passphrase unlocks its key, so store it as carefully as the password. `KeyPassphrases::derive_secret(purpose)` gives a 32-byte secret only an unlocked account can reproduce, for encrypting local state.
+
+`AccountClient::unlock()` checks a password or a set of passphrases with one request. A secret that does not fit fails with `ProtonError::KeysLocked`, which a login prompt should answer by asking again, never by retrying.
+
 ### 2. Upload Pipeline
 
 When uploading a file:

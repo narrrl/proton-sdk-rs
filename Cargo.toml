@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proton-sdk", "crates/proton-drive-rs"]
 
 [workspace.package]
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narrrl/proton-sdk-rs"
@@ -43,6 +43,7 @@ sha1 = "0.11"
 sha2 = "0.11"
 aes-gcm = "0.11"
 hkdf = "0.13"
+zeroize = "1"
 bcrypt = "0.19"
 pgp = "0.21"
 # Match the chrono line rPGP pulls in; used to stamp detached-signature subpackets.

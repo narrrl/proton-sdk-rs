@@ -11,11 +11,15 @@
 //! derived in step 1.) Decrypted keys are cached for the lifetime of the client.
 
 mod dtos;
+mod passphrases;
+
+pub use passphrases::KeyPassphrases;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use crate::crypto::{self, PrivateKey, PublicKey};
 use crate::error::{ProtonError, Result};
@@ -79,7 +83,7 @@ pub struct AccountClient {
 
 struct Inner {
     http: ApiHttpClient,
-    mailbox_password: Vec<u8>,
+    mailbox_password: Zeroizing<Vec<u8>>,
     cache: Mutex<Cache>,
 }
 
@@ -89,7 +93,7 @@ struct Cache {
     /// caller (see [`AccountClient::with_key_salts`]).
     key_salts: Option<Vec<KeySalt>>,
     /// key id → passphrase derived from the mailbox password and key salts.
-    key_passphrases: Option<HashMap<String, Vec<u8>>>,
+    key_passphrases: Option<KeyPassphrases>,
     user_keys: Option<Vec<PrivateKey>>,
     addresses: Option<Vec<Address>>,
     address_keys: HashMap<AddressId, Vec<PrivateKey>>,
@@ -102,7 +106,7 @@ impl AccountClient {
         Self {
             inner: Arc::new(Inner {
                 http: session.http().clone(),
-                mailbox_password: mailbox_password.into(),
+                mailbox_password: Zeroizing::new(mailbox_password.into()),
                 cache: Mutex::new(Cache::default()),
             }),
         }
@@ -125,7 +129,7 @@ impl AccountClient {
         Self {
             inner: Arc::new(Inner {
                 http: session.http().clone(),
-                mailbox_password: mailbox_password.into(),
+                mailbox_password: Zeroizing::new(mailbox_password.into()),
                 cache: Mutex::new(Cache {
                     key_salts: Some(key_salts),
                     ..Cache::default()
@@ -142,12 +146,12 @@ impl AccountClient {
     /// missing from the map does not unlock, exactly as a key without a salt.
     pub fn with_key_passphrases(
         session: &ProtonApiSession,
-        key_passphrases: HashMap<String, Vec<u8>>,
+        key_passphrases: KeyPassphrases,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 http: session.http().clone(),
-                mailbox_password: Vec::new(),
+                mailbox_password: Zeroizing::new(Vec::new()),
                 cache: Mutex::new(Cache {
                     key_passphrases: Some(key_passphrases),
                     ..Cache::default()
@@ -297,6 +301,19 @@ impl AccountClient {
         })
     }
 
+    /// Check that this client's password (or passphrases) unlocks the account.
+    ///
+    /// Fetches the user's keys once (`core/v4/users`) and unlocks them, nothing
+    /// more: no address is loaded or decrypted. Fails with
+    /// [`ProtonError::KeysLocked`] when the secret is wrong, which is the
+    /// answer a login prompt wants for "try again", and with a transport error
+    /// when Proton could not be reached, which says nothing about the secret.
+    /// The unlocked keys are cached, so a client that passes this has done the
+    /// work its first real call would have.
+    pub async fn unlock(&self) -> Result<()> {
+        self.user_keys().await.map(drop)
+    }
+
     /// Decrypted user (account) keys.
     async fn user_keys(&self) -> Result<Vec<PrivateKey>> {
         {
@@ -327,9 +344,14 @@ impl AccountClient {
         }
 
         if keys.is_empty() {
-            return Err(ProtonError::invalid_operation(
-                "no active user key could be unlocked",
-            ));
+            // Keys the account has, none of which this client's secret opens —
+            // as opposed to an account with no active key at all, which no
+            // password fixes.
+            return Err(if response.user.keys.iter().any(|k| k.is_active()) {
+                ProtonError::KeysLocked
+            } else {
+                ProtonError::invalid_operation("the account has no active user key")
+            });
         }
 
         self.inner.cache.lock().await.user_keys = Some(keys.clone());
@@ -345,7 +367,7 @@ impl AccountClient {
     /// itself out of storage. Deriving needs the salts, so on a session
     /// resumed without them call this right after login, as for
     /// [`key_salts`](Self::key_salts).
-    pub async fn key_passphrases(&self) -> Result<HashMap<String, Vec<u8>>> {
+    pub async fn key_passphrases(&self) -> Result<KeyPassphrases> {
         {
             let cache = self.inner.cache.lock().await;
             if let Some(passphrases) = &cache.key_passphrases {
@@ -354,7 +376,7 @@ impl AccountClient {
         }
 
         let salts = self.key_salts().await?;
-        let mut passphrases = HashMap::new();
+        let mut passphrases = KeyPassphrases::new();
         for salt in &salts {
             let Some(salt_b64) = &salt.value else {
                 continue;
@@ -365,7 +387,7 @@ impl AccountClient {
             let salt_bytes = decode_base64(salt_b64)?;
             let passphrase =
                 crypto::derive_key_passphrase(&self.inner.mailbox_password, &salt_bytes)?;
-            passphrases.insert(salt.key_id.clone(), passphrase);
+            passphrases.insert(salt.key_id.clone(), passphrase.to_vec());
         }
 
         self.inner.cache.lock().await.key_passphrases = Some(passphrases.clone());
@@ -392,7 +414,7 @@ impl AccountClient {
             let passphrase = match (&key_dto.token, &key_dto.signature) {
                 (Some(token), Some(_signature)) => {
                     match crypto::decrypt_armored_with_keys(token, &user_keys) {
-                        Ok(passphrase) => passphrase,
+                        Ok(passphrase) => Zeroizing::new(passphrase),
                         Err(e) => {
                             tracing::warn!(key_id = %key_dto.id, error = %e, "failed to decrypt address key token");
                             continue;
@@ -400,7 +422,7 @@ impl AccountClient {
                     }
                 }
                 _ => match passphrases.get(key_dto.id.as_str()) {
-                    Some(passphrase) => passphrase.clone(),
+                    Some(passphrase) => Zeroizing::new(passphrase.to_vec()),
                     None => {
                         tracing::warn!(key_id = %key_dto.id, "no passphrase for address key");
                         continue;
@@ -489,10 +511,129 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_key_passphrases_are_used_without_deriving_or_a_request() {
-        let passphrases = HashMap::from([("key-1".to_owned(), b"derived".to_vec())]);
+        let passphrases = KeyPassphrases::from_iter([("key-1", b"derived".to_vec())]);
         let client = AccountClient::with_key_passphrases(&session(), passphrases.clone());
         // No salts were given and the base URL is unreachable from a test, so
         // anything but the seeded map would fail here.
         assert_eq!(client.key_passphrases().await.unwrap(), passphrases);
+    }
+
+    /// A session pointed at a loopback server that answers every request with
+    /// `body`, and the number of requests it has served.
+    async fn session_serving(
+        body: String,
+    ) -> (
+        ProtonApiSession,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let session = ProtonApiSession::resume(
+            ProtonClientConfiguration::new("test@1.0.0")
+                .with_base_url(format!("http://{addr}/"))
+                .with_retry_policy(crate::config::RetryPolicy::disabled()),
+            ResumeParameters {
+                session_id: "session".to_owned().into(),
+                username: "user".to_owned(),
+                user_id: "user-id".to_owned().into(),
+                access_token: "access".to_owned(),
+                refresh_token: "refresh".to_owned(),
+                scopes: Vec::new(),
+                is_waiting_for_second_factor_code: false,
+                password_mode: PasswordMode::Dual,
+            },
+        )
+        .expect("resume");
+        (session, served)
+    }
+
+    /// The `core/v4/users` answer for one account key locked with `passphrase`.
+    fn user_with_key(armored: &str, active: i32) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "User": {
+                "ID": "user-id", "MaxSpace": 1, "UsedSpace": 0,
+                "Keys": [{ "ID": "key-1", "PrivateKey": armored, "Primary": 1, "Active": active }]
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn unlock_accepts_the_passphrase_that_locks_the_key() {
+        let key = crate::crypto::generate_node_key().unwrap();
+        let (session, served) = session_serving(user_with_key(&key.locked_armored, 1)).await;
+        let passphrases = KeyPassphrases::from_iter([("key-1", key.passphrase.clone())]);
+
+        AccountClient::with_key_passphrases(&session, passphrases)
+            .unlock()
+            .await
+            .expect("right passphrase");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unlock_reports_a_wrong_passphrase_as_keys_locked() {
+        let key = crate::crypto::generate_node_key().unwrap();
+        let (session, _) = session_serving(user_with_key(&key.locked_armored, 1)).await;
+        let passphrases = KeyPassphrases::from_iter([("key-1", b"not it".to_vec())]);
+
+        let error = AccountClient::with_key_passphrases(&session, passphrases)
+            .unlock()
+            .await
+            .expect_err("wrong passphrase");
+        assert!(matches!(error, ProtonError::KeysLocked), "{error:?}");
+        assert!(!error.is_retriable());
+    }
+
+    #[tokio::test]
+    async fn unlock_treats_a_missing_passphrase_as_keys_locked() {
+        let key = crate::crypto::generate_node_key().unwrap();
+        let (session, _) = session_serving(user_with_key(&key.locked_armored, 1)).await;
+
+        let error = AccountClient::with_key_passphrases(&session, KeyPassphrases::new())
+            .unlock()
+            .await
+            .expect_err("no passphrase");
+        assert!(matches!(error, ProtonError::KeysLocked), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_account_without_an_active_key_is_not_a_password_problem() {
+        let key = crate::crypto::generate_node_key().unwrap();
+        let (session, _) = session_serving(user_with_key(&key.locked_armored, 0)).await;
+        let passphrases = KeyPassphrases::from_iter([("key-1", key.passphrase.clone())]);
+
+        let error = AccountClient::with_key_passphrases(&session, passphrases)
+            .unlock()
+            .await
+            .expect_err("no active key");
+        assert!(
+            matches!(error, ProtonError::InvalidOperation(_)),
+            "{error:?}"
+        );
     }
 }
