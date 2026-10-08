@@ -708,21 +708,42 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
 /// the typed success payload.
 async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     let status = response.status();
+    let path = response.url().path().to_owned();
     let bytes = response.bytes().await?;
 
     // Every Proton response embeds the envelope; a missing/non-success code or a
     // non-2xx HTTP status is an API error. `MultipleResponses` (1001) is a batch
     // multi-status, not a failure: the real per-item codes live in the body, so
     // the caller (e.g. trash/restore/delete) inspects them itself.
-    if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes) {
-        if !envelope.is_success() && envelope.code != ResponseCode::MultipleResponses {
-            return Err(api_error(status, &bytes));
-        }
-    } else if !status.is_success() {
+    let failed = match serde_json::from_slice::<ApiResponse>(&bytes) {
+        Ok(envelope) => !envelope.is_success() && envelope.code != ResponseCode::MultipleResponses,
+        Err(_) => !status.is_success(),
+    };
+    if failed {
+        // A code missing from `ResponseCode` deserializes to `Unknown`, so this
+        // line is the only place its number survives.
+        tracing::debug!(
+            path,
+            http_status = status.as_u16(),
+            code = raw_code(&bytes),
+            "proton api request failed"
+        );
         return Err(api_error(status, &bytes));
     }
 
     Ok(serde_json::from_slice::<T>(&bytes)?)
+}
+
+/// The envelope's `Code` exactly as sent, before [`ResponseCode`] maps it.
+fn raw_code(bytes: &[u8]) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct RawCode {
+        #[serde(rename = "Code")]
+        code: i64,
+    }
+    serde_json::from_slice::<RawCode>(bytes)
+        .ok()
+        .map(|raw| raw.code)
 }
 
 fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
@@ -844,6 +865,13 @@ fn ensure_trailing_slash(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_code_keeps_codes_response_code_does_not_know() {
+        let body = br#"{"Code":5099,"Error":"This version of the app is no longer supported"}"#;
+        assert_eq!(raw_code(body), Some(5099));
+        assert_eq!(raw_code(b"<html>bad gateway</html>"), None);
+    }
 
     #[test]
     fn retryable_statuses() {
