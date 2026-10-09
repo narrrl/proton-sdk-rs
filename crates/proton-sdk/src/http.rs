@@ -544,7 +544,23 @@ impl ApiHttpClient {
     /// Refresh the session tokens, deduplicating concurrent refreshes: if the
     /// in-memory access token already differs from the rejected one, another
     /// task refreshed first and we reuse its result.
+    ///
+    /// The refresh runs on a task of its own, so a caller that stops waiting —
+    /// a timeout around the request — cannot drop it between Proton rotating
+    /// the tokens and this client storing them. Refresh tokens are single-use:
+    /// a rotation dropped there ends the session for good. The new tokens are
+    /// stored and the callback fired whether or not anyone still waits.
     async fn refresh_access_token(&self, rejected_access_token: &str) -> Result<String> {
+        let client = self.clone();
+        let rejected = rejected_access_token.to_owned();
+        tokio::spawn(async move { client.refresh_access_token_now(&rejected).await })
+            .await
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("token refresh task failed: {e}"))
+            })?
+    }
+
+    async fn refresh_access_token_now(&self, rejected_access_token: &str) -> Result<String> {
         // The refresh lock, not the token lock: ordinary requests read the
         // tokens without ever waiting on this.
         let _guard = self.inner.refresh.lock().await;
@@ -583,7 +599,7 @@ impl ApiHttpClient {
 
         // The refresh call carries the session id but, deliberately, no bearer
         // token (the access token is the thing being replaced).
-        let response = send_retrying(&self.inner.config.retry_policy, || {
+        let response = send_unrepeatable(&self.inner.config.retry_policy, || {
             self.inner
                 .http
                 .post(&url)
@@ -806,6 +822,30 @@ where
                 }
                 return Err(err.into());
             }
+        }
+    }
+}
+
+/// Send a request that must not be sent twice, such as `auth/v4/refresh`, which
+/// spends its single-use refresh token: retried only when the connection
+/// failed, so the request never left.
+///
+/// A timeout or a 5xx may come after the server acted. Repeating a refresh then
+/// presents the token it just spent, Proton answers `InvalidRefreshToken`, and
+/// the session is over although the first attempt worked.
+async fn send_unrepeatable<F>(policy: &RetryPolicy, build: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match build().send().await {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt < policy.max_retries && err.is_connect() => {
+                tokio::time::sleep(backoff(policy, attempt)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -1209,6 +1249,133 @@ mod tests {
         );
 
         refreshing.await.unwrap().unwrap();
+        server.abort();
+    }
+
+    /// A test server that answers `auth/v4/refresh` with `refresh` after
+    /// `delay`, 401s the first `needs-refresh` and answers everything else with
+    /// success. Returns its address and how many refreshes it was asked for.
+    async fn refresh_server(
+        refresh: &'static str,
+        delay: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let unauthorized = Arc::new(AtomicUsize::new(0));
+        let counted = refreshes.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (counted, unauthorized) = (counted.clone(), unauthorized.clone());
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let (status, body) = if request.contains("auth/v4/refresh") {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        (refresh, refresh_body(refresh))
+                    } else if request.contains("needs-refresh")
+                        && unauthorized.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        ("401 Unauthorized", r#"{"Code":401}"#)
+                    } else {
+                        ("200 OK", r#"{"Code":1000}"#)
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (addr, refreshes, server)
+    }
+
+    fn refresh_body(status: &str) -> &'static str {
+        if status.starts_with("200") {
+            r#"{"Code":1000,"AccessToken":"fresh","RefreshToken":"fresh-refresh","UID":"test-session"}"#
+        } else {
+            r#"{"Code":503,"Error":"try later"}"#
+        }
+    }
+
+    fn refresh_client(addr: std::net::SocketAddr, retry: RetryPolicy) -> ApiHttpClient {
+        let config = ProtonClientConfiguration::new("test@1.0")
+            .with_base_url(format!("http://{addr}/"))
+            .with_retry_policy(retry);
+        ApiHttpClient::new(
+            config,
+            SessionId::from("test-session"),
+            Tokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A caller that gives up while the refresh is on the wire must not take
+    /// the rotation with it: Proton has spent the old refresh token by then,
+    /// and a client that never stores the new one has no session left.
+    #[tokio::test]
+    async fn a_refresh_outlives_a_caller_that_stops_waiting() {
+        let (addr, _, server) = refresh_server("200 OK", Duration::from_millis(300)).await;
+        let client = refresh_client(addr, RetryPolicy::disabled());
+        let stored = Arc::new(std::sync::Mutex::new(None));
+        let seen = stored.clone();
+        client.set_on_tokens_refreshed(move |tokens| *seen.lock().unwrap() = Some(tokens));
+
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.get::<ApiResponse>("needs-refresh"),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the caller stopped waiting");
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(client.tokens().refresh_token, "fresh-refresh");
+        assert_eq!(
+            stored
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| t.refresh_token.clone()),
+            Some("fresh-refresh".to_string()),
+            "the callback ran although nobody waited"
+        );
+        server.abort();
+    }
+
+    /// A 5xx from `auth/v4/refresh` may come after Proton rotated the tokens;
+    /// a retry would spend the old refresh token a second time.
+    #[tokio::test]
+    async fn a_refresh_is_not_repeated_after_the_server_answered() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, refreshes, server) =
+            refresh_server("503 Service Unavailable", Duration::ZERO).await;
+        let retry = RetryPolicy {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            max_retry_after: Duration::from_millis(1),
+        };
+        let client = refresh_client(addr, retry);
+
+        assert!(client.get::<ApiResponse>("needs-refresh").await.is_err());
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1, "one refresh, no retry");
         server.abort();
     }
 }
