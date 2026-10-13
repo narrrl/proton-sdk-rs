@@ -129,6 +129,11 @@ pub enum ResponseCode {
     InvalidValue = 2001,
     NotEnoughPermissions = 2011,
     NotEnoughPermissionsToGrantPermissions = 2026,
+    /// The feature is disabled, rate-limited or blocked for abuse. Arrives with
+    /// HTTP 422. On `auth/v4` it is a temporary block on the sign-in, and its
+    /// `Error` text claims the app version is no longer supported even when
+    /// it is.
+    Blocked = 2028,
     InvalidEncryptedIdFormat = 2061,
     AlreadyExists = 2500,
     DoesNotExist = 2501,
@@ -175,6 +180,7 @@ impl ResponseCode {
             2001 => Self::InvalidValue,
             2011 => Self::NotEnoughPermissions,
             2026 => Self::NotEnoughPermissionsToGrantPermissions,
+            2028 => Self::Blocked,
             2061 => Self::InvalidEncryptedIdFormat,
             2500 => Self::AlreadyExists,
             2501 => Self::DoesNotExist,
@@ -244,6 +250,17 @@ mod tests {
     fn a_gated_login_is_recognised_rather_than_unknown() {
         let envelope: ApiResponse = serde_json::from_str(GATED_LOGIN).unwrap();
         assert_eq!(envelope.code, ResponseCode::HumanVerificationRequired);
+    }
+
+    /// A blocked sign-in claims the app is outdated. Only the code tells it
+    /// apart from a real [`ResponseCode::OutdatedApp`].
+    #[test]
+    fn a_blocked_login_is_not_an_outdated_app() {
+        let envelope: ApiResponse = serde_json::from_str(
+            r#"{"Code": 2028, "Error": "This version of the app is no longer supported, please update to continue using the app"}"#,
+        )
+        .unwrap();
+        assert_eq!(envelope.code, ResponseCode::Blocked);
     }
 
     #[test]
