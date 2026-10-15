@@ -41,6 +41,25 @@ pub struct ShareDto {
     pub address_id: AddressId,
 }
 
+/// `GET volumes`: every volume of the user, active or not.
+#[derive(Debug, Deserialize)]
+pub struct VolumeListResponse {
+    #[serde(rename = "Volumes")]
+    pub volumes: Vec<VolumeListItemDto>,
+}
+
+/// One entry of [`VolumeListResponse`]. `Type` is 1 for a regular (My Files)
+/// volume and 2 for Photos; `State` is 1 when active and 3 when locked.
+#[derive(Debug, Deserialize)]
+pub struct VolumeListItemDto {
+    #[serde(rename = "VolumeID")]
+    pub id: VolumeId,
+    #[serde(rename = "State")]
+    pub state: i32,
+    #[serde(rename = "Type", default)]
+    pub volume_type: Option<i32>,
+}
+
 /// `POST v2/volumes/{vid}/links` request body.
 #[derive(Debug, Serialize)]
 pub struct LinkDetailsRequest<'a> {

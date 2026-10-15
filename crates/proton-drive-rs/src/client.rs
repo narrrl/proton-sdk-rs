@@ -76,7 +76,7 @@ use crate::dtos::{
     ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
     TimelinePhotoListResponse, TransferPhotoLinkItem, TransferPhotosRequest,
     TransferPhotosResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
-    VolumeEventListResponse, VolumeTrashResponse,
+    VolumeEventListResponse, VolumeListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -5452,7 +5452,7 @@ impl ProtonDriveClient {
         // Mirrors C# `NodeOperations.GetOrCreateMyFilesFolderAsync`: a brand-new
         // account has no My Files volume yet, so the share lookup fails. Create
         // the volume, then re-read it through the normal path to populate caches.
-        let response: MyFilesShareResponse = match self.http.get("v2/shares/my-files").await {
+        let mut response: MyFilesShareResponse = match self.http.get("v2/shares/my-files").await {
             Ok(response) => response,
             Err(e) if is_not_found(&e) => {
                 self.create_volume().await?;
@@ -5460,10 +5460,29 @@ impl ProtonDriveClient {
             }
             Err(e) => return Err(e),
         };
+
+        // A password reset replaces the account's keys and locks the volume
+        // whose share was encrypted to the old ones; its key then fails with
+        // "missing key" on every call. The web client answers a missing
+        // *active* regular volume by creating a fresh one (the locked one stays
+        // restorable from the web), so do the same, but only once the server
+        // confirms no active regular volume is left, never on a guess.
+        let share_key = match decrypt_share_key(&self.account, &response.share).await {
+            Ok(key) => key,
+            Err(e @ ProtonError::Crypto(_)) => {
+                let volumes: VolumeListResponse = self.http.get("volumes").await?;
+                if has_active_regular_volume(&volumes) {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "My Files volume is locked; creating a new one");
+                self.create_volume().await?;
+                response = self.http.get("v2/shares/my-files").await?;
+                decrypt_share_key(&self.account, &response.share).await?
+            }
+            Err(e) => return Err(e),
+        };
         let volume_id = response.volume.id.clone();
         let share_id = response.share.id.clone();
-
-        let share_key = decrypt_share_key(&self.account, &response.share).await?;
 
         // The My Files root link's parent key is the share key.
         let root_link = &response.link.link;
@@ -7861,6 +7880,17 @@ fn is_listable_revision_state(state: Option<i32>) -> bool {
     matches!(state, Some(1) | Some(2))
 }
 
+/// Whether the user still has an active regular (My Files) volume. Mirrors the
+/// web client's check before it creates a replacement for a locked one: `Type`
+/// 1 is regular, `State` 1 is active. A volume without a `Type` counts as
+/// regular, since older responses omit it and Photos volumes always carry it.
+fn has_active_regular_volume(response: &VolumeListResponse) -> bool {
+    response
+        .volumes
+        .iter()
+        .any(|v| v.state == 1 && v.volume_type.unwrap_or(1) == 1)
+}
+
 /// Whether an API error means the requested entity simply is not there.
 ///
 /// Both `DoesNotExist` in the envelope and a bare HTTP 404 occur in the wild for
@@ -8702,16 +8732,16 @@ mod tests {
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
         MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_file_names,
         alternate_folder_names, assemble_manifest, context_share_path, drive_items,
-        epoch_to_iso8601, is_expired_upload_token, is_listable_revision_state, is_upload_timeout,
-        join_node_path, missing_related_links, path_segments, record_timeline_outcome,
-        resolve_parent_keys, run_context_share_mutation, share_membership_from_dto,
-        small_upload_applicable, small_upload_should_fall_back, take_block_target,
-        take_thumbnail_target, to_drive_event, validate_node_name,
+        epoch_to_iso8601, has_active_regular_volume, is_expired_upload_token,
+        is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
+        path_segments, record_timeline_outcome, resolve_parent_keys, run_context_share_mutation,
+        share_membership_from_dto, small_upload_applicable, small_upload_should_fall_back,
+        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkDetailsDto, LinkDto, LinkIdResponsePair,
         ShareMembershipSummaryDto, SharedWithMeLinkDto, SharedWithMeResponse, VolumeEventDto,
-        VolumeEventLinkDto,
+        VolumeEventLinkDto, VolumeListResponse,
     };
     use crate::node::RevisionState;
     use crate::sharing::MemberRole;
@@ -9629,5 +9659,37 @@ mod tests {
         assert_eq!(key_for(&keys, &links[0]), Some("share-key:a"));
         assert_eq!(key_for(&keys, &links[1]), None);
         assert_eq!(key_for(&keys, &links[2]), Some("share-key:c"));
+    }
+
+    fn volumes(json: &str) -> VolumeListResponse {
+        serde_json::from_str(json).expect("volume list parses")
+    }
+
+    #[test]
+    fn a_locked_main_volume_is_not_an_active_regular_one() {
+        // After a password reset: the old regular volume is locked (3), and
+        // an active Photos volume (2) does not stand in for My Files.
+        let locked = volumes(
+            r#"{"Code":1000,"Volumes":[
+                {"VolumeID":"v1","State":3,"Type":1},
+                {"VolumeID":"v2","State":1,"Type":2}
+            ]}"#,
+        );
+        assert!(!has_active_regular_volume(&locked));
+        assert!(!has_active_regular_volume(&volumes(r#"{"Volumes":[]}"#)));
+    }
+
+    #[test]
+    fn an_active_regular_volume_is_found_with_or_without_a_type() {
+        let typed = volumes(
+            r#"{"Volumes":[
+                {"VolumeID":"v1","State":3,"Type":1},
+                {"VolumeID":"v3","State":1,"Type":1}
+            ]}"#,
+        );
+        assert!(has_active_regular_volume(&typed));
+        assert!(has_active_regular_volume(&volumes(
+            r#"{"Volumes":[{"VolumeID":"v1","State":1}]}"#
+        )));
     }
 }
