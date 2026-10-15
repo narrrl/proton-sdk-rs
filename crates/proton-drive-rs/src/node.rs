@@ -20,6 +20,18 @@ pub struct NodeMoveItem {
     pub target_name: Option<String>,
 }
 
+/// What [`get_available_name`](crate::ProtonDriveClient::get_available_name)
+/// resolves a name for, which decides how alternates are spelled.
+///
+/// Mirrors C# `Proton.Drive.Sdk.Nodes.AvailableNameTarget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailableNameTarget {
+    /// Alternates keep the extension last: `report (1).txt`.
+    File,
+    /// Alternates append to the whole name: `v1.2 (1)`.
+    Folder,
+}
+
 /// One node for [`report_recently_accessed`](crate::ProtonDriveClient::report_recently_accessed).
 ///
 /// Mirrors upstream `RecentlyAccessedReportItem`.

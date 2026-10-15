@@ -80,8 +80,9 @@ use crate::dtos::{
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
-    AlbumProperties, FileThumbnail, Node, NodeKind, NodeMoveItem, PhotoLocation, PhotoProperties,
-    RecentlyAccessedReportItem, RevisionState, Thumbnail, ThumbnailType,
+    AlbumProperties, AvailableNameTarget, FileThumbnail, Node, NodeKind, NodeMoveItem,
+    PhotoLocation, PhotoProperties, RecentlyAccessedReportItem, RevisionState, Thumbnail,
+    ThumbnailType,
 };
 use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
@@ -2576,19 +2577,30 @@ impl ProtonDriveClient {
     /// `name`.
     ///
     /// Mirrors C# `NodeOperations.GetAvailableNameAsync`: hash `name` and a
-    /// stream of alternates (`name`, `name (1)`, `name (2)`, …) under the parent
-    /// folder's hash key and ask the server which hashes are free
-    /// (`checkAvailableHashes`), a batch of [`NAME_AVAILABILITY_BATCH`] at a
-    /// time, returning the first available candidate. Call before create/upload
-    /// to dodge `NameHashDigest` collisions. Returns `name` unchanged when it is
-    /// already free.
-    pub async fn get_available_name(&self, parent_uid: &NodeUid, name: &str) -> Result<String> {
+    /// stream of alternates under the parent folder's hash key and ask the
+    /// server which hashes are free (`checkAvailableHashes`), a batch of
+    /// [`NAME_AVAILABILITY_BATCH`] at a time, returning the first available
+    /// candidate. `target` picks the alternate spelling: a file keeps its
+    /// extension last (`name (1).ext`), a folder appends to the whole name
+    /// (`name (1)`), so `v1.2` does not become `v1 (1).2`. Call before
+    /// create/upload to dodge `NameHashDigest` collisions. Returns `name`
+    /// unchanged when it is already free.
+    pub async fn get_available_name(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        target: AvailableNameTarget,
+    ) -> Result<String> {
         let parent_key = self.folder_node_key(parent_uid).await?;
         let parent_hash_key = self.parent_hash_key(parent_uid, &parent_key).await?;
         let client_uid = self.http.session_id().to_string();
 
-        // Candidate stream: the original name first, then `name (1)`, `name (2)`…
-        let mut candidates = std::iter::once(name.to_string()).chain(alternate_names(name));
+        // Candidate stream: the original name first, then its alternates.
+        let alternates: Box<dyn Iterator<Item = String> + Send + '_> = match target {
+            AvailableNameTarget::File => Box::new(alternate_file_names(name)),
+            AvailableNameTarget::Folder => Box::new(alternate_folder_names(name)),
+        };
+        let mut candidates = std::iter::once(name.to_string()).chain(alternates);
 
         loop {
             // Build one batch of candidates and their hex name-hash digests.
@@ -8127,10 +8139,11 @@ fn to_drive_event(volume_id: &VolumeId, event: &VolumeEventDto) -> Result<DriveE
     }
 }
 
-/// Unbounded stream of alternate names for a taken name: `name (1).ext`,
-/// `name (2).ext`, … (C# `AlternateFileNameGenerator.GetNames`). The extension
-/// is everything from the last `.`, matching .NET `Path.GetFileNameWithoutExtension`.
-fn alternate_names(original: &str) -> impl Iterator<Item = String> + '_ {
+/// Unbounded stream of alternate names for a taken file name: `name (1).ext`,
+/// `name (2).ext`, … (C# `AlternateFileNameGenerator.GetFileNames`). The
+/// extension is everything from the last `.`, matching .NET
+/// `Path.GetFileNameWithoutExtension`.
+fn alternate_file_names(original: &str) -> impl Iterator<Item = String> + Send + '_ {
     let (stem, ext) = match original.rfind('.') {
         Some(idx) => original.split_at(idx),
         None => (original, ""),
@@ -8138,9 +8151,13 @@ fn alternate_names(original: &str) -> impl Iterator<Item = String> + '_ {
     (1..).map(move |i| format!("{stem} ({i}){ext}"))
 }
 
-/// Fail if any per-link response in a batch aggregate carries a non-success
-/// code (the top-level envelope is `MultipleResponses`, so the real status is
-/// per link). `op` names the operation for the error message.
+/// Unbounded stream of alternate names for a taken folder name: `name (1)`,
+/// `name (2)`, … (C# `AlternateFileNameGenerator.GetFolderNames`). A folder has
+/// no extension, so a dot in its name is kept where it is.
+fn alternate_folder_names(original: &str) -> impl Iterator<Item = String> + Send + '_ {
+    (1..).map(move |i| format!("{original} ({i})"))
+}
+
 /// The re-encrypted material a single node needs to move under a new parent,
 /// produced by `ProtonDriveClient::build_move_parts`.
 struct MoveParts {
@@ -8683,13 +8700,13 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 mod tests {
     use super::{
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
-        MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_names,
-        assemble_manifest, context_share_path, drive_items, epoch_to_iso8601,
-        is_expired_upload_token, is_listable_revision_state, is_upload_timeout, join_node_path,
-        missing_related_links, path_segments, record_timeline_outcome, resolve_parent_keys,
-        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
-        small_upload_should_fall_back, take_block_target, take_thumbnail_target, to_drive_event,
-        validate_node_name,
+        MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_file_names,
+        alternate_folder_names, assemble_manifest, context_share_path, drive_items,
+        epoch_to_iso8601, is_expired_upload_token, is_listable_revision_state, is_upload_timeout,
+        join_node_path, missing_related_links, path_segments, record_timeline_outcome,
+        resolve_parent_keys, run_context_share_mutation, share_membership_from_dto,
+        small_upload_applicable, small_upload_should_fall_back, take_block_target,
+        take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkDetailsDto, LinkDto, LinkIdResponsePair,
@@ -9152,22 +9169,28 @@ mod tests {
     }
 
     #[test]
-    fn alternate_names_keeps_extension() {
-        let got: Vec<String> = alternate_names("report.txt").take(3).collect();
+    fn alternate_file_names_keeps_extension() {
+        let got: Vec<String> = alternate_file_names("report.txt").take(3).collect();
         assert_eq!(got, ["report (1).txt", "report (2).txt", "report (3).txt"]);
     }
 
     #[test]
-    fn alternate_names_no_extension() {
-        let got: Vec<String> = alternate_names("folder").take(2).collect();
-        assert_eq!(got, ["folder (1)", "folder (2)"]);
+    fn alternate_file_names_no_extension() {
+        let got: Vec<String> = alternate_file_names("notes").take(2).collect();
+        assert_eq!(got, ["notes (1)", "notes (2)"]);
     }
 
     #[test]
-    fn alternate_names_uses_last_dot_only() {
+    fn alternate_file_names_uses_last_dot_only() {
         // .NET `Path.GetFileNameWithoutExtension` strips only the final segment.
-        let first = alternate_names("archive.tar.gz").next().unwrap();
+        let first = alternate_file_names("archive.tar.gz").next().unwrap();
         assert_eq!(first, "archive.tar (1).gz");
+    }
+
+    #[test]
+    fn alternate_folder_names_keep_dots_in_place() {
+        let got: Vec<String> = alternate_folder_names("v1.2").take(2).collect();
+        assert_eq!(got, ["v1.2 (1)", "v1.2 (2)"]);
     }
 
     #[test]

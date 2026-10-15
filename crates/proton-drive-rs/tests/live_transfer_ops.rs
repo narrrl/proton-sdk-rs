@@ -12,7 +12,7 @@ mod common;
 
 use std::io::Cursor;
 
-use proton_drive_rs::{NodeKind, Thumbnail, ThumbnailType};
+use proton_drive_rs::{AvailableNameTarget, NodeKind, Thumbnail, ThumbnailType};
 use proton_sdk::ids::NodeUid;
 
 /// Trash then permanently delete the given nodes; best-effort, logs on failure.
@@ -342,7 +342,7 @@ async fn get_available_name_resolves_collision() {
 
     // Free name resolves to itself.
     let free = client
-        .get_available_name(&root.uid, &base)
+        .get_available_name(&root.uid, &base, AvailableNameTarget::File)
         .await
         .expect("get_available_name (free)");
     assert_eq!(free, base, "an unused name must resolve to itself");
@@ -354,7 +354,7 @@ async fn get_available_name_resolves_collision() {
         .expect("create_folder to occupy the name");
 
     let alt = client
-        .get_available_name(&root.uid, &base)
+        .get_available_name(&root.uid, &base, AvailableNameTarget::File)
         .await
         .expect("get_available_name (taken)");
     assert_ne!(alt, base, "a taken name must resolve to an alternate");
