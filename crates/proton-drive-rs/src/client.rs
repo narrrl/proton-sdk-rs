@@ -555,6 +555,18 @@ impl ProtonDriveClient {
         &self.account
     }
 
+    /// The address the My Files share belongs to, and the keys its passphrase
+    /// is encrypted to (see [`proton_sdk::crypto::recipients`]). Decrypts
+    /// nothing and creates nothing, so it answers even when the share key does
+    /// not open: matched against
+    /// [`AccountClient::key_report`](proton_sdk::account::AccountClient::key_report),
+    /// it names the address key My Files needs.
+    pub async fn my_files_share_recipients(&self) -> Result<(AddressId, Vec<Option<String>>)> {
+        let response: MyFilesShareResponse = self.http.get("v2/shares/my-files").await?;
+        let recipients = proton_sdk::crypto::recipients(&response.share.passphrase)?;
+        Ok((response.share.address_id, recipients))
+    }
+
     /// Total account storage usage (`MaxSpace`/`UsedSpace`), account-wide across
     /// all Proton products. Convenience passthrough to
     /// [`AccountClient::quota`](proton_sdk::account::AccountClient::quota).

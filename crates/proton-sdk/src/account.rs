@@ -12,8 +12,10 @@
 
 mod dtos;
 mod passphrases;
+mod report;
 
 pub use passphrases::KeyPassphrases;
+pub use report::{AddressKeyReport, AddressReport, KeyReport, UserKeyReport};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -619,6 +621,65 @@ mod tests {
             .await
             .expect_err("no passphrase");
         assert!(matches!(error, ProtonError::KeysLocked), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn the_key_report_traces_a_token_to_the_inactive_key_it_was_meant_for() {
+        use crate::crypto::{PrivateKey, generate_node_key};
+
+        let active = generate_node_key().unwrap();
+        let inactive = generate_node_key().unwrap();
+        let (good, stranded) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let token_for = |user_key: &crate::crypto::GeneratedNodeKey, passphrase: &[u8]| {
+            PrivateKey::from_armored(&user_key.locked_armored, &user_key.passphrase)
+                .unwrap()
+                .encrypt(passphrase)
+                .unwrap()
+        };
+        // Both answers in one body: each request reads only its own field.
+        let body = serde_json::json!({
+            "Code": 1000,
+            "User": {
+                "ID": "user-id", "MaxSpace": 1, "UsedSpace": 0,
+                "Keys": [
+                    { "ID": "key-1", "PrivateKey": active.locked_armored, "Primary": 1, "Active": 1 },
+                    { "ID": "key-2", "PrivateKey": inactive.locked_armored, "Primary": 0, "Active": 0 }
+                ]
+            },
+            "Addresses": [{
+                "ID": "address-1", "Email": "user@proton.me", "Status": 1, "Order": 1,
+                "Keys": [
+                    { "ID": "address-key-1", "PrivateKey": good.locked_armored,
+                      "Token": token_for(&active, &good.passphrase), "Signature": "signature",
+                      "Primary": 1, "Active": 1 },
+                    { "ID": "address-key-2", "PrivateKey": stranded.locked_armored,
+                      "Token": token_for(&inactive, &stranded.passphrase), "Signature": "signature",
+                      "Primary": 0, "Active": 1 }
+                ]
+            }]
+        });
+        let (session, _) = session_serving(body.to_string()).await;
+        let passphrases = KeyPassphrases::from_iter([
+            ("key-1", active.passphrase.clone()),
+            ("key-2", inactive.passphrase.clone()),
+        ]);
+
+        let report = AccountClient::with_key_passphrases(&session, passphrases)
+            .key_report()
+            .await
+            .unwrap();
+
+        assert!(report.user_keys.iter().all(|key| key.unlocks));
+        let keys = &report.addresses[0].keys;
+        assert!(keys[0].unlocks && keys[0].error.is_none());
+        assert!(!keys[1].unlocks);
+        assert!(keys[1].error.as_deref().unwrap().contains("missing key"));
+        let recipients = keys[1].token_recipients.as_ref().unwrap();
+        let meant_for = report
+            .user_key_named(recipients[0].as_deref().unwrap())
+            .unwrap();
+        assert_eq!(meant_for.id.as_str(), "key-2");
+        assert!(!meant_for.active);
     }
 
     #[tokio::test]

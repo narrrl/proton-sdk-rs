@@ -1,6 +1,6 @@
 //! PGP message decryption helpers.
 
-use pgp::composed::{Message, SignedSecretKey};
+use pgp::composed::{Esk, Message, SignedSecretKey};
 use pgp::types::Password;
 
 use super::errors::CryptoError;
@@ -81,6 +81,35 @@ pub fn decrypt_armored_any(
     Err(last_err)
 }
 
+/// The keys an armored message's session key is encrypted to, as lowercase
+/// hex: the key ID of a v3 PKESK, the fingerprint of a v6 one. A hidden
+/// recipient (a wildcard key ID, or a v6 PKESK without a fingerprint) is
+/// `None`. Only the packet headers are read, so no key is needed.
+///
+/// Matched against [`key_ids`](super::key_ids), this tells which key a
+/// message that fails with "missing key" was meant for.
+pub fn recipients(armored: &str) -> Result<Vec<Option<String>>, CryptoError> {
+    let (message, _headers) =
+        Message::from_string(armored).map_err(|e| CryptoError::Parse(format!("message: {e}")))?;
+    let Message::Encrypted { esk, .. } = &message else {
+        return Ok(Vec::new());
+    };
+    Ok(esk
+        .iter()
+        .filter_map(|esk| match esk {
+            Esk::PublicKeyEncryptedSessionKey(pkesk) => Some(match pkesk.fingerprint() {
+                Ok(fingerprint) => fingerprint.map(|f| format!("{f:x}")),
+                Err(_) => pkesk
+                    .id()
+                    .ok()
+                    .filter(|id| !id.is_wildcard())
+                    .map(|id| id.to_string()),
+            }),
+            Esk::SymKeyEncryptedSessionKey(_) => None,
+        })
+        .collect())
+}
+
 /// Drain a decrypted message to bytes, transparently decompressing if needed.
 pub(crate) fn read_plaintext(mut message: Message<'_>) -> Result<Vec<u8>, CryptoError> {
     while message.is_compressed() {
@@ -101,6 +130,12 @@ mod tests {
     use pgp::composed::MessageBuilder;
     use pgp::crypto::sym::SymmetricKeyAlgorithm;
     use pgp::types::{Password, StringToKey};
+
+    #[test]
+    fn a_password_encrypted_message_has_no_key_recipients() {
+        let message = encrypt_armored_with_password(b"secret", b"password");
+        assert!(super::recipients(&message).unwrap().is_empty());
+    }
 
     /// Build the shape Proton's `SharePassphrase` has: an armored, symmetrically
     /// encrypted message whose passphrase is the bcrypt-derived key password.

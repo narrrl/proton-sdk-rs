@@ -7,7 +7,7 @@
 //! re-run the key's S2K derivation.
 
 use pgp::composed::{Deserializable, DetachedSignature, SignedSecretKey};
-use pgp::types::Password;
+use pgp::types::{KeyDetails, Password};
 
 use super::errors::CryptoError;
 use super::messages;
@@ -138,6 +138,23 @@ impl PrivateKey {
     }
 }
 
+/// Every identifier a message's recipient can name this armored key by, as
+/// lowercase hex: the key ID and the fingerprint of the primary key and of
+/// each subkey. Reads only the public parts, so no passphrase is needed.
+pub fn key_ids(armored: &str) -> Result<Vec<String>, CryptoError> {
+    let (key, _headers) = SignedSecretKey::from_string(armored)
+        .map_err(|e| CryptoError::Parse(format!("secret key: {e}")))?;
+    let mut ids = vec![
+        key.primary_key.legacy_key_id().to_string(),
+        format!("{:x}", key.primary_key.fingerprint()),
+    ];
+    for subkey in &key.secret_subkeys {
+        ids.push(subkey.key.legacy_key_id().to_string());
+        ids.push(format!("{:x}", subkey.key.fingerprint()));
+    }
+    Ok(ids)
+}
+
 /// Decrypt an armored message, trying each key in `keys` until one succeeds.
 pub fn decrypt_armored_with_keys(
     armored: &str,
@@ -157,6 +174,31 @@ pub(crate) fn password_from_bytes(bytes: &[u8]) -> Password {
 mod tests {
     use super::*;
     use crate::crypto::encrypt::generate_node_key;
+
+    #[test]
+    fn a_message_names_the_key_it_is_encrypted_to() {
+        let node = generate_node_key().expect("generate node key");
+        let other = generate_node_key().expect("generate node key");
+        let key = PrivateKey::from_armored(&node.locked_armored, &node.passphrase).unwrap();
+        let message = key.encrypt(b"token").unwrap();
+
+        let recipients = super::super::recipients(&message).unwrap();
+        assert_eq!(recipients.len(), 1);
+        let recipient = recipients[0].as_deref().expect("a named recipient");
+        // Read from the locked key: no passphrase is needed to name it.
+        assert!(
+            key_ids(&node.locked_armored)
+                .unwrap()
+                .iter()
+                .any(|id| id == recipient)
+        );
+        assert!(
+            !key_ids(&other.locked_armored)
+                .unwrap()
+                .iter()
+                .any(|id| id == recipient)
+        );
+    }
 
     #[test]
     fn from_armored_rejects_a_wrong_passphrase() {

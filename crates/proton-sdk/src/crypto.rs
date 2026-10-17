@@ -23,8 +23,8 @@ pub use encrypt::{
     encrypt_invitation, generate_node_hash_key, generate_node_key, generate_node_key_aead,
 };
 pub use errors::CryptoError;
-pub use keys::{PrivateKey, decrypt_armored_with_keys};
-pub use messages::decrypt_armored_with_password;
+pub use keys::{PrivateKey, decrypt_armored_with_keys, key_ids};
+pub use messages::{decrypt_armored_with_password, recipients};
 pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, SrpVerifier, generate_proofs, generate_verifier};
 pub use verify::{
     PublicKey, VerificationKeyRing, VerificationStatus, verify_detached,
