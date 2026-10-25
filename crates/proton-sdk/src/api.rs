@@ -163,6 +163,9 @@ pub enum ResponseCode {
     InsufficientVolumeQuota = 200_100,
     TooManyChildren = 200_300,
     NestingTooDeep = 200_301,
+    /// An album cannot be deleted because some of its photos exist only in it;
+    /// `Details.ChildLinkIDs` names them.
+    AlbumContainsPhotosNotInTimeline = 200_302,
 }
 
 impl ResponseCode {
@@ -204,6 +207,7 @@ impl ResponseCode {
             200_100 => Self::InsufficientVolumeQuota,
             200_300 => Self::TooManyChildren,
             200_301 => Self::NestingTooDeep,
+            200_302 => Self::AlbumContainsPhotosNotInTimeline,
             _ => Self::Unknown,
         }
     }

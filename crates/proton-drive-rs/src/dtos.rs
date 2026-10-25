@@ -412,12 +412,13 @@ pub struct AlbumCreationLinkResponse {
 
 /// `PUT photos/volumes/{vid}/albums/{lid}` — rename an album or change its
 /// cover. Ported from the TypeScript SDK (`PhotosAPIService.updateAlbum`); a
-/// `None` field leaves that part of the album as it is.
+/// `None` field is left out and leaves that part of the album as it is (C#
+/// `UpdateAlbumRequest`).
 #[derive(Debug, Serialize)]
 pub struct AlbumUpdateRequest {
-    #[serde(rename = "CoverLinkID")]
+    #[serde(rename = "CoverLinkID", skip_serializing_if = "Option::is_none")]
     pub cover_link_id: Option<LinkId>,
-    #[serde(rename = "Link")]
+    #[serde(rename = "Link", skip_serializing_if = "Option::is_none")]
     pub link: Option<AlbumUpdateLink>,
 }
 
@@ -495,12 +496,6 @@ pub struct AddPhotoToAlbumEntry {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AddPhotosToAlbumResponse {
-    #[serde(rename = "Responses", default)]
-    pub responses: Vec<PhotoLinkOutcome>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct PhotoLinkOutcome {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
@@ -566,6 +561,9 @@ pub struct TransferPhotoLinkItem {
     pub passphrase_signature: Option<String>,
 }
 
+/// The per-link answers of `transfer-multiple` and of an album's
+/// `add-multiple`, which share one shape (C#
+/// `AggregateApiResponse<TransferPhotoResponsePair>`).
 #[derive(Debug, Deserialize)]
 pub struct TransferPhotosResponse {
     #[serde(rename = "Responses", default)]
@@ -1845,6 +1843,18 @@ mod tests {
     }
 
     #[test]
+    fn album_cover_update_sends_the_cover_and_no_name() {
+        let request = AlbumUpdateRequest {
+            cover_link_id: Some(LinkId::new("photo")),
+            link: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("album update"),
+            serde_json::json!({ "CoverLinkID": "photo" })
+        );
+    }
+
+    #[test]
     fn album_rename_sends_the_name_and_no_cover() {
         let request = AlbumUpdateRequest {
             cover_link_id: None,
@@ -1858,7 +1868,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&request).expect("album update"),
             serde_json::json!({
-                "CoverLinkID": null,
                 "Link": {
                     "Name": "armored",
                     "Hash": "new",

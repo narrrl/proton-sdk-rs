@@ -45,38 +45,37 @@ use crate::crypto::{
 };
 use crate::devices::{Device, DeviceMetadata, DeviceType};
 use crate::dtos::{
-    AcceptInvitationRequest, AddPhotoToAlbumEntry, AddPhotosToAlbumRequest,
-    AddPhotosToAlbumResponse, AggregateLinksResponse, AlbumCreationLink, AlbumCreationRequest,
-    AlbumCreationResponse, AlbumItemListResponse, AlbumListResponse, AlbumUpdateLink,
-    AlbumUpdateRequest, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
-    BlockUploadPreparationResponse, BlockUploadTarget, BlockVerificationInputResponse,
-    BlockVerifier, BookmarkShareUrlDto, BookmarksResponse, CommonExtendedAttributes,
-    ContextShareResponse, CopyLinkRequest, CopyLinkResponse, CopyPhotoContent,
-    CopyPhotoRelatedItem, CopyPhotoRequest, CreateBookmarkRequest, CreatePublicLinkRequest,
-    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
-    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
-    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
-    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
-    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
-    FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
-    FolderCreationResponse, FolderSizeResponse, InvitationDetailsResponse, InvitationsListResponse,
-    InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
-    InviteProtonUserInvitationDto, InviteProtonUserRequest, InviteProtonUserResponse,
-    LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
-    LinkType, ModulusResponse, MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest,
-    MultipleLinksRequest, MyFilesShareResponse, NodeNameAvailabilityRequest,
-    NodeNameAvailabilityResponse, PhotoTagsRequest, PhotosAttributesDto,
-    RemovePhotosFromAlbumRequest, RenameLinkRequest, ReportRecentlyAccessedItem,
-    ReportRecentlyAccessedRequest, RevisionConflict, RevisionCreationRequest,
-    RevisionCreationResponse, RevisionDto, RevisionListItemDto, RevisionListResponse,
-    RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto, ShareInvitationsResponse,
-    ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse, ShareTargetType, ShareUrlDto,
-    ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse, SharedWithMeResponse,
-    SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest, SmallUploadResponse,
-    ThumbnailBlockListRequest, ThumbnailBlockListResponse, ThumbnailCreationRequest, ThumbnailDto,
-    TimelinePhotoListResponse, TransferPhotoLinkItem, TransferPhotosRequest,
-    TransferPhotosResponse, UpdatePermissionsRequest, VolumeCreationRequest, VolumeEventDto,
-    VolumeEventListResponse, VolumeListResponse, VolumeTrashResponse,
+    AcceptInvitationRequest, AddPhotoToAlbumEntry, AddPhotosToAlbumRequest, AggregateLinksResponse,
+    AlbumCreationLink, AlbumCreationRequest, AlbumCreationResponse, AlbumItemListResponse,
+    AlbumListResponse, AlbumUpdateLink, AlbumUpdateRequest, BlockCreationRequest, BlockDto,
+    BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
+    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
+    CommonExtendedAttributes, ContextShareResponse, CopyLinkRequest, CopyLinkResponse,
+    CopyPhotoContent, CopyPhotoRelatedItem, CopyPhotoRequest, CreateBookmarkRequest,
+    CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse,
+    DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse,
+    DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto,
+    ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
+    ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
+    FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
+    FolderCreationRequest, FolderCreationResponse, FolderSizeResponse, InvitationDetailsResponse,
+    InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
+    InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
+    InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
+    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
+    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
+    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
+    PhotosAttributesDto, RemovePhotosFromAlbumRequest, RenameLinkRequest,
+    ReportRecentlyAccessedItem, ReportRecentlyAccessedRequest, RevisionConflict,
+    RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
+    RevisionListResponse, RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto,
+    ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse,
+    ShareTargetType, ShareUrlDto, ShareUrlsResponse, SharedAlbumsResponse, SharedByMeResponse,
+    SharedWithMeResponse, SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest,
+    SmallUploadResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
+    ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, TransferPhotoLinkItem,
+    TransferPhotosRequest, TransferPhotosResponse, UpdatePermissionsRequest, VolumeCreationRequest,
+    VolumeEventDto, VolumeEventListResponse, VolumeListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -6216,148 +6215,57 @@ impl ProtonDriveClient {
         ))
     }
 
-    /// Add photos that already live on the album's volume to `album_uid`,
-    /// returning one outcome per input photo in input order.
+    /// Add photos to `album_uid`, returning one outcome per input photo in
+    /// input order. The photos stay where they are, timeline included.
     ///
-    /// Ported from the TypeScript SDK (`AddToAlbumProcess.processSameVolumeQueue`
-    /// with `PhotoTransferPayloadBuilder`). Each photo's name and node passphrase
-    /// are re-encrypted to the album key and its name/content hashes recomputed
-    /// under the album's hash key; the photo itself is not re-uploaded and stays
-    /// in the timeline. A main photo's related photos (live-photo video, burst
-    /// siblings) travel with it, because the server refuses the group otherwise.
-    ///
-    /// Photos on a *different* volume (an album shared with us) need the TS
-    /// `copyPhoto` path, which is not ported — those fail their own outcome
-    /// rather than the whole call.
+    /// Mirrors C# `PhotoOperations.AddPhotosToAlbumAsync` (itself the TS
+    /// `AddToAlbumProcess`). A photo on the album's volume is added through
+    /// `POST photos/volumes/{vid}/albums/{lid}/add-multiple`; one on another
+    /// volume — from an album shared with us — is copied into the album
+    /// through `POST volumes/{vid}/links/{lid}/copy`. Each photo's name and node
+    /// passphrase are re-encrypted to the album key and its name/content hashes
+    /// recomputed under the album's hash key; the photo itself is not
+    /// re-uploaded. A main photo's related photos (live-photo video, burst
+    /// siblings) travel with it, and when the server names related photos it
+    /// still wants, the photo is sent once more with them, as in
+    /// [`save_photos_to_timeline`](Self::save_photos_to_timeline). A photo
+    /// already in the album fails its own outcome.
     pub(crate) async fn add_photos_to_album(
         &self,
         album_uid: &NodeUid,
         photo_uids: &[NodeUid],
     ) -> Result<Vec<(NodeUid, Result<()>)>> {
-        /// Photos per `add-multiple` request, related photos included (TS
-        /// `ADD_PHOTOS_BATCH_SIZE`).
-        const ADD_BATCH: usize = 10;
-
         let mut timer = self.telemetry.start("add_photos_to_album");
-        let mut outcomes: Vec<(NodeUid, Result<()>)> = Vec::with_capacity(photo_uids.len());
+        timer.attr("photo_count", photo_uids.len());
         if photo_uids.is_empty() {
             timer.success();
-            return Ok(outcomes);
+            return Ok(Vec::new());
         }
 
-        let album_key = self.folder_node_key(album_uid).await?;
-        let album_hash_key = self
-            .parent_hash_key_ctx(album_uid, &album_key, true)
-            .await?;
+        let key = self.folder_node_key(album_uid).await?;
+        let hash_key = self.parent_hash_key_ctx(album_uid, &key, true).await?;
         let (_address_id, email, signing_key) = self.photos_membership_address().await?;
+        let target = PhotoTransferTarget {
+            uid: album_uid.clone(),
+            kind: PhotoTransferKind::Album,
+            key,
+            hash_key,
+            email,
+            signing_key,
+        };
+        let mut outcomes = self.transfer_photos(&target, photo_uids).await?;
 
-        let mut wanted: Vec<&NodeUid> = Vec::new();
-        for uid in photo_uids {
-            if uid.volume_id != album_uid.volume_id {
-                outcomes.push((
-                    uid.clone(),
-                    Err(ProtonError::invalid_operation(format!(
-                        "photo {uid} is on another volume than album {album_uid}; \
-                         copying photos across volumes is not implemented"
-                    ))),
-                ));
-                continue;
-            }
-            wanted.push(uid);
-        }
-
-        // One `add-multiple` batch at a time: build each photo's payload, fan
-        // the related photos in beside it, then post and map the per-link
-        // outcomes back onto the *main* photos the caller asked about.
-        let mut batch: Vec<NodeUid> = Vec::new();
-        let mut entries: Vec<AddPhotoToAlbumEntry> = Vec::new();
-        let mut queue: std::collections::VecDeque<NodeUid> = wanted.into_iter().cloned().collect();
-
-        while let Some(uid) = queue.pop_front() {
-            let payload = match self
-                .album_photo_entries(&uid, &album_key, &album_hash_key, &email, &signing_key)
-                .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    outcomes.push((uid, Err(error)));
-                    continue;
-                }
-            };
-
-            // A photo plus its related photos must not be split across requests.
-            if !entries.is_empty() && entries.len() + payload.len() > ADD_BATCH {
-                self.post_album_additions(album_uid, &entries, &batch, &mut outcomes)
-                    .await?;
-                entries.clear();
-                batch.clear();
-            }
-            entries.extend(payload);
-            batch.push(uid);
-        }
-        if !entries.is_empty() {
-            self.post_album_additions(album_uid, &entries, &batch, &mut outcomes)
-                .await?;
-        }
-
+        // The transfer reports in completion order; this call has always
+        // answered in input order.
+        let position: HashMap<&NodeUid, usize> = photo_uids
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, uid)| (uid, index))
+            .collect();
+        outcomes.sort_by_key(|(uid, _)| position.get(uid).copied().unwrap_or(usize::MAX));
         timer.success();
         Ok(outcomes)
-    }
-
-    /// Build the `AlbumData` entries for one photo: the photo itself first, then
-    /// each of its related photos (TS `preparePhotoPayload`).
-    async fn album_photo_entries(
-        &self,
-        uid: &NodeUid,
-        album_key: &PrivateKey,
-        album_hash_key: &[u8],
-        email: &str,
-        signing_key: &PrivateKey,
-    ) -> Result<Vec<AddPhotoToAlbumEntry>> {
-        let node = self
-            .get_photos_node(uid)
-            .await?
-            .ok_or_else(|| ProtonError::invalid_operation(format!("photo {uid} not found")))?;
-
-        let related: Vec<NodeUid> = node
-            .photo
-            .as_ref()
-            .map(|photo| photo.related_photo_uids.clone())
-            .unwrap_or_default();
-
-        let mut entries = vec![
-            self.album_photo_entry(uid, album_key, album_hash_key, email, signing_key)
-                .await?,
-        ];
-        for related_uid in related {
-            entries.push(
-                self.album_photo_entry(&related_uid, album_key, album_hash_key, email, signing_key)
-                    .await?,
-            );
-        }
-        Ok(entries)
-    }
-
-    /// Re-encrypt one photo's name and passphrase to the album key.
-    async fn album_photo_entry(
-        &self,
-        uid: &NodeUid,
-        album_key: &PrivateKey,
-        album_hash_key: &[u8],
-        email: &str,
-        signing_key: &PrivateKey,
-    ) -> Result<AddPhotoToAlbumEntry> {
-        let payload = self
-            .photo_target_payload(uid, album_key, album_hash_key, email, signing_key)
-            .await?;
-        Ok(AddPhotoToAlbumEntry {
-            link_id: payload.uid.link_id,
-            name_hash: payload.name_hash,
-            name: payload.name,
-            name_signature_email: payload.name_signature_email,
-            passphrase: payload.passphrase,
-            content_hash: payload.content_hash,
-        })
     }
 
     /// Re-encrypt one photo's name, passphrase and hashes for a target node —
@@ -6425,74 +6333,6 @@ impl ProtonDriveClient {
         })
     }
 
-    /// Post one `add-multiple` batch and record an outcome for every photo in
-    /// `batch` (the main photos; a related photo's failure fails its main one).
-    async fn post_album_additions(
-        &self,
-        album_uid: &NodeUid,
-        entries: &[AddPhotoToAlbumEntry],
-        batch: &[NodeUid],
-        outcomes: &mut Vec<(NodeUid, Result<()>)>,
-    ) -> Result<()> {
-        /// `ResponseCode::Success` as it arrives inside a per-link sub-response.
-        const SUCCESS_CODE: i32 = 1000;
-
-        let path = format!(
-            "photos/volumes/{}/albums/{}/add-multiple",
-            album_uid.volume_id, album_uid.link_id
-        );
-        let response: AddPhotosToAlbumResponse = self
-            .http
-            .post(
-                &path,
-                &AddPhotosToAlbumRequest {
-                    album_data: entries.to_vec(),
-                },
-            )
-            .await?;
-
-        // Only the links the server reports on failed; everything else in the
-        // batch succeeded (TS builds the same error map and yields ok for the
-        // rest).
-        let mut failures: HashMap<String, String> = HashMap::new();
-        for outcome in response.responses {
-            let body = &outcome.response;
-            // `Code == 1000` and no `Error` is the only success shape; a missing
-            // code (0) counts as a failure, as it does in TS.
-            if body.code == SUCCESS_CODE && body.error.is_none() {
-                continue;
-            }
-            let missing = body
-                .details
-                .as_ref()
-                .map(|details| details.missing.as_slice())
-                .unwrap_or_default();
-            let message = if !missing.is_empty() {
-                let missing: Vec<String> = missing.iter().map(|id| id.to_string()).collect();
-                format!(
-                    "server wants related photos added with it: {}",
-                    missing.join(", ")
-                )
-            } else {
-                body.error
-                    .clone()
-                    .unwrap_or_else(|| format!("add to album failed with code {}", body.code))
-            };
-            failures.insert(outcome.link_id.to_string(), message);
-        }
-
-        for uid in batch {
-            match failures.get(&uid.link_id.to_string()) {
-                Some(message) => outcomes.push((
-                    uid.clone(),
-                    Err(ProtonError::invalid_operation(message.clone())),
-                )),
-                None => outcomes.push((uid.clone(), Ok(()))),
-            }
-        }
-        Ok(())
-    }
-
     /// Rename the album `album_uid` to `name`.
     ///
     /// Ported from the TypeScript SDK (`AlbumsManager.updateAlbum` +
@@ -6550,13 +6390,43 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// Set the cover photo of the album `album_uid`.
+    ///
+    /// Mirrors the cover half of C# `PhotoOperations.UpdateAlbumAsync`
+    /// (`PUT photos/volumes/{vid}/albums/{lid}` with only `CoverLinkID`). The
+    /// cover must be on the album's volume; upstream refuses anything else
+    /// before sending.
+    pub(crate) async fn set_album_cover(
+        &self,
+        album_uid: &NodeUid,
+        cover_uid: &NodeUid,
+    ) -> Result<()> {
+        let mut timer = self.telemetry.start("set_album_cover");
+        if cover_uid.volume_id != album_uid.volume_id {
+            return Err(ProtonError::invalid_operation(
+                "the cover photo must be on the same volume as the album",
+            ));
+        }
+        let request = AlbumUpdateRequest {
+            cover_link_id: Some(cover_uid.link_id.clone()),
+            link: None,
+        };
+        let path = format!(
+            "photos/volumes/{}/albums/{}",
+            album_uid.volume_id, album_uid.link_id
+        );
+        let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+        timer.success();
+        Ok(())
+    }
+
     /// Delete the album `album_uid`.
     ///
     /// Ported from the TypeScript SDK (`PhotosAPIService.deleteAlbum`). With
     /// `delete_photos` false the photos stay in the timeline, and the server
-    /// refuses (code 200302) when the album holds photos that exist only in it,
-    /// such as ones saved from a shared album; with it true those are deleted
-    /// together with the album.
+    /// refuses with [`ResponseCode::AlbumContainsPhotosNotInTimeline`] when the
+    /// album holds photos that exist only in it, such as ones saved from a
+    /// shared album; with it true those are deleted together with the album.
     pub(crate) async fn delete_album(
         &self,
         album_uid: &NodeUid,
@@ -6572,6 +6442,34 @@ impl ProtonDriveClient {
         let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
         timer.success();
         Ok(())
+    }
+
+    /// Delete the album `album_uid`, first saving to the timeline the photos
+    /// that exist only in it, so no photo is lost.
+    ///
+    /// Mirrors C# `PhotoOperations.DeleteAlbumAsync` with `saveToTimeline`: the
+    /// delete is tried as is; when the server refuses with
+    /// [`ResponseCode::AlbumContainsPhotosNotInTimeline`], the photos it names
+    /// are saved through [`save_photos_to_timeline`](Self::save_photos_to_timeline)
+    /// and the delete is sent once more. The first photo that cannot be saved
+    /// fails the call, and the album stays.
+    pub(crate) async fn delete_album_saving_photos(&self, album_uid: &NodeUid) -> Result<()> {
+        let only_in_album = match self.delete_album(album_uid, false).await {
+            Err(ProtonError::Api(error))
+                if error.code == ResponseCode::AlbumContainsPhotosNotInTimeline =>
+            {
+                let photos = photos_only_in_album(&error, &album_uid.volume_id);
+                if photos.is_empty() {
+                    return Err(ProtonError::Api(error));
+                }
+                photos
+            }
+            done => return done,
+        };
+        for (_, outcome) in self.save_photos_to_timeline(&only_in_album).await? {
+            outcome?;
+        }
+        self.delete_album(album_uid, false).await
     }
 
     /// Take photos out of `album_uid`, one outcome per input photo in input
@@ -6593,26 +6491,47 @@ impl ProtonDriveClient {
             "photos/volumes/{}/albums/{}/remove-multiple",
             album_uid.volume_id, album_uid.link_id
         );
-        let mut outcomes = Vec::with_capacity(photo_uids.len());
-        for batch in photo_uids.chunks(REMOVE_BATCH) {
+        // A photo on another volume cannot be in this album's request; it fails
+        // its own outcome without being sent, as upstream does.
+        let mut results: Vec<Option<Result<()>>> = photo_uids
+            .iter()
+            .map(|uid| {
+                (uid.volume_id != album_uid.volume_id).then(|| {
+                    Err(ProtonError::invalid_operation(
+                        "the photo must be on the same volume as the album",
+                    ))
+                })
+            })
+            .collect();
+        let sendable: Vec<usize> = (0..photo_uids.len())
+            .filter(|&index| results[index].is_none())
+            .collect();
+        for batch in sendable.chunks(REMOVE_BATCH) {
             let request = RemovePhotosFromAlbumRequest {
-                link_ids: batch.iter().map(|uid| uid.link_id.clone()).collect(),
+                link_ids: batch
+                    .iter()
+                    .map(|&index| photo_uids[index].link_id.clone())
+                    .collect(),
             };
             let result: Result<proton_sdk::api::ApiResponse> =
                 self.http.post(&path, &request).await;
-            match result {
-                Ok(_) => outcomes.extend(batch.iter().map(|uid| (uid.clone(), Ok(())))),
-                Err(error) => {
-                    let message = error.to_string();
-                    outcomes.extend(batch.iter().map(|uid| {
-                        (
-                            uid.clone(),
-                            Err(ProtonError::invalid_operation(message.clone())),
-                        )
-                    }));
-                }
+            let message = result.err().map(|error| error.to_string());
+            for &index in batch {
+                results[index] = Some(match &message {
+                    None => Ok(()),
+                    Some(message) => Err(ProtonError::invalid_operation(message.clone())),
+                });
             }
         }
+        let outcomes: Vec<(NodeUid, Result<()>)> = photo_uids
+            .iter()
+            .cloned()
+            .zip(
+                results
+                    .into_iter()
+                    .map(|result| result.expect("every photo is either refused or sent")),
+            )
+            .collect();
         timer.success();
         Ok(outcomes)
     }
@@ -6638,13 +6557,6 @@ impl ProtonDriveClient {
         &self,
         photo_uids: &[NodeUid],
     ) -> Result<Vec<(NodeUid, Result<()>)>> {
-        /// Photos whose payloads are built before a round of requests goes out
-        /// (C# `SaveToTimelineBatchSize`).
-        const SAVE_BATCH: usize = 20;
-        /// Links — main photos plus related ones — per `transfer-multiple`
-        /// request (C# `MaxLinksPerTransferBatch`).
-        const MAX_LINKS_PER_TRANSFER: usize = 10;
-
         let mut timer = self.telemetry.start("save_photos_to_timeline");
         timer.attr("photo_count", photo_uids.len());
         if photo_uids.is_empty() {
@@ -6671,13 +6583,40 @@ impl ProtonDriveClient {
             .parent_hash_key_ctx(&target_uid, &target_key, true)
             .await?;
         let (_address_id, email, signing_key) = self.photos_membership_address().await?;
-        let target = TimelineTarget {
+        let target = PhotoTransferTarget {
             uid: target_uid,
+            kind: PhotoTransferKind::Timeline,
             key: target_key,
             hash_key: target_hash_key,
             email,
             signing_key,
         };
+
+        let outcomes = self.transfer_photos(&target, photo_uids).await?;
+        timer.success();
+        Ok(outcomes)
+    }
+
+    /// Bring photos into `target`, the timeline root or an album, with one
+    /// outcome per photo in completion order (C#
+    /// `PhotoOperations.TransferPhotosToTargetAsync`).
+    ///
+    /// Photos on the target's volume go in batches through the target's own
+    /// endpoint (see [`PhotoTransferKind`]); photos on another volume are
+    /// copied one at a time. A photo whose group the server reports
+    /// incomplete is re-queued once with the related photos it named, and only
+    /// its second answer becomes an outcome.
+    async fn transfer_photos(
+        &self,
+        target: &PhotoTransferTarget,
+        photo_uids: &[NodeUid],
+    ) -> Result<Vec<(NodeUid, Result<()>)>> {
+        /// Photos whose payloads are built before a round of requests goes out
+        /// (C# `PhotoTransferLoadBatchSize`).
+        const LOAD_BATCH: usize = 20;
+        /// Links — main photos plus related ones — per same-volume request
+        /// (C# `MaxLinksPerTransferBatch`).
+        const MAX_LINKS_PER_TRANSFER: usize = 10;
 
         let mut outcomes: Vec<(NodeUid, Result<()>)> = Vec::with_capacity(photo_uids.len());
         // Each entry is a photo plus the related photos the server asked for on
@@ -6692,12 +6631,12 @@ impl ProtonDriveClient {
         while !queue.is_empty() {
             let mut same_volume: Vec<PhotoTargetPayload> = Vec::new();
             let mut cross_volume: Vec<PhotoTargetPayload> = Vec::new();
-            for _ in 0..SAVE_BATCH {
+            for _ in 0..LOAD_BATCH {
                 let Some((uid, extra_related)) = queue.pop_front() else {
                     break;
                 };
                 match self
-                    .timeline_photo_payload(&uid, &extra_related, &target)
+                    .transfer_photo_payload(&uid, &extra_related, target)
                     .await
                 {
                     Ok(payload) if payload.uid.volume_id == target.uid.volume_id => {
@@ -6715,8 +6654,8 @@ impl ProtonDriveClient {
             for payload in same_volume {
                 let count = 1 + payload.related.len();
                 if !batch.is_empty() && links + count > MAX_LINKS_PER_TRANSFER {
-                    self.transfer_photos_to_timeline(
-                        &target,
+                    self.transfer_photo_batch(
+                        target,
                         &batch,
                         &mut queue,
                         &mut retried,
@@ -6730,19 +6669,13 @@ impl ProtonDriveClient {
                 batch.push(payload);
             }
             if !batch.is_empty() {
-                self.transfer_photos_to_timeline(
-                    &target,
-                    &batch,
-                    &mut queue,
-                    &mut retried,
-                    &mut outcomes,
-                )
-                .await?;
+                self.transfer_photo_batch(target, &batch, &mut queue, &mut retried, &mut outcomes)
+                    .await?;
             }
 
             for payload in cross_volume {
-                self.copy_photo_to_timeline(
-                    &target,
+                self.copy_photo_to_target(
+                    target,
                     &payload,
                     &mut queue,
                     &mut retried,
@@ -6751,23 +6684,21 @@ impl ProtonDriveClient {
                 .await;
             }
         }
-
-        timer.success();
         Ok(outcomes)
     }
 
-    /// One photo's timeline payload: the photo itself plus its related photos,
-    /// re-encrypted for the timeline root (C#
+    /// One photo's transfer payload: the photo itself plus its related photos,
+    /// re-encrypted for `target` (C#
     /// `PhotoTransferPayloadBuilder.BuildPayloadsAsync`).
     ///
     /// `extra_related` are the ones the server demanded on a previous attempt,
     /// merged with what the photo itself declares. A related photo that cannot
     /// be built is skipped rather than failing its main photo, as upstream does.
-    async fn timeline_photo_payload(
+    async fn transfer_photo_payload(
         &self,
         uid: &NodeUid,
         extra_related: &[NodeUid],
-        target: &TimelineTarget,
+        target: &PhotoTransferTarget,
     ) -> Result<PhotoTargetPayload> {
         let mut payload = self
             .photo_target_payload(
@@ -6778,6 +6709,8 @@ impl ProtonDriveClient {
                 &target.signing_key,
             )
             .await?;
+        // Album membership is not parentage, so only the timeline can tell here;
+        // the album endpoint reports a photo already in it per link.
         if payload.parent_uid.as_ref() == Some(&target.uid) {
             return Err(ProtonError::invalid_operation(format!(
                 "photo {uid} is already in the timeline"
@@ -6816,62 +6749,102 @@ impl ProtonDriveClient {
         Ok(payload)
     }
 
-    /// Post one `transfer-multiple` batch and record an outcome for each of its
-    /// main photos (C# `TransferSameVolumeBatchAsync` + `RecordTransferOutcomes`).
-    async fn transfer_photos_to_timeline(
+    /// Post one same-volume batch — `transfer-multiple` into the timeline,
+    /// `add-multiple` into an album — and record an outcome for each of its main
+    /// photos (C# `TransferSameVolumeBatchAsync` / `AddToAlbumSameVolumeBatchAsync`
+    /// + `RecordTransferOutcomes`).
+    async fn transfer_photo_batch(
         &self,
-        target: &TimelineTarget,
+        target: &PhotoTransferTarget,
         payloads: &[PhotoTargetPayload],
+        queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
+        retried: &mut HashSet<NodeUid>,
+        outcomes: &mut Vec<(NodeUid, Result<()>)>,
+    ) -> Result<()> {
+        let response: TransferPhotosResponse = match target.kind {
+            PhotoTransferKind::Timeline => {
+                let mut links: Vec<TransferPhotoLinkItem> = Vec::new();
+                let mut sent: Vec<&PhotoTargetPayload> = Vec::new();
+                for payload in payloads {
+                    // The endpoint matches each link on the hash it currently has,
+                    // so a photo whose link carries none cannot be moved.
+                    let items: Option<Vec<TransferPhotoLinkItem>> = std::iter::once(payload)
+                        .chain(payload.related.iter())
+                        .map(transfer_link_item)
+                        .collect();
+                    match items {
+                        Some(items) => {
+                            links.extend(items);
+                            sent.push(payload);
+                        }
+                        None => outcomes.push((
+                            payload.uid.clone(),
+                            Err(ProtonError::invalid_operation(format!(
+                                "photo {} has no name hash on its current parent; it cannot be moved",
+                                payload.uid
+                            ))),
+                        )),
+                    }
+                }
+                if links.is_empty() {
+                    return Ok(());
+                }
+                let path = format!(
+                    "photos/volumes/{}/links/transfer-multiple",
+                    target.uid.volume_id
+                );
+                let response = self
+                    .http
+                    .put(
+                        &path,
+                        &TransferPhotosRequest {
+                            parent_link_id: target.uid.link_id.clone(),
+                            links,
+                            name_signature_email: target.email.clone(),
+                            signature_email: None,
+                        },
+                    )
+                    .await?;
+                return self
+                    .record_transfer_outcomes(target, response, sent, queue, retried, outcomes);
+            }
+            PhotoTransferKind::Album => {
+                let album_data: Vec<AddPhotoToAlbumEntry> = payloads
+                    .iter()
+                    .flat_map(|payload| std::iter::once(payload).chain(payload.related.iter()))
+                    .map(album_entry)
+                    .collect();
+                let path = format!(
+                    "photos/volumes/{}/albums/{}/add-multiple",
+                    target.uid.volume_id, target.uid.link_id
+                );
+                self.http
+                    .post(&path, &AddPhotosToAlbumRequest { album_data })
+                    .await?
+            }
+        };
+        self.record_transfer_outcomes(
+            target,
+            response,
+            payloads.iter().collect(),
+            queue,
+            retried,
+            outcomes,
+        )
+    }
+
+    /// Map one same-volume batch's per-link answers onto the main photos `sent`.
+    fn record_transfer_outcomes(
+        &self,
+        target: &PhotoTransferTarget,
+        response: TransferPhotosResponse,
+        sent: Vec<&PhotoTargetPayload>,
         queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
         retried: &mut HashSet<NodeUid>,
         outcomes: &mut Vec<(NodeUid, Result<()>)>,
     ) -> Result<()> {
         /// `ResponseCode::Success` as it arrives inside a per-link sub-response.
         const SUCCESS_CODE: i32 = 1000;
-
-        let mut links: Vec<TransferPhotoLinkItem> = Vec::new();
-        let mut sent: Vec<&PhotoTargetPayload> = Vec::new();
-        for payload in payloads {
-            // The endpoint matches each link on the hash it currently has, so a
-            // photo whose link carries none cannot be moved.
-            let items: Option<Vec<TransferPhotoLinkItem>> = std::iter::once(payload)
-                .chain(payload.related.iter())
-                .map(transfer_link_item)
-                .collect();
-            match items {
-                Some(items) => {
-                    links.extend(items);
-                    sent.push(payload);
-                }
-                None => outcomes.push((
-                    payload.uid.clone(),
-                    Err(ProtonError::invalid_operation(format!(
-                        "photo {} has no name hash on its current parent; it cannot be moved",
-                        payload.uid
-                    ))),
-                )),
-            }
-        }
-        if links.is_empty() {
-            return Ok(());
-        }
-
-        let path = format!(
-            "photos/volumes/{}/links/transfer-multiple",
-            target.uid.volume_id
-        );
-        let response: TransferPhotosResponse = self
-            .http
-            .put(
-                &path,
-                &TransferPhotosRequest {
-                    parent_link_id: target.uid.link_id.clone(),
-                    links,
-                    name_signature_email: target.email.clone(),
-                    signature_email: None,
-                },
-            )
-            .await?;
 
         // Only the links the server reports on failed; a main photo without an
         // entry succeeded, and a related photo's own failure is not reported
@@ -6905,16 +6878,16 @@ impl ProtonDriveClient {
 
         for payload in sent {
             let failure = failures.remove(&payload.uid.link_id.to_string());
-            record_timeline_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
+            record_transfer_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
         }
         Ok(())
     }
 
-    /// Copy one photo that lives on another volume into the timeline (C#
-    /// `CopyCrossVolumePhotoAsync`, JS `copyPhoto`).
-    async fn copy_photo_to_timeline(
+    /// Copy one photo that lives on another volume into `target`, the timeline
+    /// root or an album (C# `CopyCrossVolumePhotoAsync`, JS `copyPhoto`).
+    async fn copy_photo_to_target(
         &self,
-        target: &TimelineTarget,
+        target: &PhotoTransferTarget,
         payload: &PhotoTargetPayload,
         queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
         retried: &mut HashSet<NodeUid>,
@@ -6964,7 +6937,7 @@ impl ProtonDriveClient {
             }
             Err(error) => Some((Vec::new(), error)),
         };
-        record_timeline_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
+        record_transfer_outcome(payload.uid.clone(), failure, queue, retried, outcomes);
     }
 
     /// Page the albums on the account's photos volume.
@@ -8709,6 +8682,20 @@ fn share_membership_from_dto(dto: &ShareMembershipSummaryDto) -> ShareMembership
     }
 }
 
+/// One `add-multiple` entry. It never carries a passphrase signature, not even
+/// for an anonymously signed photo: the endpoint rejects the field (C#
+/// `ToAlbumPhotoLinkItem`).
+fn album_entry(payload: &PhotoTargetPayload) -> AddPhotoToAlbumEntry {
+    AddPhotoToAlbumEntry {
+        link_id: payload.uid.link_id.clone(),
+        name_hash: payload.name_hash.clone(),
+        name: payload.name.clone(),
+        name_signature_email: payload.name_signature_email.clone(),
+        passphrase: payload.passphrase.clone(),
+        content_hash: payload.content_hash.clone(),
+    }
+}
+
 /// One `transfer-multiple` link item, or `None` when the photo's link carries
 /// no name hash for the parent it is leaving — the endpoint needs it to match.
 fn transfer_link_item(payload: &PhotoTargetPayload) -> Option<TransferPhotoLinkItem> {
@@ -8721,6 +8708,25 @@ fn transfer_link_item(payload: &PhotoTargetPayload) -> Option<TransferPhotoLinkI
         content_hash: payload.content_hash.clone(),
         passphrase_signature: None,
     })
+}
+
+/// The photos an album delete was refused for, from the error envelope's
+/// `Details.ChildLinkIDs` (C# `DeleteAlbumFailureDetails`), on the album's
+/// volume.
+fn photos_only_in_album(error: &ProtonApiError, volume_id: &VolumeId) -> Vec<NodeUid> {
+    error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("ChildLinkIDs"))
+        .and_then(|links| links.as_array())
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(|link_id| link_id.as_str())
+                .map(|link_id| NodeUid::new(volume_id.clone(), LinkId::from(link_id.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The related photos an error envelope's `Details.Missing` names, on the volume
@@ -8744,7 +8750,7 @@ fn missing_related_links(error: &ProtonApiError, volume_id: &VolumeId) -> Vec<No
 fn missing_related_photos_error(missing: &[NodeUid]) -> ProtonError {
     let missing: Vec<String> = missing.iter().map(|uid| uid.to_string()).collect();
     ProtonError::invalid_operation(format!(
-        "server wants related photos saved with it: {}",
+        "server wants related photos sent with it: {}",
         missing.join(", ")
     ))
 }
@@ -8752,7 +8758,7 @@ fn missing_related_photos_error(missing: &[NodeUid]) -> ProtonError {
 /// Turn one photo's answer into an outcome, or re-queue it once when the server
 /// asked for its related photos (C# `PhotoOperations.RecordOutcome`). `failure`
 /// carries the related photos the server named, when it named any.
-fn record_timeline_outcome(
+fn record_transfer_outcome(
     uid: NodeUid,
     failure: Option<(Vec<NodeUid>, ProtonError)>,
     queue: &mut VecDeque<(NodeUid, Vec<NodeUid>)>,
@@ -8770,10 +8776,23 @@ fn record_timeline_outcome(
     }
 }
 
-/// The timeline root and the keys photos are re-encrypted for on their way into
-/// it (C# `PhotoOperations.TimelineTarget`).
-struct TimelineTarget {
+/// Where same-volume photos go in, which decides the endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotoTransferKind {
+    /// The timeline root: the photos are *moved* in through
+    /// `transfer-multiple`.
+    Timeline,
+    /// An album: the photos are *added* through `add-multiple` and stay where
+    /// they are.
+    Album,
+}
+
+/// The node photos are brought into — the timeline root or an album — and the
+/// keys they are re-encrypted for on their way (C#
+/// `PhotoOperations.PhotoTransferTarget`).
+struct PhotoTransferTarget {
     uid: NodeUid,
+    kind: PhotoTransferKind,
     key: PrivateKey,
     hash_key: Vec<u8>,
     /// The photos share membership address: what signs the re-encrypted names.
@@ -8834,9 +8853,10 @@ mod tests {
         alternate_folder_names, assemble_manifest, context_share_path, drive_items,
         epoch_to_iso8601, has_active_regular_volume, is_expired_upload_token,
         is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
-        path_segments, record_timeline_outcome, resolve_parent_keys, run_context_share_mutation,
-        share_membership_from_dto, small_upload_applicable, small_upload_should_fall_back,
-        take_block_target, take_thumbnail_target, to_drive_event, validate_node_name,
+        path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
+        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
+        small_upload_should_fall_back, take_block_target, take_thumbnail_target, to_drive_event,
+        validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkDetailsDto, LinkDto, LinkIdResponsePair,
@@ -9519,7 +9539,7 @@ mod tests {
         };
 
         // First answer: re-queued with the related photo, no outcome yet.
-        record_timeline_outcome(
+        record_transfer_outcome(
             uid.clone(),
             failure(),
             &mut queue,
@@ -9534,7 +9554,7 @@ mod tests {
 
         // Second: the retry is spent, so it becomes a failed outcome instead of
         // going round again.
-        record_timeline_outcome(
+        record_transfer_outcome(
             uid.clone(),
             failure(),
             &mut queue,
@@ -9553,11 +9573,30 @@ mod tests {
         let mut retried = std::collections::HashSet::new();
         let mut outcomes = Vec::new();
 
-        record_timeline_outcome(uid.clone(), None, &mut queue, &mut retried, &mut outcomes);
+        record_transfer_outcome(uid.clone(), None, &mut queue, &mut retried, &mut outcomes);
 
         assert!(queue.is_empty());
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].1.is_ok());
+    }
+
+    #[test]
+    fn photos_only_in_album_reads_the_error_details() {
+        let volume_id = VolumeId::new("vol");
+        let error = ProtonApiError {
+            code: ResponseCode::from_raw(200_302),
+            http_status: 422,
+            message: "Album contains photos not in timeline".into(),
+            details: Some(serde_json::json!({ "ChildLinkIDs": ["a", "b"] })),
+        };
+        assert_eq!(error.code, ResponseCode::AlbumContainsPhotosNotInTimeline);
+        assert_eq!(
+            photos_only_in_album(&error, &volume_id),
+            vec![
+                NodeUid::new(volume_id.clone(), LinkId::new("a")),
+                NodeUid::new(volume_id.clone(), LinkId::new("b")),
+            ]
+        );
     }
 
     #[test]

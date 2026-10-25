@@ -307,16 +307,16 @@ impl ProtonPhotosClient {
         self.drive.create_album(name).await
     }
 
-    /// Add photos already on the album's volume to `album_uid`, one outcome per
-    /// input photo in input order (a photo that fails does not stop the others).
+    /// Add photos to `album_uid`, one outcome per input photo in input order (a
+    /// photo that fails does not stop the others).
     ///
-    /// Ported from the TypeScript SDK (`AlbumsManager.addPhotos`). The photos
-    /// stay in the timeline — an album membership re-encrypts a photo's name and
-    /// passphrase to the album key, it does not copy content. Related photos
-    /// (live-photo video, burst siblings) are sent alongside their main photo
-    /// because the server rejects the group otherwise. Photos on another volume
-    /// (from an album shared with us) need the unported `copyPhoto` path and
-    /// fail their own outcome.
+    /// Mirrors C# `ProtonPhotosClient.AddPhotosToAlbumAsync` (TS
+    /// `AlbumsManager.addPhotos`). The photos stay in the timeline — an album
+    /// membership re-encrypts a photo's name and passphrase to the album key, it
+    /// does not copy content. A photo on another volume, from an album shared
+    /// with us, is copied into the album instead. Related photos (live-photo
+    /// video, burst siblings) are sent alongside their main photo because the
+    /// server rejects the group otherwise.
     pub async fn add_photos_to_album(
         &self,
         album_uid: &NodeUid,
@@ -333,21 +333,44 @@ impl ProtonPhotosClient {
         self.drive.rename_album(album_uid, name).await
     }
 
+    /// Set the cover photo of the album `album_uid`. The cover must be on the
+    /// album's volume.
+    ///
+    /// Mirrors the cover half of C# `ProtonPhotosClient.UpdateAlbumAsync`;
+    /// [`rename_album`](Self::rename_album) is the name half.
+    pub async fn set_album_cover(&self, album_uid: &NodeUid, cover_uid: &NodeUid) -> Result<()> {
+        self.drive.set_album_cover(album_uid, cover_uid).await
+    }
+
     /// Delete the album `album_uid`.
     ///
     /// Ported from the TypeScript SDK (`AlbumsManager.deleteAlbum`). With
     /// `delete_photos` false the photos stay in the timeline; the server then
-    /// refuses to delete an album holding photos that exist only in it (API
-    /// code 200302). With it true those photos are deleted too.
+    /// refuses to delete an album holding photos that exist only in it, with
+    /// [`ResponseCode::AlbumContainsPhotosNotInTimeline`](proton_sdk::api::ResponseCode::AlbumContainsPhotosNotInTimeline).
+    /// With it true those photos are deleted too;
+    /// [`delete_album_saving_photos`](Self::delete_album_saving_photos) keeps
+    /// them instead.
     pub async fn delete_album(&self, album_uid: &NodeUid, delete_photos: bool) -> Result<()> {
         self.drive.delete_album(album_uid, delete_photos).await
+    }
+
+    /// Delete the album `album_uid`, first saving to the timeline the photos
+    /// that exist only in it, so no photo is lost.
+    ///
+    /// Mirrors C# `ProtonPhotosClient.DeleteAlbumAsync` with `saveToTimeline`.
+    /// The first photo that cannot be saved fails the call, and the album
+    /// stays.
+    pub async fn delete_album_saving_photos(&self, album_uid: &NodeUid) -> Result<()> {
+        self.drive.delete_album_saving_photos(album_uid).await
     }
 
     /// Take photos out of `album_uid`, one outcome per input photo in input
     /// order. The photos stay in the timeline; this is not a trash.
     ///
     /// Ported from the TypeScript SDK (`AlbumsManager.removePhotos`). The
-    /// server answers per batch of ten, so a failure fails its whole batch.
+    /// server answers per batch of ten, so a failure fails its whole batch. A
+    /// photo on another volume than the album fails without being sent.
     pub async fn remove_photos_from_album(
         &self,
         album_uid: &NodeUid,
@@ -495,7 +518,8 @@ mod tests {
 
     #[test]
     fn add_photos_response_reports_missing_related_photos() {
-        // The per-link sub-responses of `albums/{lid}/add-multiple`: one plain
+        // The per-link sub-responses of `albums/{lid}/add-multiple`, which share
+        // the `transfer-multiple` shape: one plain
         // success, one failure naming the related photos the server wants sent
         // alongside the main one.
         let raw = r#"{
@@ -506,7 +530,7 @@ mod tests {
                 } }
             ]
         }"#;
-        let parsed: crate::dtos::AddPhotosToAlbumResponse = serde_json::from_str(raw).unwrap();
+        let parsed: crate::dtos::TransferPhotosResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.responses.len(), 2);
         assert_eq!(parsed.responses[0].response.code, 1000);
         assert!(parsed.responses[0].response.error.is_none());
