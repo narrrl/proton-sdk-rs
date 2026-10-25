@@ -9,7 +9,9 @@
 
 mod common;
 
+use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::crypto::VerificationStatus;
+use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::{Node, NodeKind};
 use proton_sdk::ids::{LinkId, NodeUid};
 
@@ -567,6 +569,97 @@ async fn folder_size_counts_nested_descendants() {
         .await
         .expect("get_folder_size(nested)");
     assert_eq!(empty.descendants, 1, "nested holds one file: {empty:?}");
+
+    cleanup(client, &[top]).await;
+}
+
+/// `copy_node` copies a file with its content and a folder with its subtree,
+/// keeps or replaces the name, and refuses a name already taken.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn copy_node_copies_content_and_subtrees() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let top_name = format!("copy-ops-{}", common::unique_suffix());
+    let top = client
+        .create_folder(&root.uid, &top_name, None)
+        .await
+        .expect("create top folder");
+    let source = client
+        .create_folder(&top, "source", None)
+        .await
+        .expect("create source folder");
+    let target = client
+        .create_folder(&top, "target", None)
+        .await
+        .expect("create target folder");
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let file = client
+        .upload_file(&source, "data.bin", "application/octet-stream", &payload)
+        .await
+        .expect("upload file");
+
+    // A file, keeping its name, into another folder.
+    let copy = client
+        .copy_node(&file, &target, None)
+        .await
+        .expect("copy file");
+    assert_ne!(copy, file, "a copy is a new node");
+    let node = get(client, &copy, "file copy").await;
+    assert_eq!(node.name, "data.bin");
+    assert_eq!(node.parent_uid.as_ref(), Some(&target));
+    assert_eq!(
+        client.download_file(&copy).await.expect("download copy"),
+        payload,
+        "the copy carries the content"
+    );
+
+    // A file, renamed, next to itself.
+    let renamed = client
+        .copy_node(&file, &source, Some("data (copy).bin"))
+        .await
+        .expect("copy file with a new name");
+    assert_eq!(
+        get(client, &renamed, "renamed copy").await.name,
+        "data (copy).bin"
+    );
+    assert_eq!(get(client, &file, "source file").await.name, "data.bin");
+
+    // The same name twice in one folder is refused.
+    let taken = client
+        .copy_node(&file, &source, None)
+        .await
+        .expect_err("the name is taken");
+    match &taken {
+        ProtonError::Api(e) => assert_eq!(e.code, ResponseCode::AlreadyExists, "{taken:?}"),
+        other => panic!("expected an api error, got {other:?}"),
+    }
+
+    // A folder, with its subtree.
+    let folder_copy = client
+        .copy_node(&source, &target, Some("source copy"))
+        .await
+        .expect("copy folder");
+    let children = client
+        .enumerate_folder_children_node_uids(&folder_copy)
+        .await
+        .expect("list folder copy");
+    let mut names: Vec<String> = client
+        .enumerate_nodes(&children)
+        .await
+        .expect("read folder copy children")
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data (copy).bin", "data.bin"]);
 
     cleanup(client, &[top]).await;
 }

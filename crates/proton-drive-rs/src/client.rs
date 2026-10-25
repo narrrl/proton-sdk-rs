@@ -51,13 +51,13 @@ use crate::dtos::{
     AlbumUpdateRequest, BlockCreationRequest, BlockDto, BlockUploadPreparationRequest,
     BlockUploadPreparationResponse, BlockUploadTarget, BlockVerificationInputResponse,
     BlockVerifier, BookmarkShareUrlDto, BookmarksResponse, CommonExtendedAttributes,
-    ContextShareResponse, CopyPhotoContent, CopyPhotoRelatedItem, CopyPhotoRequest,
-    CopyPhotoResponse, CreateBookmarkRequest, CreatePublicLinkRequest, CreatePublicLinkResponse,
-    CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto, DeviceCreationLinkDto,
-    DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse,
-    DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto,
-    ExternalInvitationResponseDto, ExternalInvitationsResponse, FileContentDigests,
-    FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
+    ContextShareResponse, CopyLinkRequest, CopyLinkResponse, CopyPhotoContent,
+    CopyPhotoRelatedItem, CopyPhotoRequest, CreateBookmarkRequest, CreatePublicLinkRequest,
+    CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse, DeviceCreationDeviceDto,
+    DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse, DeviceCreationShareDto,
+    DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto, ExtendedAttributes,
+    ExternalInvitationDto, ExternalInvitationResponseDto, ExternalInvitationsResponse,
+    FileContentDigests, FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
     FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
     FolderCreationResponse, FolderSizeResponse, InvitationDetailsResponse, InvitationsListResponse,
     InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
@@ -2810,6 +2810,75 @@ impl ProtonDriveClient {
         .await?;
         timer.success();
         Ok(())
+    }
+
+    /// Copy `uid` under `new_parent` on the server, without downloading it, and
+    /// return the copy's uid. A file is copied with its content and a folder
+    /// with its subtree. `name` renames the copy; `None` keeps the name.
+    ///
+    /// Mirrors TS `NodesManagement.copyNode`
+    /// (`POST volumes/{vid}/links/{lid}/copy`). The crypto is the move's, from
+    /// `build_move_parts`: the passphrase is rewrapped
+    /// to the new parent, so the node key and its content key stay the same,
+    /// and the name is encrypted and signed by the My Files address. Unlike
+    /// [`move_node`](Self::move_node), the new parent may be on another volume.
+    ///
+    /// A name already taken in `new_parent` fails with
+    /// [`ResponseCode::AlreadyExists`](proton_sdk::api::ResponseCode::AlreadyExists);
+    /// [`get_available_name`](Self::get_available_name) finds a free one.
+    pub async fn copy_node(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<NodeUid> {
+        let mut timer = self.telemetry.start("copy_node");
+        if let Some(name) = name {
+            validate_node_name(name)?;
+        }
+
+        let details = self
+            .get_link_details(&uid.volume_id, std::slice::from_ref(&uid.link_id))
+            .await?;
+        let link = details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("node {uid} not found")))?
+            .link;
+
+        let dest_parent_key = self.folder_node_key(new_parent).await?;
+        let dest_hash_key = self.parent_hash_key(new_parent, &dest_parent_key).await?;
+        let (_address_id, email, signing_key) = self.membership_address().await?;
+
+        let parts = self
+            .build_move_parts(
+                uid,
+                &link,
+                name,
+                &dest_parent_key,
+                &dest_hash_key,
+                &signing_key,
+            )
+            .await?;
+
+        let request = CopyLinkRequest {
+            target_volume_id: new_parent.volume_id.clone(),
+            target_parent_link_id: new_parent.link_id.clone(),
+            passphrase: parts.passphrase,
+            signature_email: parts.anonymous_signature.as_ref().map(|_| email.clone()),
+            passphrase_signature: parts.anonymous_signature,
+            name: parts.encrypted_name,
+            name_signature_email: email,
+            name_hash: parts.name_hash,
+        };
+        let path = format!("volumes/{}/links/{}/copy", uid.volume_id, uid.link_id);
+        let response: CopyLinkResponse = self.http.post(&path, &request).await?;
+        timer.success();
+        // The copy lives with its new parent, whichever volume the source was
+        // on. (TS builds the uid from the source volume, which only holds for
+        // a copy within one volume.)
+        Ok(NodeUid::new(new_parent.volume_id.clone(), response.link_id))
     }
 
     /// Move several nodes under a single destination parent, keeping their
@@ -6880,11 +6949,7 @@ impl ProtonDriveClient {
             },
         };
 
-        let failure = match self
-            .http
-            .post::<_, CopyPhotoResponse>(&path, &request)
-            .await
-        {
+        let failure = match self.http.post::<_, CopyLinkResponse>(&path, &request).await {
             Ok(_) => None,
             // The incomplete-group answer arrives as an ordinary API error whose
             // `Details.Missing` names the related photos on the *source* volume.

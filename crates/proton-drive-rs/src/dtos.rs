@@ -623,10 +623,42 @@ pub struct CopyPhotoRelatedItem {
     pub content_hash: String,
 }
 
+/// `POST volumes/{vid}/links/{lid}/copy` response, for a photo or any other
+/// node: the new link.
 #[derive(Debug, Deserialize)]
-pub struct CopyPhotoResponse {
+pub struct CopyLinkResponse {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
+}
+
+/// `POST volumes/{vid}/links/{lid}/copy` — copy a node, with its content or
+/// subtree, under a new parent (TS `PostCopyNodeRequest`).
+///
+/// The crypto is the move's: the passphrase rewrapped to the target parent
+/// key, the name encrypted and signed to it, `Hash` under its hash key.
+/// `NodePassphraseSignature` and `SignatureEmail` are sent only for an
+/// anonymously signed node, like [`MoveLinkRequest`].
+#[derive(Debug, Serialize)]
+pub struct CopyLinkRequest {
+    #[serde(rename = "TargetVolumeID")]
+    pub target_volume_id: VolumeId,
+    #[serde(rename = "TargetParentLinkID")]
+    pub target_parent_link_id: LinkId,
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: String,
+    #[serde(
+        rename = "NodePassphraseSignature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub passphrase_signature: Option<String>,
+    #[serde(rename = "SignatureEmail", skip_serializing_if = "Option::is_none")]
+    pub signature_email: Option<String>,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: String,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
 }
 
 /// `POST`/`DELETE photos/volumes/{vid}/links/{lid}/tags` (C# `PhotoTagsRequest`).
