@@ -22,9 +22,10 @@ use proton_sdk::crypto::PrivateKey;
 use proton_sdk::crypto::{
     ContentKey, DEFAULT_BIT_LENGTH, SHARING_INVITER_CONTEXT, VerificationKeyRing,
     VerificationStatus, accept_invitation, build_standard_share_material,
-    build_volume_creation_material, decrypt_armored_with_keys, derive_key_passphrase,
-    encrypt_external_invitation, encrypt_invitation, generate_node_hash_key, generate_node_key,
-    generate_node_key_aead, generate_verifier, verify_detached, verify_detached_with_context,
+    build_volume_creation_material, decrypt_armored_with_keys, decrypt_armored_with_password,
+    derive_key_passphrase, encrypt_external_invitation, encrypt_invitation, generate_node_hash_key,
+    generate_node_key, generate_node_key_aead, generate_verifier, verify_detached,
+    verify_detached_with_context,
 };
 use proton_sdk::error::{ProtonApiError, ProtonError, Result};
 use proton_sdk::http::ApiHttpClient;
@@ -49,13 +50,13 @@ use crate::dtos::{
     AlbumCreationLink, AlbumCreationRequest, AlbumCreationResponse, AlbumItemListResponse,
     AlbumListResponse, AlbumUpdateLink, AlbumUpdateRequest, BlockCreationRequest, BlockDto,
     BlockUploadPreparationRequest, BlockUploadPreparationResponse, BlockUploadTarget,
-    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarksResponse,
-    CommonExtendedAttributes, ContextShareResponse, CopyLinkRequest, CopyLinkResponse,
-    CopyPhotoContent, CopyPhotoRelatedItem, CopyPhotoRequest, CreateBookmarkRequest,
-    CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest, CreateShareResponse,
-    DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest, DeviceCreationResponse,
-    DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest, DeviceUpdateShareDto,
-    ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
+    BlockVerificationInputResponse, BlockVerifier, BookmarkShareUrlDto, BookmarkTokenDto,
+    BookmarksResponse, CommonExtendedAttributes, ContextShareResponse, CopyLinkRequest,
+    CopyLinkResponse, CopyPhotoContent, CopyPhotoRelatedItem, CopyPhotoRequest,
+    CreateBookmarkRequest, CreatePublicLinkRequest, CreatePublicLinkResponse, CreateShareRequest,
+    CreateShareResponse, DeviceCreationDeviceDto, DeviceCreationLinkDto, DeviceCreationRequest,
+    DeviceCreationResponse, DeviceCreationShareDto, DeviceListResponse, DeviceUpdateRequest,
+    DeviceUpdateShareDto, ExtendedAttributes, ExternalInvitationDto, ExternalInvitationResponseDto,
     ExternalInvitationsResponse, FileContentDigests, FileCreationRequest, FileCreationResponse,
     FindPhotoDuplicatesRequest, FindPhotoDuplicatesResponse, FolderChildrenResponse,
     FolderCreationRequest, FolderCreationResponse, FolderSizeResponse, InvitationDetailsResponse,
@@ -65,7 +66,7 @@ use crate::dtos::{
     LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
     MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
     NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
-    PhotosAttributesDto, RemovePhotosFromAlbumRequest, RenameLinkRequest,
+    PhotosAttributesDto, PublicLinkSettingsDto, RemovePhotosFromAlbumRequest, RenameLinkRequest,
     ReportRecentlyAccessedItem, ReportRecentlyAccessedRequest, RevisionConflict,
     RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
     RevisionListResponse, RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto,
@@ -74,8 +75,9 @@ use crate::dtos::{
     SharedWithMeResponse, SmallFileUploadMetadataRequest, SmallRevisionUploadMetadataRequest,
     SmallUploadResponse, ThumbnailBlockListRequest, ThumbnailBlockListResponse,
     ThumbnailCreationRequest, ThumbnailDto, TimelinePhotoListResponse, TransferPhotoLinkItem,
-    TransferPhotosRequest, TransferPhotosResponse, UpdatePermissionsRequest, VolumeCreationRequest,
-    VolumeEventDto, VolumeEventListResponse, VolumeListResponse, VolumeTrashResponse,
+    TransferPhotosRequest, TransferPhotosResponse, UpdatePermissionsRequest,
+    UpdatePublicLinkRequest, VolumeCreationRequest, VolumeEventDto, VolumeEventListResponse,
+    VolumeListResponse, VolumeTrashResponse,
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
@@ -3755,15 +3757,7 @@ impl ProtonDriveClient {
         expiration_time: Option<i64>,
     ) -> Result<PublicLink> {
         let mut timer = self.telemetry.start("create_public_link");
-
-        let permissions = match role {
-            MemberRole::Viewer | MemberRole::Editor => role.to_permissions().unwrap(),
-            _ => {
-                return Err(ProtonError::invalid_operation(
-                    "a public link can only grant the Viewer or Editor role",
-                ));
-            }
-        };
+        let permissions = public_link_permissions(role)?;
 
         let (share_id, share_session_key, creator_email, address_key) =
             self.ensure_node_share(uid).await?;
@@ -3771,65 +3765,21 @@ impl ProtonDriveClient {
         // The URL fragment is the generated password; the encryption password is
         // the generated password with any custom password appended.
         let generated = generate_public_link_password();
-        let full_password = match custom_password {
-            Some(custom) if !custom.is_empty() => format!("{generated}{custom}"),
-            _ => generated.clone(),
-        };
-
-        // The modulus is fetched first so that everything CPU-bound below can go
-        // to the blocking pool in one hop.
-        let modulus = self.fetch_srp_modulus().await?;
-
-        // Wrap the share session key with the SRP-salted passphrase, store the
-        // password encrypted to the owner's address key, and build the SRP
-        // verifier over the link password.
-        //
-        // All of that is pure CPU and none of it is cheap: `derive_key_passphrase`
-        // is a deliberately slow bcrypt, and `generate_verifier` a 2048-bit modular
-        // exponentiation. Inline, they stalled every other task on the reactor
-        // thread for the duration — so, like the rest of the crate's PGP work, they
-        // run on the blocking pool.
-        let key_salt = generate_key_salt();
-        let signed_modulus = modulus.modulus.clone();
-        let password_bytes = full_password.clone();
-        let salt_for_task = key_salt;
-        let (share_passphrase_key_packet, armored_password, verifier) =
-            tokio::task::spawn_blocking(move || {
-                let salted_passphrase =
-                    derive_key_passphrase(password_bytes.as_bytes(), &salt_for_task)?;
-                let key_packet =
-                    base64_encode(share_session_key.encrypt_with_password(&salted_passphrase)?);
-                let armored_password = address_key.encrypt(password_bytes.as_bytes())?;
-                let verifier = generate_verifier(
-                    password_bytes.as_bytes(),
-                    &signed_modulus,
-                    DEFAULT_BIT_LENGTH,
-                )?;
-                Ok::<_, ProtonError>((key_packet, armored_password, verifier))
-            })
-            .await
-            .map_err(|e| {
-                ProtonError::invalid_operation(format!("public link crypto task failed: {e}"))
-            })??;
-
-        let flags = if custom_password.map(|p| !p.is_empty()).unwrap_or(false) {
-            3 // random + custom password
-        } else {
-            2 // random password only
-        };
+        let settings = self
+            .seal_public_link_settings(
+                permissions,
+                &generated,
+                custom_password,
+                share_session_key,
+                address_key,
+            )
+            .await?;
+        let has_custom_password = settings.flags == 3;
 
         let request = CreatePublicLinkRequest {
             creator_email,
-            permissions,
-            flags,
             expiration_time,
-            share_password_salt: base64_encode(key_salt),
-            share_passphrase_key_packet,
-            password: armored_password,
-            url_password_salt: verifier.salt,
-            srp_verifier: verifier.verifier,
-            srp_modulus_id: modulus.modulus_id,
-            max_accesses: 0,
+            settings,
         };
 
         let path = format!("shares/{share_id}/urls");
@@ -3843,7 +3793,134 @@ impl ProtonDriveClient {
             role,
             creation_time: now_epoch_seconds(),
             expiration_time,
-            has_custom_password: flags == 3,
+            has_custom_password,
+        })
+    }
+
+    /// Change the options of the public link on a node: its role, its custom
+    /// password and its expiry (`PUT shares/{sid}/urls/{urlID}`). Each call sets
+    /// all three: `None` removes a custom password or an expiry the link had.
+    ///
+    /// Ported from the TypeScript SDK (`SharingManagement.updateSharedLink`). The
+    /// URL does not change: the generated password in its fragment is kept, and
+    /// the share key and SRP verifier are sealed again under it plus the new
+    /// custom password. A legacy link, whose fragment is not a generated
+    /// 12-character password, cannot be updated; remove it and create a new one.
+    pub async fn update_public_link(
+        &self,
+        uid: &NodeUid,
+        role: MemberRole,
+        custom_password: Option<&str>,
+        expiration_time: Option<i64>,
+    ) -> Result<PublicLink> {
+        let mut timer = self.telemetry.start("update_public_link");
+        let permissions = public_link_permissions(role)?;
+
+        let link = self
+            .get_public_link(uid)
+            .await?
+            .ok_or_else(|| ProtonError::invalid_operation("the node has no public link"))?;
+        let generated = link
+            .url
+            .as_deref()
+            .and_then(|url| url.split_once('#'))
+            .map(|(_, fragment)| fragment.to_owned())
+            .filter(|fragment| fragment.chars().count() == PUBLIC_LINK_PASSWORD_LEN)
+            .ok_or_else(|| {
+                ProtonError::invalid_operation(
+                    "a legacy public link cannot be updated; remove it and create a new one",
+                )
+            })?;
+
+        let (_, share_session_key, _, address_key) = self.ensure_node_share(uid).await?;
+        let settings = self
+            .seal_public_link_settings(
+                permissions,
+                &generated,
+                custom_password,
+                share_session_key,
+                address_key,
+            )
+            .await?;
+        let has_custom_password = settings.flags == 3;
+
+        let request = UpdatePublicLinkRequest {
+            expiration_time,
+            settings,
+        };
+        let path = format!("shares/{}/urls/{}", link.share_id, link.public_link_id);
+        let _: proton_sdk::api::ApiResponse = self.http.put(&path, &request).await?;
+
+        timer.success();
+        Ok(PublicLink {
+            role,
+            expiration_time,
+            has_custom_password,
+            ..link
+        })
+    }
+
+    /// Seal a public link's share key and SRP verifier under its password: the
+    /// generated password, with `custom_password` appended when there is one.
+    ///
+    /// The share session key is wrapped with the bcrypt-salted passphrase
+    /// (`SharePassphraseKeyPacket`), the password is stored encrypted to the
+    /// owner's address key, and the SRP verifier lets the server authenticate
+    /// visitors without learning the password.
+    async fn seal_public_link_settings(
+        &self,
+        permissions: i32,
+        generated: &str,
+        custom_password: Option<&str>,
+        share_session_key: ContentKey,
+        address_key: PrivateKey,
+    ) -> Result<PublicLinkSettingsDto> {
+        let custom_password = custom_password.filter(|p| !p.is_empty());
+        let full_password = format!("{generated}{}", custom_password.unwrap_or(""));
+
+        // The modulus is fetched first so that everything CPU-bound below can go
+        // to the blocking pool in one hop.
+        let modulus = self.fetch_srp_modulus().await?;
+
+        // All of that is pure CPU and none of it is cheap: `derive_key_passphrase`
+        // is a deliberately slow bcrypt, and `generate_verifier` a 2048-bit modular
+        // exponentiation. Inline, they stalled every other task on the reactor
+        // thread for the duration — so, like the rest of the crate's PGP work, they
+        // run on the blocking pool.
+        let key_salt = generate_key_salt();
+        let signed_modulus = modulus.modulus;
+        let (share_passphrase_key_packet, armored_password, verifier) =
+            tokio::task::spawn_blocking(move || {
+                let salted_passphrase = derive_key_passphrase(full_password.as_bytes(), &key_salt)?;
+                let key_packet =
+                    base64_encode(share_session_key.encrypt_with_password(&salted_passphrase)?);
+                let armored_password = address_key.encrypt(full_password.as_bytes())?;
+                let verifier = generate_verifier(
+                    full_password.as_bytes(),
+                    &signed_modulus,
+                    DEFAULT_BIT_LENGTH,
+                )?;
+                Ok::<_, ProtonError>((key_packet, armored_password, verifier))
+            })
+            .await
+            .map_err(|e| {
+                ProtonError::invalid_operation(format!("public link crypto task failed: {e}"))
+            })??;
+
+        Ok(PublicLinkSettingsDto {
+            permissions,
+            flags: if custom_password.is_some() {
+                3 // random + custom password
+            } else {
+                2 // random password only
+            },
+            share_password_salt: base64_encode(key_salt),
+            share_passphrase_key_packet,
+            password: armored_password,
+            url_password_salt: verifier.salt,
+            srp_verifier: verifier.verifier,
+            srp_modulus_id: modulus.modulus_id,
+            max_accesses: 0,
         })
     }
 
@@ -4120,8 +4197,9 @@ impl ProtonDriveClient {
     // ---- bookmarks ---------------------------------------------------------
 
     /// List the public links the user has saved to their account
-    /// (`GET v2/shared-bookmarks`). The URL is always recovered; the item name is
-    /// only present when the SRP-derived share key could be decrypted (not yet).
+    /// (`GET v2/shared-bookmarks`). A bookmark whose stored password cannot be
+    /// decrypted is skipped; the item name is `None` when the share key it is
+    /// encrypted to cannot be unlocked or the name is not valid.
     pub async fn list_bookmarks(&self) -> Result<Vec<Bookmark>> {
         let mut timer = self.telemetry.start("list_bookmarks");
         let response: BookmarksResponse = self.http.get("v2/shared-bookmarks").await?;
@@ -4138,20 +4216,24 @@ impl ProtonDriveClient {
             let Ok(bytes) = decrypt_armored_with_keys(enc, &address_keys) else {
                 continue;
             };
-            // The stored secret is the URL password with any custom password
-            // appended; the URL only needs the leading generated portion, but the
-            // API does not tell us the split, so the fragment is the whole string.
-            let url_password = String::from_utf8_lossy(&bytes).into_owned();
+            // The stored secret is the generated URL password with any custom
+            // password appended (TS `splitGeneratedAndCustomPassword`). The URL
+            // fragment is the generated part; the share key is locked with the
+            // whole string.
+            let password = String::from_utf8_lossy(&bytes).into_owned();
+            let (url_password, custom_password) = split_bookmark_password(&password);
+            let url = format!(
+                "https://drive.proton.me/urls/{}#{url_password}",
+                dto.token.token
+            );
+            let custom_password = custom_password.map(str::to_owned);
+            let node_name = decrypt_bookmark_name(password, &dto.token).await;
 
             bookmarks.push(Bookmark {
-                url: format!(
-                    "https://drive.proton.me/urls/{}#{url_password}",
-                    dto.token.token
-                ),
+                url,
                 token: dto.token.token,
-                // Name decryption needs the SRP-derived share key, not yet ported;
-                // the URL is enough to open the link.
-                node_name: None,
+                custom_password,
+                node_name,
                 is_folder: dto.token.link_type == 1,
                 creation_time: dto.create_time,
             });
@@ -7987,6 +8069,53 @@ const PUBLIC_LINK_PASSWORD_CHARSET: &[u8] =
 /// Generated public-link password length (JS `PUBLIC_LINK_GENERATED_PASSWORD_LENGTH`).
 const PUBLIC_LINK_PASSWORD_LEN: usize = 12;
 
+/// The permission mask a public link may grant: Viewer or Editor, never Admin.
+fn public_link_permissions(role: MemberRole) -> Result<i32> {
+    role.to_permissions()
+        .filter(|_| matches!(role, MemberRole::Viewer | MemberRole::Editor))
+        .ok_or_else(|| {
+            ProtonError::invalid_operation("a public link can only grant the Viewer or Editor role")
+        })
+}
+
+/// Split a bookmark's stored secret into the generated URL password and the
+/// custom password appended to it, if any (TS `splitGeneratedAndCustomPassword`).
+fn split_bookmark_password(password: &str) -> (&str, Option<&str>) {
+    let split = password
+        .char_indices()
+        .nth(PUBLIC_LINK_PASSWORD_LEN)
+        .map_or(password.len(), |(i, _)| i);
+    let (generated, custom) = password.split_at(split);
+    (generated, (!custom.is_empty()).then_some(custom))
+}
+
+/// Decrypt a bookmarked item's name (TS `SharingCryptoService.decryptBookmark`).
+///
+/// The share key is locked the way a visitor unlocks it: the whole stored
+/// password, bcrypt-derived with `SharePasswordSalt`, opens `SharePassphrase`.
+/// The name is encrypted to the share key. Signatures are not checked, as in
+/// TS. Any failure, or a name that would not pass validation, yields `None`:
+/// the URL still opens the link.
+///
+/// Runs on the blocking pool: the bcrypt derivation and the share key's S2K
+/// are each tens of milliseconds of CPU, once per bookmark.
+async fn decrypt_bookmark_name(password: String, token: &BookmarkTokenDto) -> Option<String> {
+    let salt = BASE64.decode(&token.share_password_salt).ok()?;
+    let armored_passphrase = token.share_passphrase.clone();
+    let armored_share_key = token.share_key.clone();
+    let armored_name = token.name.clone();
+    tokio::task::spawn_blocking(move || {
+        let key_password = derive_key_passphrase(password.as_bytes(), &salt).ok()?;
+        let passphrase = decrypt_armored_with_password(&armored_passphrase, &key_password).ok()?;
+        let share_key = PrivateKey::from_armored(&armored_share_key, &passphrase).ok()?;
+        let name_bytes = share_key.decrypt_armored_message(&armored_name).ok()?;
+        let name = String::from_utf8(name_bytes).ok()?;
+        validate_node_name(&name).ok().map(|()| name)
+    })
+    .await
+    .ok()?
+}
+
 /// Generate a random 12-character alphanumeric public-link password.
 fn generate_public_link_password() -> String {
     let mut raw = [0u8; PUBLIC_LINK_PASSWORD_LEN];
@@ -8855,8 +8984,8 @@ mod tests {
         is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
         path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
         run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
-        small_upload_should_fall_back, take_block_target, take_thumbnail_target, to_drive_event,
-        validate_node_name,
+        small_upload_should_fall_back, split_bookmark_password, take_block_target,
+        take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
         AggregateLinksResponse, BlockUploadTarget, LinkDetailsDto, LinkDto, LinkIdResponsePair,
@@ -8872,6 +9001,26 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Mutex, Notify, RwLock};
+
+    #[test]
+    fn a_bookmark_password_splits_into_the_generated_part_and_the_custom_one() {
+        assert_eq!(
+            split_bookmark_password("AbCdEf123456"),
+            ("AbCdEf123456", None)
+        );
+        assert_eq!(
+            split_bookmark_password("AbCdEf123456s3cr3t!"),
+            ("AbCdEf123456", Some("s3cr3t!"))
+        );
+        // A custom password may hold any character; the split counts chars,
+        // not bytes, and never cuts one in half.
+        assert_eq!(
+            split_bookmark_password("AbCdEf123456pässwört"),
+            ("AbCdEf123456", Some("pässwört"))
+        );
+        // A legacy password shorter than a generated one is all URL password.
+        assert_eq!(split_bookmark_password("short"), ("short", None));
+    }
 
     /// A batch envelope with one successful link and one that failed with `code`.
     fn mixed_aggregate(code: ResponseCode) -> AggregateLinksResponse {

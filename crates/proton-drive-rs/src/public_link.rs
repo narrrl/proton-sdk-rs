@@ -66,6 +66,12 @@ use crate::sharing::MemberRole;
 use crate::single_flight::SingleFlight;
 use crate::transport::{BlockSession, RevisionTransport, rank_block_sizes};
 
+/// How many folders of one level [`ProtonDrivePublicLinkClient::enumerate_subtree`]
+/// lists at once. Each listing fans out again into up to
+/// [`MAX_CONCURRENT_DETAIL_FETCHES`] detail batches, so this multiplies the
+/// requests in flight; six keeps them in the low tens.
+const MAX_CONCURRENT_FOLDER_LISTINGS: usize = 6;
+
 /// Link metadata readable before authenticating, from `GET urls/{token}/info`.
 ///
 /// Fetch it with [`ProtonDrivePublicLinkClient::info`] to learn whether the user
@@ -520,6 +526,67 @@ impl ProtonDrivePublicLinkClient {
         }
 
         Ok(uids)
+    }
+
+    /// Every node below a shared folder, breadth first: the folder's children,
+    /// then their children, and so on. The folder itself is not included.
+    ///
+    /// The authenticated client walks a tree with `get_node_hierarchy`; a
+    /// visitor has no such endpoint, so this lists one folder per request. A
+    /// whole level is listed at once, six folders at a time, because a shared
+    /// library is wide: hundreds of sibling folders, each one listing plus a
+    /// detail fetch, which one at a time is minutes of round trips. Nodes come back in a stable order: by level, then in the
+    /// order their folders were listed.
+    ///
+    /// A failed listing fails the walk. A caller that walks large shares over a
+    /// flaky network may want to wrap [`enumerate_folder_children_node_uids`]
+    /// with its own retry instead.
+    ///
+    /// [`enumerate_folder_children_node_uids`]: Self::enumerate_folder_children_node_uids
+    pub async fn enumerate_subtree(&self, folder_uid: &NodeUid) -> Result<Vec<Node>> {
+        self.enumerate_subtree_reporting(folder_uid, |_| {}).await
+    }
+
+    /// As [`enumerate_subtree`](Self::enumerate_subtree), calling `progress`
+    /// with the number of nodes found so far each time a folder's listing
+    /// comes back. A walk of a large share takes minutes; a rising count shows
+    /// it is not stuck.
+    pub async fn enumerate_subtree_reporting(
+        &self,
+        folder_uid: &NodeUid,
+        progress: impl Fn(usize),
+    ) -> Result<Vec<Node>> {
+        let mut level = vec![folder_uid.clone()];
+        let mut found = Vec::new();
+
+        while !level.is_empty() {
+            let listings = level.into_iter().map(|folder| {
+                let client = self.clone();
+                async move { client.list_folder(&folder).await }
+            });
+            let mut listings = stream::iter(listings).buffered(MAX_CONCURRENT_FOLDER_LISTINGS);
+
+            let mut next = Vec::new();
+            while let Some(children) = listings.try_next().await? {
+                next.extend(
+                    children
+                        .iter()
+                        .filter(|child| child.is_folder())
+                        .map(|child| child.uid.clone()),
+                );
+                found.extend(children);
+                progress(found.len());
+            }
+            level = next;
+        }
+
+        Ok(found)
+    }
+
+    /// One folder's children, decrypted.
+    async fn list_folder(&self, folder_uid: &NodeUid) -> Result<Vec<Node>> {
+        let child_uids = self.enumerate_folder_children_node_uids(folder_uid).await?;
+        self.enumerate_nodes(&child_uids).await
     }
 
     /// Fetch decrypted metadata for many nodes in the shared subtree.

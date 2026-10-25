@@ -787,3 +787,228 @@ async fn a_visitor_can_download_thumbnails_of_shared_files() {
 
     cleanup(client, &folder).await;
 }
+
+// ---------------------------------------------------------------------------
+// Public link — changing options, walking the subtree, bookmarks
+// ---------------------------------------------------------------------------
+
+/// Updating a link keeps its URL and applies the new role, custom password and
+/// expiry; a visitor then needs the new password, and a second update clears
+/// both the password and the expiry again.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn update_public_link_changes_role_password_and_expiry() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-update").await;
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    let custom = "n3w-s3cr3t";
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 7 * 24 * 3600;
+    let updated = client
+        .update_public_link(&folder, MemberRole::Editor, Some(custom), Some(expiry))
+        .await
+        .expect("update_public_link");
+    assert_eq!(updated.public_link_id, link.public_link_id);
+    assert_eq!(
+        updated.url.as_deref(),
+        Some(url.as_str()),
+        "the URL is kept"
+    );
+    assert_eq!(updated.role, MemberRole::Editor);
+    assert!(updated.has_custom_password);
+    assert_eq!(updated.expiration_time, Some(expiry));
+
+    let fetched = client
+        .get_public_link(&folder)
+        .await
+        .expect("get_public_link")
+        .expect("link must still exist");
+    assert_eq!(fetched.role, MemberRole::Editor, "the role must be stored");
+    assert!(
+        fetched.has_custom_password,
+        "the password flag must be stored"
+    );
+    assert_eq!(
+        fetched.expiration_time,
+        Some(expiry),
+        "the expiry must be stored"
+    );
+    assert_eq!(fetched.url.as_deref(), Some(url.as_str()));
+
+    assert!(
+        ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+            .await
+            .is_err(),
+        "the link must now need the custom password"
+    );
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, Some(custom))
+        .await
+        .expect("open with the new custom password");
+    assert_eq!(visitor.public_role(), MemberRole::Editor);
+
+    let cleared = client
+        .update_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("update_public_link (clear)");
+    assert!(!cleared.has_custom_password);
+    let fetched = client
+        .get_public_link(&folder)
+        .await
+        .expect("get_public_link")
+        .expect("link must still exist");
+    assert!(
+        !fetched.has_custom_password,
+        "the custom password is removed"
+    );
+    assert_eq!(fetched.expiration_time, None, "the expiry is cleared");
+    ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("the link opens with the URL alone again");
+
+    assert!(
+        client
+            .update_public_link(&folder, MemberRole::Admin, None, None)
+            .await
+            .is_err(),
+        "a public link cannot grant Admin"
+    );
+
+    client
+        .remove_public_link(&link)
+        .await
+        .expect("remove_public_link");
+    cleanup(client, &folder).await;
+}
+
+/// A visitor walks the whole shared tree, nested folders included, without
+/// the start folder itself.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_visitor_enumerates_the_whole_shared_subtree() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-walk").await;
+    let a = client
+        .create_folder(&folder, "a", None)
+        .await
+        .expect("create a");
+    let b = client.create_folder(&a, "b", None).await.expect("create b");
+    let top = client
+        .upload_file(&folder, "top.txt", "text/plain", b"top")
+        .await
+        .expect("upload top");
+    let deep = client
+        .upload_file(&b, "deep.txt", "text/plain", b"deep")
+        .await
+        .expect("upload deep");
+
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, None, None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+    let visitor = ProtonDrivePublicLinkClient::open(common::config(), &url, None)
+        .await
+        .expect("open public link");
+
+    let progress = std::sync::atomic::AtomicUsize::new(0);
+    let nodes = visitor
+        .enumerate_subtree_reporting(&folder, |n| {
+            progress.store(n, std::sync::atomic::Ordering::Relaxed)
+        })
+        .await
+        .expect("enumerate_subtree");
+
+    let mut uids: Vec<_> = nodes.iter().map(|n| n.uid.clone()).collect();
+    uids.sort_by_key(|uid| uid.link_id.to_string());
+    let mut want = vec![a.clone(), b.clone(), top.clone(), deep.clone()];
+    want.sort_by_key(|uid| uid.link_id.to_string());
+    assert_eq!(uids, want, "every descendant, and not the start folder");
+    assert_eq!(progress.into_inner(), 4, "the last report is the total");
+
+    // Breadth first: the first level comes before anything below it.
+    let position = |uid: &NodeUid| nodes.iter().position(|n| &n.uid == uid).unwrap();
+    assert!(position(&a) < position(&b));
+    assert!(position(&top) < position(&b));
+    assert!(position(&b) < position(&deep));
+
+    client
+        .remove_public_link(&link)
+        .await
+        .expect("remove_public_link");
+    cleanup(client, &folder).await;
+}
+
+/// A bookmark lists with its item's name, the URL fragment without the custom
+/// password, and the custom password on its own, and is gone once deleted.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn bookmarks_list_with_their_name_and_custom_password() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+
+    let folder = scratch_folder(client, "public-bookmark").await;
+    let folder_name = client
+        .get_node(&folder)
+        .await
+        .expect("get_node")
+        .expect("folder exists")
+        .name;
+    let custom = "b00kmark";
+    let link = client
+        .create_public_link(&folder, MemberRole::Viewer, Some(custom), None)
+        .await
+        .expect("create_public_link");
+    let url = link.url.clone().expect("a created link must carry its URL");
+
+    client
+        .create_bookmark(&url, Some(custom))
+        .await
+        .expect("create_bookmark");
+
+    let bookmarks = client.list_bookmarks().await.expect("list_bookmarks");
+    let bookmark = bookmarks
+        .iter()
+        .find(|b| url.contains(&b.token))
+        .expect("the new bookmark must be listed");
+    assert_eq!(
+        bookmark.url, url,
+        "the URL carries the generated password only"
+    );
+    assert_eq!(bookmark.custom_password.as_deref(), Some(custom));
+    assert_eq!(bookmark.node_name.as_deref(), Some(folder_name.as_str()));
+    assert!(bookmark.is_folder);
+
+    client
+        .delete_bookmark(&bookmark.token)
+        .await
+        .expect("delete_bookmark");
+    let bookmarks = client.list_bookmarks().await.expect("list_bookmarks");
+    assert!(
+        bookmarks.iter().all(|b| !url.contains(&b.token)),
+        "a deleted bookmark must not be listed"
+    );
+
+    client
+        .remove_public_link(&link)
+        .await
+        .expect("remove_public_link");
+    cleanup(client, &folder).await;
+}

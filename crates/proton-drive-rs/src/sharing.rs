@@ -257,6 +257,11 @@ pub struct Bookmark {
     pub token: String,
     /// The full public URL, including the `#password` fragment.
     pub url: String,
+    /// The link's custom password, when it has one. The URL alone does not
+    /// open such a link; pass this to
+    /// [`ProtonDrivePublicLinkClient::open`](crate::ProtonDrivePublicLinkClient::open)
+    /// as well.
+    pub custom_password: Option<String>,
     /// The bookmarked item's decrypted name, when it could be decrypted.
     pub node_name: Option<String>,
     /// Whether the bookmarked item is a folder.

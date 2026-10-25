@@ -2389,12 +2389,30 @@ pub struct ModulusResponse {
 pub struct CreatePublicLinkRequest {
     #[serde(rename = "CreatorEmail")]
     pub creator_email: String,
+    #[serde(rename = "ExpirationTime", skip_serializing_if = "Option::is_none")]
+    pub expiration_time: Option<i64>,
+    #[serde(flatten)]
+    pub settings: PublicLinkSettingsDto,
+}
+
+/// `PUT shares/{shareID}/urls/{urlID}`. Unlike create, an absent expiry is
+/// sent as `null`, which clears an expiry the link had (TS `updatePublicLink`).
+#[derive(Debug, Serialize)]
+pub struct UpdatePublicLinkRequest {
+    #[serde(rename = "ExpirationTime")]
+    pub expiration_time: Option<i64>,
+    #[serde(flatten)]
+    pub settings: PublicLinkSettingsDto,
+}
+
+/// The fields create and update share: the role, the password flags, and the
+/// share key + SRP verifier sealed under the link password.
+#[derive(Debug, Serialize)]
+pub struct PublicLinkSettingsDto {
     #[serde(rename = "Permissions")]
     pub permissions: i32,
     #[serde(rename = "Flags")]
     pub flags: i32,
-    #[serde(rename = "ExpirationTime", skip_serializing_if = "Option::is_none")]
-    pub expiration_time: Option<i64>,
     #[serde(rename = "SharePasswordSalt")]
     pub share_password_salt: String,
     #[serde(rename = "SharePassphraseKeyPacket")]

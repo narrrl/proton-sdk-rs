@@ -265,6 +265,7 @@ neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
 | | Key-salt Injection | ⭐ | `with_key_salts` lets a client hand in cached salts and chain an entity repository onto it, so a warm start skips the salt round-trip. |
 | | Quota | ✅ | `quota()` — used/total space with `available()` / `used_fraction()` helpers. |
 | **HTTP Client** | Retries & Jitter | ✅ | Exponential backoff for 408, 429, and 5xx, respecting `Retry-After`. |
+| | Read Replay | ⭐ | A read (GET, block download, `post_query`) whose connection drops mid-request or mid-body is sent again; a write is not, because it may have been applied. |
 | | Telemetry | ✅ | Pluggable request tracking (`ITelemetry` analogue). |
 | **Drive / Volume** | Volume Resolution | ✅ | Auto-resolves volume lists; auto-creates the `my-files` root volume on first login. |
 | | Node Listing | ✅ | `get_node`, `enumerate_folder_children`, `enumerate_trash` with key resolution. |
@@ -272,6 +273,8 @@ neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
 | | Path Helpers | ⭐ | `get_node_by_path`, `get_node_path`, `get_node_hierarchy`, `create_folder_path`, `get_available_name` — a filesystem front-end wants paths, not UID walks. |
 | | File Operations | ✅ | Rename, trash, restore, delete, empty trash — batch calls report one outcome per node (`trash_nodes`), or stream them as each batch lands (`trash_nodes_streaming`). |
 | | Move Operations | ✅ | Same-volume move. Batch moves are chunked automatically, one outcome per node. |
+| | Server-side Copy | 🟦 | `copy_node` copies a file or a whole folder on the server, optionally under a new name and onto another volume; no bytes pass through the client. |
+| | Folder Size | 🟦 | `get_folder_size` asks the server for a folder's total size (encrypted bytes) and descendant count, trashed nodes included. |
 | | Cross-volume Move | ❌ | Not supported here, and not by `proton-drive-linux` either — the C# public API throws `NotImplementedException`, and a cross-volume move means re-uploading content under the destination volume's keys. |
 | **Events / Sync** | Event Enumeration | ✅ | `enumerate_events` + `latest_event_id` per volume scope; `invalidate_caches_for_event` keeps the entity cache coherent. |
 | | Event Manager | 🟦 | Background poll loop (`EventManager`) with a broadcast channel and a foreground/background interval switch, modelled on the TS `eventScheduler`. |
@@ -294,12 +297,12 @@ neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
 | | Device Operations | ✅ | Rename and delete registered devices. |
 | **Sharing & Links** | Share Creation | 🟦 | `share_node` bootstraps a share on a node (no C# public API for it). |
 | | Member Management | ✅ | Invite users (`invite_users`), list members, update roles, and remove members. |
-| | Public Share Links | 🟦 | Create public shareable links (`create_public_link`) with password protection and expiry; `get_public_link`, `remove_public_link`. |
+| | Public Share Links | 🟦 | Create public shareable links (`create_public_link`) with password protection and expiry; `get_public_link`, `update_public_link` (role, custom password, expiry; the URL is kept), `remove_public_link`. |
 | | External Invites | ✅ | Invite non-Proton users (`invite_external_users`) and track registration status. |
-| | Bookmarks | ✅ | Save, list, and delete public link bookmarks (`create_bookmark`, `list_bookmarks`, `delete_bookmark`). |
+| | Bookmarks | ✅ | Save, list, and delete public link bookmarks (`create_bookmark`, `list_bookmarks`, `delete_bookmark`). A listed bookmark carries its URL, its custom password and the bookmarked item's name. |
 | | Incoming Invites | ✅ | List, accept, or reject invitations shared *with* the current user; `leave_shared_node`. |
 | | Shared Listings | ✅ | `enumerate_shared_by_me_node_uids`, `enumerate_shared_with_me` (drive and photos volumes). |
-| | Public Link (consume) | 🟦 | Open someone else's link with no Proton account (`ProtonDrivePublicLinkClient`): SRP handshake, custom passwords, browse and download the shared subtree. |
+| | Public Link (consume) | 🟦 | Open someone else's link with no Proton account (`ProtonDrivePublicLinkClient`): SRP handshake, custom passwords, browse and download the shared subtree, or walk all of it at once (`enumerate_subtree`). |
 | | Public Link streaming | ⭐ | Seekable range reads over a shared file (`open_revision` → `RevisionReader::read_at`), plus thumbnails, batch enumeration and in-place session renewal — a visitor streams a large file without downloading it. No TS or C# counterpart. |
 | **Photos** | Photos Timeline | ✅ | `ProtonPhotosClient` maps photostream, timeline enumeration, and photo downloads. |
 | | Photo Uploads | ✅ | Uploading photos with `PhotoUploadMetadata` (capture time, tags, grouping). |
@@ -309,7 +312,7 @@ neither upstream SDK, original to `proton-sdk-rs` · ❌ not implemented.
 | | Duplicate Detection | ✅ | `find_duplicates` matches candidates on name/content HMAC before re-uploading. |
 | | Favorite Shared Photos | ❌ | Needs the photo re-encrypted for our timeline root; not ported (upstream `03b1cb7f`). |
 | | Save to Timeline | ✅ | `save_photos_to_timeline` moves photos already on our photos volume into the timeline root and copies cross-volume ones (from albums shared with us). |
-| | Album Writes | ⚠️ | `create_album` and `add_photos_to_album` are ported from the TypeScript SDK (C# has no public album write API); album rename, cover photo and delete are not. |
+| | Album Writes | ✅ | `create_album`, `rename_album`, `set_album_cover`, `add_photos_to_album` (photos from another volume are copied in), `remove_photos_from_album`, `delete_album`, and `delete_album_saving_photos`, which first saves photos that are only in the album to the timeline. |
 | | Photos Volume Create| ❌ | Volume creation is not yet ported. |
 | **Caching** | Pluggable Cache | ✅ | Pluggable entity cache (`with_entity_cache`, or `with_entity_repository` to chain one onto a `with_key_salts` client); keys/secrets remain strictly in memory. Retained deliberately — upstream C# removed its entity cache. |
 | **Validation** | Node Names | ✅ | Empty or >255-char names are rejected client-side before create/rename (counted in `char`s; C# counts UTF-16 units). |
