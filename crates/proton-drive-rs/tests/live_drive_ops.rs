@@ -511,3 +511,62 @@ async fn folder_path_helpers_round_trip() {
         .uid;
     cleanup(client, &[top_uid]).await;
 }
+
+/// `get_folder_size` counts every descendant, nested folders included, and
+/// sums their encrypted sizes.
+///
+/// The TS docs leave both points open; the first live run answered them with
+/// `size: 301112, descendants: 3` — two single-block files, 56 bytes of
+/// encryption overhead each.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn folder_size_counts_nested_descendants() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let top_name = format!("size-ops-{}", common::unique_suffix());
+    let top = client
+        .create_folder(&root.uid, &top_name, None)
+        .await
+        .expect("create top folder");
+    let nested = client
+        .create_folder(&top, "nested", None)
+        .await
+        .expect("create nested folder");
+    let small = vec![b'a'; 1000];
+    let large = vec![b'b'; 300_000];
+    client
+        .upload_file(&top, "small.bin", "application/octet-stream", &small)
+        .await
+        .expect("upload small file");
+    client
+        .upload_file(&nested, "large.bin", "application/octet-stream", &large)
+        .await
+        .expect("upload nested file");
+
+    let size = client.get_folder_size(&top).await.expect("get_folder_size");
+    eprintln!("[folder size] {size:?} for 1 folder + 2 files of 301000 plaintext bytes");
+    assert_eq!(
+        size.descendants, 3,
+        "two files and the nested folder: {size:?}"
+    );
+    let plaintext = (small.len() + large.len()) as u64;
+    assert!(
+        (plaintext..plaintext + 1024).contains(&size.size),
+        "encrypted size, a little above the plaintext: {size:?}"
+    );
+
+    let empty = client
+        .get_folder_size(&nested)
+        .await
+        .expect("get_folder_size(nested)");
+    assert_eq!(empty.descendants, 1, "nested holds one file: {empty:?}");
+
+    cleanup(client, &[top]).await;
+}

@@ -59,7 +59,7 @@ use crate::dtos::{
     ExternalInvitationResponseDto, ExternalInvitationsResponse, FileContentDigests,
     FileCreationRequest, FileCreationResponse, FindPhotoDuplicatesRequest,
     FindPhotoDuplicatesResponse, FolderChildrenResponse, FolderCreationRequest,
-    FolderCreationResponse, InvitationDetailsResponse, InvitationsListResponse,
+    FolderCreationResponse, FolderSizeResponse, InvitationDetailsResponse, InvitationsListResponse,
     InviteEmailDetailsDto, InviteExternalUserRequest, InviteExternalUserResponse,
     InviteProtonUserInvitationDto, InviteProtonUserRequest, InviteProtonUserResponse,
     LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse, LinkDto,
@@ -80,7 +80,7 @@ use crate::dtos::{
 };
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
-    AlbumProperties, AvailableNameTarget, FileThumbnail, Node, NodeKind, NodeMoveItem,
+    AlbumProperties, AvailableNameTarget, FileThumbnail, FolderSize, Node, NodeKind, NodeMoveItem,
     PhotoLocation, PhotoProperties, RecentlyAccessedReportItem, RevisionState, Thumbnail,
     ThumbnailType,
 };
@@ -1135,6 +1135,28 @@ impl ProtonDriveClient {
             ))),
             None => Ok(None),
         }
+    }
+
+    /// The total size and number of a folder's descendants, computed by the
+    /// server, so the caller does not walk the tree.
+    ///
+    /// Mirrors TS `ProtonDriveClient.getFolderSize`
+    /// (`GET volumes/{vid}/folders/{lid}/calculate-descendents-size`). Trashed
+    /// descendants count too, so this is the space the folder holds rather
+    /// than what a listing shows. Folders count as descendants, and the size is
+    /// encrypted bytes on storage, a little above the plaintext.
+    pub async fn get_folder_size(&self, uid: &NodeUid) -> Result<FolderSize> {
+        let mut timer = self.telemetry.start("get_folder_size");
+        let path = format!(
+            "volumes/{}/folders/{}/calculate-descendents-size",
+            uid.volume_id, uid.link_id
+        );
+        let response: FolderSizeResponse = self.http.get(&path).await?;
+        timer.success();
+        Ok(FolderSize {
+            size: response.descendents_size,
+            descendants: response.descendents_count,
+        })
     }
 
     /// Enumerate the [`NodeUid`]s of the main volume's trashed nodes.

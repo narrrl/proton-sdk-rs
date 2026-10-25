@@ -1759,9 +1759,30 @@ pub struct DeviceUpdateShareDto {
     pub name: String,
 }
 
+/// `GET volumes/{vid}/folders/{lid}/calculate-descendents-size` response (TS
+/// `FolderSizeResponseDto`). The server spells it "descendents".
+#[derive(Debug, Deserialize)]
+pub struct FolderSizeResponse {
+    #[serde(rename = "DescendentsSize")]
+    pub descendents_size: u64,
+    #[serde(rename = "DescendentsCount")]
+    pub descendents_count: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_size_response_reads_the_wire_names() {
+        let raw = r#"{
+            "Code": 1000, "VolumeID": "vol", "LinkID": "folder",
+            "DescendentsSize": 5368709120, "DescendentsCount": 42
+        }"#;
+        let response: FolderSizeResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(response.descendents_size, 5_368_709_120);
+        assert_eq!(response.descendents_count, 42);
+    }
 
     #[test]
     fn recently_accessed_request_uses_the_wire_names() {

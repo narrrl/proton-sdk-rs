@@ -42,6 +42,20 @@ pub struct RecentlyAccessedReportItem {
     pub access_time: Option<i64>,
 }
 
+/// What [`get_folder_size`](crate::ProtonDriveClient::get_folder_size) reports
+/// about a folder.
+///
+/// Mirrors TS `FolderSizeInfo`. Both numbers count every descendant the user
+/// can see, in the trash as well as active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderSize {
+    /// Sum of the descendants' sizes in encrypted bytes on storage, which is a
+    /// little more than the plaintext.
+    pub size: u64,
+    /// Number of descendants, files and folders.
+    pub descendants: u64,
+}
+
 /// A decrypted Drive node (folder or file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
