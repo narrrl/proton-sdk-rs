@@ -1828,7 +1828,7 @@ impl ProtonDriveClient {
 
         let response: ThumbnailBlockListResponse = self
             .http
-            .post(
+            .post_query(
                 &format!("volumes/{}/thumbnails", uid.volume_id),
                 &ThumbnailBlockListRequest {
                     thumbnail_ids: vec![thumbnail_id.clone()],
@@ -1925,7 +1925,7 @@ impl ProtonDriveClient {
             for chunk in thumbnail_ids.chunks(MAX_THUMBNAIL_IDS_PER_REQUEST) {
                 let response: ThumbnailBlockListResponse = match self
                     .http
-                    .post(
+                    .post_query(
                         &format!("volumes/{volume_id}/thumbnails"),
                         &ThumbnailBlockListRequest {
                             thumbnail_ids: chunk.to_vec(),
@@ -2638,7 +2638,8 @@ impl ProtonDriveClient {
                 "v2/volumes/{}/links/{}/checkAvailableHashes",
                 parent_uid.volume_id, parent_uid.link_id
             );
-            let response: NodeNameAvailabilityResponse = self.http.post(&path, &request).await?;
+            let response: NodeNameAvailabilityResponse =
+                self.http.post_query(&path, &request).await?;
 
             // Take the first hash the server reports free and map it back to its
             // name (C# returns `AvailableHashes[0]`).
@@ -5855,7 +5856,7 @@ impl ProtonDriveClient {
         let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
         let response: FindPhotoDuplicatesResponse = self
             .http
-            .post(
+            .post_query(
                 &path,
                 &FindPhotoDuplicatesRequest {
                     name_hashes: vec![name_hash.clone()],
@@ -5959,7 +5960,7 @@ impl ProtonDriveClient {
             let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
             let response: FindPhotoDuplicatesResponse = self
                 .http
-                .post(
+                .post_query(
                     &path,
                     &FindPhotoDuplicatesRequest {
                         name_hashes: chunk.to_vec(),
@@ -6045,7 +6046,7 @@ impl ProtonDriveClient {
             let path = format!("volumes/{}/photos/duplicates", photos_root.volume_id);
             let response: FindPhotoDuplicatesResponse = self
                 .http
-                .post(
+                .post_query(
                     &path,
                     &FindPhotoDuplicatesRequest {
                         name_hashes: chunk.to_vec(),
@@ -7464,7 +7465,7 @@ impl ProtonDriveClient {
             format!("v2/volumes/{volume_id}/links")
         };
         let body = LinkDetailsRequest { link_ids };
-        self.http.post(&path, &body).await
+        self.http.post_query(&path, &body).await
     }
 
     async fn build_node(

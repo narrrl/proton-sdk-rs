@@ -587,7 +587,7 @@ impl ProtonDrivePublicLinkClient {
         link_ids: &[LinkId],
     ) -> Result<LinkDetailsResponse> {
         self.transport
-            .post(
+            .post_query(
                 &format!("v2/volumes/{volume_id}/links"),
                 &LinkDetailsRequest { link_ids },
             )
@@ -794,7 +794,7 @@ impl ProtonDrivePublicLinkClient {
 
         let response: ThumbnailBlockListResponse = self
             .transport
-            .post(
+            .post_query(
                 &format!("volumes/{}/thumbnails", uid.volume_id),
                 &ThumbnailBlockListRequest {
                     thumbnail_ids: vec![thumbnail_id.clone()],
@@ -880,7 +880,7 @@ impl ProtonDrivePublicLinkClient {
     ) {
         let response: ThumbnailBlockListResponse = match self
             .transport
-            .post(
+            .post_query(
                 &format!("volumes/{volume_id}/thumbnails"),
                 &ThumbnailBlockListRequest {
                     thumbnail_ids: chunk.to_vec(),

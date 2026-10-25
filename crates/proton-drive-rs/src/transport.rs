@@ -127,17 +127,19 @@ impl RevisionTransport {
         }
     }
 
-    /// `POST path` through the current session, with the same one-shot renewal.
-    pub(crate) async fn post<B: Serialize + Sync, T: DeserializeOwned>(
+    /// `POST path` for an endpoint that only reads (see
+    /// [`ApiHttpClient::post_query`]), through the current session, with the
+    /// same one-shot renewal.
+    pub(crate) async fn post_query<B: Serialize + Sync, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
     ) -> Result<T> {
         let (http, generation) = self.session.http();
-        match http.post::<B, T>(path, body).await {
+        match http.post_query::<B, T>(path, body).await {
             Err(e) if is_session_expired(&e) => {
                 self.session.renew(generation).await?;
-                self.session.http().0.post::<B, T>(path, body).await
+                self.session.http().0.post_query::<B, T>(path, body).await
             }
             other => other,
         }

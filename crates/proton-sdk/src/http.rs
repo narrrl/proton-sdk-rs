@@ -239,25 +239,24 @@ impl ApiHttpClient {
     /// blocking decrypt task.
     pub async fn get_storage_blob(&self, url: &str, token: &str) -> Result<Bytes> {
         let mut timer = self.telemetry().start("storage_download");
-        let response = send_retrying(&self.inner.config.retry_policy, || {
-            // Override the client-level (API) timeout: a 4 MiB block on a slow
-            // uplink legitimately outruns the 30s JSON budget.
-            let mut request = self
-                .inner
-                .http
-                .get(url)
-                .timeout(self.inner.config.storage_timeout)
-                .header(STORAGE_TOKEN_HEADER, token);
-            if !self.inner.config.user_agent.is_empty() {
-                request =
-                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
-            }
-            request
-        })
-        .await?;
-        let status = response.status();
+        let Buffered { status, bytes, .. } =
+            send_retrying(&self.inner.config.retry_policy, Replay::Safe, || {
+                // Override the client-level (API) timeout: a 4 MiB block on a slow
+                // uplink legitimately outruns the 30s JSON budget.
+                let mut request = self
+                    .inner
+                    .http
+                    .get(url)
+                    .timeout(self.inner.config.storage_timeout)
+                    .header(STORAGE_TOKEN_HEADER, token);
+                if !self.inner.config.user_agent.is_empty() {
+                    request =
+                        request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+                }
+                request
+            })
+            .await?;
         timer.attr("status", status.as_u16());
-        let bytes = response.bytes().await?;
 
         // Success bodies are raw block bytes (not JSON); only error responses
         // carry the envelope.
@@ -294,32 +293,31 @@ impl ApiHttpClient {
 
         let blob_len = blob.len() as u64;
         let mut timer = self.telemetry().start("storage_upload");
-        let response = send_retrying(&self.inner.config.retry_policy, || {
-            let body = reqwest::Body::from(blob.clone());
-            let part = reqwest::multipart::Part::stream_with_length(body, blob_len)
-                .file_name("blob")
-                .mime_str("application/octet-stream")
-                .expect("octet-stream is a valid MIME type");
-            let form = reqwest::multipart::Form::new().part("Block", part);
+        let Buffered { status, bytes, .. } =
+            send_retrying(&self.inner.config.retry_policy, Replay::Unsafe, || {
+                let body = reqwest::Body::from(blob.clone());
+                let part = reqwest::multipart::Part::stream_with_length(body, blob_len)
+                    .file_name("blob")
+                    .mime_str("application/octet-stream")
+                    .expect("octet-stream is a valid MIME type");
+                let form = reqwest::multipart::Form::new().part("Block", part);
 
-            let mut request = self
-                .inner
-                .http
-                .post(url)
-                .timeout(self.inner.config.storage_timeout)
-                .header(STORAGE_TOKEN_HEADER, token)
-                .multipart(form);
+                let mut request = self
+                    .inner
+                    .http
+                    .post(url)
+                    .timeout(self.inner.config.storage_timeout)
+                    .header(STORAGE_TOKEN_HEADER, token)
+                    .multipart(form);
 
-            if !self.inner.config.user_agent.is_empty() {
-                request =
-                    request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
-            }
-            request
-        })
-        .await?;
-        let status = response.status();
+                if !self.inner.config.user_agent.is_empty() {
+                    request =
+                        request.header(reqwest::header::USER_AGENT, &self.inner.config.user_agent);
+                }
+                request
+            })
+            .await?;
         timer.attr("status", status.as_u16());
-        let bytes = response.bytes().await?;
 
         if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes) {
             if !envelope.is_success() {
@@ -338,12 +336,29 @@ impl ApiHttpClient {
 
     /// `GET {path}` returning a typed success body.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.send::<(), T>(Method::GET, path, None).await
+        self.send::<(), T>(Method::GET, path, None, Replay::Safe)
+            .await
     }
 
     /// `POST {path}` with a JSON body, returning a typed success body.
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        self.send::<B, T>(Method::POST, path, Some(body)).await
+        self.send::<B, T>(Method::POST, path, Some(body), Replay::Unsafe)
+            .await
+    }
+
+    /// `POST {path}` for an endpoint that only reads, such as fetching link
+    /// details or thumbnail URLs, where the body is a query too long for a URL.
+    ///
+    /// Retried like a `GET`: a connection that drops after the request left is
+    /// sent again, because the server changed nothing. Only use this for an
+    /// endpoint that changes nothing; [`post`](Self::post) for everything else.
+    pub async fn post_query<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.send::<B, T>(Method::POST, path, Some(body), Replay::Safe)
+            .await
     }
 
     /// `POST {path}` as multipart form data with a JSON `Metadata` part and
@@ -361,15 +376,15 @@ impl ApiHttpClient {
         let response = self
             .send_multipart_with_token(path, &metadata, binary_parts, &rejected_token)
             .await?;
-        let response = if response.status() == StatusCode::UNAUTHORIZED && self.refresh_tokens {
-            let bytes = response.bytes().await?;
-            if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes)
+        let response = if response.status == StatusCode::UNAUTHORIZED && self.refresh_tokens {
+            let bytes = &response.bytes;
+            if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(bytes)
                 && matches!(
                     envelope.code,
                     ResponseCode::AccountDeleted | ResponseCode::AccountDisabled
                 )
             {
-                return Err(api_error(StatusCode::UNAUTHORIZED, &bytes));
+                return Err(api_error(StatusCode::UNAUTHORIZED, bytes));
             }
             let token = self.refresh_access_token(&rejected_token).await?;
             self.send_multipart_with_token(path, &metadata, binary_parts, &token)
@@ -377,20 +392,22 @@ impl ApiHttpClient {
         } else {
             response
         };
-        timer.attr("status", response.status().as_u16());
-        let parsed = parse_response(response).await?;
+        timer.attr("status", response.status.as_u16());
+        let parsed = parse_buffered(response)?;
         timer.success();
         Ok(parsed)
     }
 
     /// `PUT {path}` with a JSON body, returning a typed success body.
     pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        self.send::<B, T>(Method::PUT, path, Some(body)).await
+        self.send::<B, T>(Method::PUT, path, Some(body), Replay::Unsafe)
+            .await
     }
 
     /// `DELETE {path}` returning a typed success body.
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.send::<(), T>(Method::DELETE, path, None).await
+        self.send::<(), T>(Method::DELETE, path, None, Replay::Unsafe)
+            .await
     }
 
     /// `DELETE {path}` with a JSON body, returning a typed success body.
@@ -403,7 +420,8 @@ impl ApiHttpClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        self.send::<B, T>(Method::DELETE, path, Some(body)).await
+        self.send::<B, T>(Method::DELETE, path, Some(body), Replay::Unsafe)
+            .await
     }
 
     async fn send<B: Serialize, T: DeserializeOwned>(
@@ -411,6 +429,7 @@ impl ApiHttpClient {
         method: Method,
         path: &str,
         body: Option<&B>,
+        replay: Replay,
     ) -> Result<T> {
         let mut timer = self.telemetry().start("http_request");
         timer.attr("method", method.as_str());
@@ -419,18 +438,18 @@ impl ApiHttpClient {
 
         // An early `?` here records the op as a failure (OpTimer defaults to it).
         let response = self
-            .send_with_token(method.clone(), path, body, &access_token)
+            .send_with_token(method.clone(), path, body, replay, &access_token)
             .await?;
 
-        let response = if response.status() == StatusCode::UNAUTHORIZED && self.refresh_tokens {
-            self.handle_unauthorized(method, path, body, response, access_token)
+        let response = if response.status == StatusCode::UNAUTHORIZED && self.refresh_tokens {
+            self.handle_unauthorized(method, path, body, replay, response, access_token)
                 .await?
         } else {
             response
         };
 
-        timer.attr("status", response.status().as_u16());
-        let parsed = parse_response(response).await?;
+        timer.attr("status", response.status.as_u16());
+        let parsed = parse_buffered(response)?;
         timer.success();
         Ok(parsed)
     }
@@ -440,22 +459,22 @@ impl ApiHttpClient {
         method: Method,
         path: &str,
         body: Option<&B>,
-        response: reqwest::Response,
+        replay: Replay,
+        response: Buffered,
         rejected_access_token: String,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<Buffered> {
         // Don't bother refreshing for terminal account states.
-        let bytes = response.bytes().await?;
-        if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&bytes)
+        if let Ok(envelope) = serde_json::from_slice::<ApiResponse>(&response.bytes)
             && matches!(
                 envelope.code,
                 ResponseCode::AccountDeleted | ResponseCode::AccountDisabled
             )
         {
-            return Err(api_error(StatusCode::UNAUTHORIZED, &bytes));
+            return Err(api_error(StatusCode::UNAUTHORIZED, &response.bytes));
         }
 
         let access_token = self.refresh_access_token(&rejected_access_token).await?;
-        self.send_with_token(method, path, body, &access_token)
+        self.send_with_token(method, path, body, replay, &access_token)
             .await
     }
 
@@ -464,15 +483,16 @@ impl ApiHttpClient {
         method: Method,
         path: &str,
         body: Option<&B>,
+        replay: Replay,
         access_token: &str,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<Buffered> {
         let url = format!(
             "{}{}{}",
             self.inner.base_url,
             self.route_prefix,
             path.trim_start_matches('/')
         );
-        send_retrying(&self.inner.config.retry_policy, || {
+        send_retrying(&self.inner.config.retry_policy, replay, || {
             let mut request = self
                 .inner
                 .http
@@ -502,14 +522,14 @@ impl ApiHttpClient {
         metadata: &[u8],
         binary_parts: &[(String, Vec<u8>)],
         access_token: &str,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<Buffered> {
         let url = format!(
             "{}{}{}",
             self.inner.base_url,
             self.route_prefix,
             path.trim_start_matches('/')
         );
-        send_retrying(&self.inner.config.retry_policy, || {
+        send_retrying(&self.inner.config.retry_policy, Replay::Unsafe, || {
             let metadata_part = reqwest::multipart::Part::bytes(metadata.to_vec())
                 .file_name("Metadata")
                 .mime_str("application/json")
@@ -652,7 +672,7 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     let base_url = ensure_trailing_slash(&config.base_url);
     let url = format!("{}{}", base_url, path.trim_start_matches('/'));
 
-    let response = send_retrying(&config.retry_policy, || {
+    let response = send_retrying(&config.retry_policy, Replay::Safe, || {
         let mut request = http
             .get(&url)
             .header(APP_VERSION_HEADER, &config.app_version)
@@ -664,7 +684,7 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     })
     .await?;
 
-    parse_response(response).await
+    parse_buffered(response)
 }
 
 /// `POST {path}` without a session: no `x-pm-uid` and no bearer token.
@@ -699,7 +719,7 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
     let base_url = ensure_trailing_slash(&config.base_url);
     let url = format!("{}{}", base_url, path.trim_start_matches('/'));
 
-    let response = send_retrying(&config.retry_policy, || {
+    let response = send_retrying(&config.retry_policy, Replay::Unsafe, || {
         let mut request = http
             .post(&url)
             .header(APP_VERSION_HEADER, &config.app_version)
@@ -717,15 +737,22 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
     })
     .await?;
 
-    parse_response(response).await
+    parse_buffered(response)
 }
 
 /// Read a response body, enforce the Proton success envelope, and deserialize
 /// the typed success payload.
 async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-    let status = response.status();
-    let path = response.url().path().to_owned();
-    let bytes = response.bytes().await?;
+    parse_buffered(Buffered::read(response).await?)
+}
+
+/// [`parse_response`] for a response whose body is already read.
+fn parse_buffered<T: DeserializeOwned>(response: Buffered) -> Result<T> {
+    let Buffered {
+        status,
+        path,
+        bytes,
+    } = response;
 
     // Every Proton response embeds the envelope; a missing/non-success code or a
     // non-2xx HTTP status is an API error. `MultipleResponses` (1001) is a batch
@@ -784,25 +811,67 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> ProtonError {
     })
 }
 
-/// Send a request, transparently retrying retryable failures per `policy`.
+/// Whether a request may be sent again after it may already have reached the
+/// server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    /// The request only reads: a `GET`, or a [`ApiHttpClient::post_query`].
+    /// Sending it twice changes nothing, so a connection that drops after the
+    /// request left — mid-request or mid-body — is worth another attempt.
+    Safe,
+    /// The request may change something. Only a failure that shows the request
+    /// never reached the server is retried, plus a timeout (see
+    /// [`is_retryable_error`]).
+    Unsafe,
+}
+
+/// A response with its body read to the end.
+///
+/// The body is read inside [`send_retrying`], so a body that breaks off can be
+/// retried for a [`Replay::Safe`] request like a failed send.
+struct Buffered {
+    status: StatusCode,
+    /// The request path, for the failure log in [`parse_buffered`].
+    path: String,
+    bytes: Bytes,
+}
+
+impl Buffered {
+    async fn read(response: reqwest::Response) -> reqwest::Result<Self> {
+        let status = response.status();
+        let path = response.url().path().to_owned();
+        let bytes = response.bytes().await?;
+        Ok(Self {
+            status,
+            path,
+            bytes,
+        })
+    }
+}
+
+/// Send a request and read its body, transparently retrying retryable failures
+/// per `policy`.
 ///
 /// `build` is called once per attempt to produce a fresh `RequestBuilder`
 /// (reqwest builders are consumed by `send`, and streaming bodies like
 /// `multipart` can't be cloned), so every retry resends the full request.
 ///
 /// Retryable = HTTP 408/429/502/503/504 or a transient transport error
-/// (timeout / connect). A `Retry-After` header (delta-seconds) is honoured, up
+/// (timeout / connect). A [`Replay::Safe`] request is also retried when the
+/// connection drops after the request was sent, before or during the body —
+/// a phone does that when the OS closes a pooled connection or the network
+/// changes. A `Retry-After` header (delta-seconds) is honoured, up
 /// to `policy.max_retry_after`; otherwise the delay is exponential backoff with
 /// full jitter. Non-retryable
 /// responses and errors — including ordinary 4xx and the 401 that drives token
 /// refresh — pass straight through to the caller untouched.
-async fn send_retrying<F>(policy: &RetryPolicy, build: F) -> Result<reqwest::Response>
+async fn send_retrying<F>(policy: &RetryPolicy, replay: Replay, build: F) -> Result<Buffered>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
     let mut attempt: u32 = 0;
     loop {
-        match build().send().await {
+        let retry = match build().send().await {
             Ok(response) => {
                 if attempt < policy.max_retries && is_retryable_status(response.status()) {
                     let delay = retry_after(&response)
@@ -812,16 +881,20 @@ where
                     attempt += 1;
                     continue;
                 }
-                return Ok(response);
-            }
-            Err(err) => {
-                if attempt < policy.max_retries && is_retryable_error(&err) {
-                    tokio::time::sleep(backoff(policy, attempt)).await;
-                    attempt += 1;
-                    continue;
+                match Buffered::read(response).await {
+                    Ok(buffered) => return Ok(buffered),
+                    // The server answered, so an unsafe request may have acted.
+                    Err(err) => (replay == Replay::Safe, err),
                 }
-                return Err(err.into());
             }
+            Err(err) => (is_retryable_error(&err, replay), err),
+        };
+        match retry {
+            (true, _) if attempt < policy.max_retries => {
+                tokio::time::sleep(backoff(policy, attempt)).await;
+                attempt += 1;
+            }
+            (_, err) => return Err(err.into()),
         }
     }
 }
@@ -856,11 +929,12 @@ fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
 }
 
-/// A transport error worth retrying: a timeout or a failure to connect. A
-/// mid-body error (`is_body`) is not retried — the request may have been
-/// applied server-side.
-fn is_retryable_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+/// A failed send worth retrying: a timeout or a failure to connect, and for a
+/// [`Replay::Safe`] request any failure of the request itself, such as a
+/// connection closed before the response arrived. That last one is not retried
+/// for an unsafe request — the request may have been applied server-side.
+fn is_retryable_error(err: &reqwest::Error, replay: Replay) -> bool {
+    err.is_timeout() || err.is_connect() || (replay == Replay::Safe && err.is_request())
 }
 
 /// Parse a `Retry-After` header expressed as delta-seconds. The HTTP-date form
@@ -1356,6 +1430,116 @@ mod tests {
             "the callback ran although nobody waited"
         );
         server.abort();
+    }
+
+    /// How the first connection to [`dropping_server`] fails.
+    #[derive(Clone, Copy)]
+    enum Drop {
+        /// Read the request, then close without answering.
+        BeforeResponse,
+        /// Send the headers and part of the body, then close.
+        MidBody,
+    }
+
+    /// A test server whose first connection fails as `drop` says and whose
+    /// later connections answer with success. Returns its address and how many
+    /// connections it accepted.
+    async fn dropping_server(
+        drop: Drop,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = br#"{"Code":1000}"#;
+                if first {
+                    if let Drop::MidBody = drop {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len() + 100
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&body[..4]).await;
+                        let _ = sock.flush().await;
+                    }
+                    continue;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, connections, server)
+    }
+
+    fn quick_retries() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            max_retry_after: Duration::from_millis(1),
+        }
+    }
+
+    /// A read is sent again when the connection drops after the request left,
+    /// whether before the response or partway through its body.
+    #[tokio::test]
+    async fn a_read_is_sent_again_after_the_connection_drops() {
+        use std::sync::atomic::Ordering;
+
+        for drop in [Drop::BeforeResponse, Drop::MidBody] {
+            let (addr, connections, server) = dropping_server(drop).await;
+            let client = refresh_client(addr, quick_retries());
+            let _: ApiResponse = client.get("listing").await.expect("the GET is retried");
+            assert_eq!(connections.load(Ordering::SeqCst), 2);
+            server.abort();
+
+            let (addr, connections, server) = dropping_server(drop).await;
+            let client = refresh_client(addr, quick_retries());
+            let _: ApiResponse = client
+                .post_query("links", &serde_json::json!({}))
+                .await
+                .expect("the read-only POST is retried");
+            assert_eq!(connections.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
+
+    /// A write is not sent again once the request may have reached the server:
+    /// the first attempt may have acted, and a second one could create a
+    /// duplicate.
+    #[tokio::test]
+    async fn a_write_is_not_sent_again_after_the_connection_drops() {
+        use std::sync::atomic::Ordering;
+
+        for drop in [Drop::BeforeResponse, Drop::MidBody] {
+            let (addr, connections, server) = dropping_server(drop).await;
+            let client = refresh_client(addr, quick_retries());
+            let error = client
+                .post::<_, ApiResponse>("folders", &serde_json::json!({}))
+                .await
+                .expect_err("the POST is not retried");
+            assert!(matches!(error, ProtonError::Transport(_)), "{error:?}");
+            assert_eq!(connections.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
     }
 
     /// A 5xx from `auth/v4/refresh` may come after Proton rotated the tokens;
