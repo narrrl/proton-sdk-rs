@@ -3794,6 +3794,7 @@ impl ProtonDriveClient {
             creation_time: now_epoch_seconds(),
             expiration_time,
             has_custom_password,
+            custom_password: custom_password.filter(|p| !p.is_empty()).map(str::to_owned),
         })
     }
 
@@ -3856,6 +3857,7 @@ impl ProtonDriveClient {
             role,
             expiration_time,
             has_custom_password,
+            custom_password: custom_password.filter(|p| !p.is_empty()).map(str::to_owned),
             ..link
         })
     }
@@ -3936,7 +3938,7 @@ impl ProtonDriveClient {
                 let response: ShareUrlsResponse = self.http.get(&path).await?;
                 match response.share_urls.into_iter().next() {
                     Some(dto) => {
-                        let url = self.recover_public_link_url(&dto).await;
+                        let (url, custom_password) = self.recover_public_link_secret(&dto).await;
                         Some(PublicLink {
                             share_id,
                             public_link_id: dto.share_url_id,
@@ -3945,6 +3947,7 @@ impl ProtonDriveClient {
                             creation_time: dto.create_time,
                             expiration_time: dto.expiration_time,
                             has_custom_password: dto.flags == 3,
+                            custom_password,
                         })
                     }
                     None => None,
@@ -3956,24 +3959,32 @@ impl ProtonDriveClient {
         Ok(link)
     }
 
-    /// Rebuild the full public URL (`{public_url}#{generated}`) for an existing
-    /// link by decrypting its stored `Password` with the owner's address key. The
-    /// stored secret is the generated password with any custom password appended;
-    /// only the leading generated portion belongs in the URL fragment (the
-    /// recipient supplies the custom password separately). Returns `None` if the
-    /// link carries no password or it can't be decrypted, so the caller still gets
-    /// the link's metadata.
-    async fn recover_public_link_url(&self, dto: &ShareUrlDto) -> Option<String> {
-        if dto.public_url.is_empty() {
-            return None;
-        }
-        let enc = dto.password.as_deref()?;
-        let (_, email, _) = self.membership_address().await.ok()?;
-        let (address_keys, _) = self.own_address_keys(&email).await.ok()?;
-        let bytes = decrypt_armored_with_keys(enc, &address_keys).ok()?;
-        let full = String::from_utf8_lossy(&bytes);
-        let generated: String = full.chars().take(PUBLIC_LINK_PASSWORD_LEN).collect();
-        Some(format!("{}#{generated}", dto.public_url))
+    /// Rebuild the full public URL (`{public_url}#{generated}`) and the custom
+    /// password of an existing link by decrypting its stored `Password` with the
+    /// owner's address key. The stored secret is the generated password with any
+    /// custom password appended; only the leading generated portion belongs in
+    /// the URL fragment (the recipient supplies the custom password separately).
+    /// Both are `None` if the link carries no password or it can't be
+    /// decrypted, so the caller still gets the link's metadata.
+    async fn recover_public_link_secret(
+        &self,
+        dto: &ShareUrlDto,
+    ) -> (Option<String>, Option<String>) {
+        let Some(enc) = dto.password.as_deref() else {
+            return (None, None);
+        };
+        let full = async {
+            let (_, email, _) = self.membership_address().await.ok()?;
+            let (address_keys, _) = self.own_address_keys(&email).await.ok()?;
+            let bytes = decrypt_armored_with_keys(enc, &address_keys).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let Some(full) = full.await else {
+            return (None, None);
+        };
+        let (generated, custom) = split_link_password(&full);
+        let url = (!dto.public_url.is_empty()).then(|| format!("{}#{generated}", dto.public_url));
+        (url, custom.map(str::to_owned))
     }
 
     /// Remove a public link, revoking access via the URL
@@ -4221,7 +4232,7 @@ impl ProtonDriveClient {
             // fragment is the generated part; the share key is locked with the
             // whole string.
             let password = String::from_utf8_lossy(&bytes).into_owned();
-            let (url_password, custom_password) = split_bookmark_password(&password);
+            let (url_password, custom_password) = split_link_password(&password);
             let url = format!(
                 "https://drive.proton.me/urls/{}#{url_password}",
                 dto.token.token
@@ -8078,9 +8089,9 @@ fn public_link_permissions(role: MemberRole) -> Result<i32> {
         })
 }
 
-/// Split a bookmark's stored secret into the generated URL password and the
+/// Split a public link's stored secret into the generated URL password and the
 /// custom password appended to it, if any (TS `splitGeneratedAndCustomPassword`).
-fn split_bookmark_password(password: &str) -> (&str, Option<&str>) {
+fn split_link_password(password: &str) -> (&str, Option<&str>) {
     let split = password
         .char_indices()
         .nth(PUBLIC_LINK_PASSWORD_LEN)
@@ -8984,7 +8995,7 @@ mod tests {
         is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
         path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
         run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
-        small_upload_should_fall_back, split_bookmark_password, take_block_target,
+        small_upload_should_fall_back, split_link_password, take_block_target,
         take_thumbnail_target, to_drive_event, validate_node_name,
     };
     use crate::dtos::{
@@ -9003,23 +9014,20 @@ mod tests {
     use tokio::sync::{Mutex, Notify, RwLock};
 
     #[test]
-    fn a_bookmark_password_splits_into_the_generated_part_and_the_custom_one() {
+    fn a_link_password_splits_into_the_generated_part_and_the_custom_one() {
+        assert_eq!(split_link_password("AbCdEf123456"), ("AbCdEf123456", None));
         assert_eq!(
-            split_bookmark_password("AbCdEf123456"),
-            ("AbCdEf123456", None)
-        );
-        assert_eq!(
-            split_bookmark_password("AbCdEf123456s3cr3t!"),
+            split_link_password("AbCdEf123456s3cr3t!"),
             ("AbCdEf123456", Some("s3cr3t!"))
         );
         // A custom password may hold any character; the split counts chars,
         // not bytes, and never cuts one in half.
         assert_eq!(
-            split_bookmark_password("AbCdEf123456pässwört"),
+            split_link_password("AbCdEf123456pässwört"),
             ("AbCdEf123456", Some("pässwört"))
         );
         // A legacy password shorter than a generated one is all URL password.
-        assert_eq!(split_bookmark_password("short"), ("short", None));
+        assert_eq!(split_link_password("short"), ("short", None));
     }
 
     /// A batch envelope with one successful link and one that failed with `code`.

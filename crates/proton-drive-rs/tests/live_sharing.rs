@@ -846,6 +846,11 @@ async fn update_public_link_changes_role_password_and_expiry() {
         "the expiry must be stored"
     );
     assert_eq!(fetched.url.as_deref(), Some(url.as_str()));
+    assert_eq!(
+        fetched.custom_password.as_deref(),
+        Some(custom),
+        "the custom password is recovered from the stored link password"
+    );
 
     assert!(
         ProtonDrivePublicLinkClient::open(common::config(), &url, None)
@@ -873,6 +878,7 @@ async fn update_public_link_changes_role_password_and_expiry() {
         "the custom password is removed"
     );
     assert_eq!(fetched.expiration_time, None, "the expiry is cleared");
+    assert_eq!(fetched.custom_password, None);
     ProtonDrivePublicLinkClient::open(common::config(), &url, None)
         .await
         .expect("the link opens with the URL alone again");

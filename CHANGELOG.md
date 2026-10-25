@@ -25,6 +25,9 @@ This file starts after 0.9.2; earlier changes are in the git history.
   expiry of the link on a node. The URL does not change. `None` removes a custom
   password or an expiry. A legacy link cannot be updated. Ported from the
   TypeScript SDK (`updateSharedLink`).
+- **A public link's custom password.** `PublicLink::custom_password` holds the
+  custom password of a link, recovered from the stored link password, so a
+  caller can keep it while `update_public_link` changes the role or the expiry.
 - **Walking a public link.** `ProtonDrivePublicLinkClient::enumerate_subtree`
   and `enumerate_subtree_reporting` return every node below a shared folder,
   breadth first, listing several folders of a level at once.
@@ -50,6 +53,8 @@ This file starts after 0.9.2; earlier changes are in the git history.
   is retried under the client's retry policy. A write still is not: it may have
   been applied. Read-only POSTs in `proton-drive-rs` (link details, thumbnails,
   photo duplicates, `checkAvailableHashes`) now use `post_query`.
+- `Debug` for `PublicLink` and `Bookmark` no longer prints the URL or the
+  custom password; it shows `<redacted>` instead.
 - `remove_photos_from_album` refuses a photo on another volume per photo, in
   the input order, without sending it.
 
@@ -60,6 +65,6 @@ This file starts after 0.9.2; earlier changes are in the git history.
 
 ### Breaking
 
-- `Bookmark` has a new public field, `custom_password`. Code that builds a
-  `Bookmark` with a struct literal must set it.
+- `Bookmark` and `PublicLink` have a new public field, `custom_password`. Code
+  that builds either with a struct literal must set it.
 - `ResponseCode` has a new variant. An exhaustive `match` on it needs an arm.

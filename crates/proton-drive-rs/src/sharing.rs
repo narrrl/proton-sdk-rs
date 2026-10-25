@@ -5,6 +5,8 @@
 //! expose; the behavior is ported from the TypeScript SDK (`internal/sharing`).
 //! Reading shared-with-me nodes and leaving them lives on the client already.
 
+use std::fmt;
+
 use proton_sdk::crypto::VerificationStatus;
 use proton_sdk::ids::{NodeUid, ShareId, ShareMembershipId};
 use serde::{Deserialize, Serialize};
@@ -149,7 +151,9 @@ pub struct ShareMember {
 }
 
 /// A public share link on a node.
-#[derive(Debug, Clone)]
+///
+/// `Debug` leaves out the custom password.
+#[derive(Clone)]
 pub struct PublicLink {
     /// The share this link belongs to.
     pub share_id: ShareId,
@@ -166,6 +170,31 @@ pub struct PublicLink {
     pub expiration_time: Option<i64>,
     /// Whether the link is additionally protected by a custom password.
     pub has_custom_password: bool,
+    /// The custom password itself, when the link has one and the stored link
+    /// password could be decrypted. Pass it back to
+    /// [`update_public_link`](crate::ProtonDriveClient::update_public_link) to
+    /// keep it while changing the role or the expiry.
+    pub custom_password: Option<String>,
+}
+
+impl fmt::Debug for PublicLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicLink")
+            .field("share_id", &self.share_id)
+            .field("public_link_id", &self.public_link_id)
+            .field("url", &redacted(&self.url))
+            .field("role", &self.role)
+            .field("creation_time", &self.creation_time)
+            .field("expiration_time", &self.expiration_time)
+            .field("has_custom_password", &self.has_custom_password)
+            .field("custom_password", &redacted(&self.custom_password))
+            .finish()
+    }
+}
+
+/// What `Debug` shows for a secret: whether there is one, never its value.
+fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
 }
 
 /// A pending invitation to a Proton user (not yet accepted).
@@ -250,7 +279,9 @@ pub struct IncomingInvitation {
 
 /// A public link the user has saved to their account ("bookmark"). Opening it
 /// visits the public URL; there is no local copy.
-#[derive(Debug, Clone)]
+///
+/// `Debug` leaves out the URL's secret fragment and the custom password.
+#[derive(Clone)]
 pub struct Bookmark {
     /// The bookmark's token — the handle for
     /// [`delete_bookmark`](crate::ProtonDriveClient::delete_bookmark).
@@ -270,9 +301,50 @@ pub struct Bookmark {
     pub creation_time: i64,
 }
 
+impl fmt::Debug for Bookmark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bookmark")
+            .field("token", &self.token)
+            .field("url", &"<redacted>")
+            .field("custom_password", &redacted(&self.custom_password))
+            .field("node_name", &self.node_name)
+            .field("is_folder", &self.is_folder)
+            .field("creation_time", &self.creation_time)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_leaves_out_link_secrets() {
+        let link = PublicLink {
+            share_id: "s1".into(),
+            public_link_id: "l1".into(),
+            url: Some("https://drive.proton.me/urls/T0K3N#AbCdEf123456".into()),
+            role: MemberRole::Viewer,
+            creation_time: 1,
+            expiration_time: None,
+            has_custom_password: true,
+            custom_password: Some("s3cr3t".into()),
+        };
+        let bookmark = Bookmark {
+            token: "T0K3N".into(),
+            url: "https://drive.proton.me/urls/T0K3N#AbCdEf123456".into(),
+            custom_password: Some("s3cr3t".into()),
+            node_name: Some("Holiday".into()),
+            is_folder: true,
+            creation_time: 1,
+        };
+        for shown in [format!("{link:?}"), format!("{bookmark:?}")] {
+            assert!(!shown.contains("AbCdEf123456"), "{shown}");
+            assert!(!shown.contains("s3cr3t"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
+        assert!(format!("{bookmark:?}").contains("Holiday"));
+    }
 
     #[test]
     fn the_strict_role_mapping_refuses_to_guess_at_an_unknown_mask() {
