@@ -26,7 +26,8 @@ pub struct KeyReport {
 pub struct UserKeyReport {
     pub id: UserKeyId,
     pub primary: bool,
-    /// `Active` from the server. The unlock path uses active keys only.
+    /// `Active` from the server. The unlock path signs with active keys only,
+    /// but tries an inactive key that opens for address key tokens too.
     pub active: bool,
     /// Whether the client's passphrase for this key opens it. Tried for
     /// inactive keys too, which the unlock path never does.
@@ -98,7 +99,10 @@ impl AccountClient {
         let user: UserResponse = self.inner.http.get("core/v4/users").await?;
 
         let mut user_keys = Vec::with_capacity(user.user.keys.len());
+        // Every key that opens, active first, as `AccountClient::token_keys`
+        // tries them for a token.
         let mut active_unlocked = Vec::new();
+        let mut inactive_unlocked = Vec::new();
         for dto in &user.user.keys {
             let unlocked = match passphrases.get(dto.id.as_str()) {
                 Some(passphrase) => PrivateKey::from_armored(&dto.private_key, passphrase)
@@ -109,6 +113,8 @@ impl AccountClient {
                 Ok(key) => {
                     if dto.is_active() {
                         active_unlocked.push(key);
+                    } else {
+                        inactive_unlocked.push(key);
                     }
                     (true, None)
                 }
@@ -123,6 +129,10 @@ impl AccountClient {
                 key_ids: crypto::key_ids(&dto.private_key).unwrap_or_default(),
             });
         }
+        let token_keys: Vec<PrivateKey> = active_unlocked
+            .into_iter()
+            .chain(inactive_unlocked)
+            .collect();
 
         let response: AddressListResponse = self.inner.http.get("core/v4/addresses").await?;
         let mut addresses = Vec::with_capacity(response.addresses.len());
@@ -131,7 +141,7 @@ impl AccountClient {
             for key_dto in &dto.keys {
                 let passphrase = match (&key_dto.token, &key_dto.signature) {
                     (Some(token), Some(_signature)) => {
-                        crypto::decrypt_armored_with_keys(token, &active_unlocked)
+                        crypto::decrypt_armored_with_keys(token, &token_keys)
                             .map_err(|e| format!("token: {e}"))
                     }
                     _ => passphrases

@@ -7,6 +7,31 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.10.1] — 2026-10-31
+
+### Fixed
+
+- **Address keys whose token is for an inactive account key.** An address key's
+  token was decrypted with the active account keys only. A token encrypted to
+  an account key since marked inactive never opened, although that key still
+  opens with the password, so the address failed with "has no primary key".
+  Tokens are now tried with every account key that opens, active ones first.
+  Signing still uses active keys only. `AccountClient::key_report` follows the
+  same chain.
+- **One broken address no longer fails the account.** `AccountClient::addresses`
+  failed as a whole when any one address's keys did not open. That address is
+  now left out with a warning, and the others work. It fails only when no
+  address opens. `address_private_keys` names the reason for a left-out
+  address, and `default_address` fails with it when the left-out address is the
+  default, instead of handing out the next address.
+
+### Added
+
+- `AccountClient::address(id)`: one address by id, failing with the reason when
+  its keys did not open. `proton-drive-rs` uses it to resolve membership
+  addresses, which before said "membership address not found" for such an
+  address.
+
 ## [0.10.0] — 2026-10-26
 
 ### Added

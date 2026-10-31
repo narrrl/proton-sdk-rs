@@ -97,8 +97,16 @@ struct Cache {
     /// key id → passphrase derived from the mailbox password and key salts.
     key_passphrases: Option<KeyPassphrases>,
     user_keys: Option<Vec<PrivateKey>>,
+    /// Every user key that opens, active ones first: what an address key's
+    /// token may be encrypted to. See [`AccountClient::token_keys`].
+    token_keys: Option<Vec<PrivateKey>>,
     addresses: Option<Vec<Address>>,
     address_keys: HashMap<AddressId, Vec<PrivateKey>>,
+    /// Addresses whose keys did not open, with why. They are left out of
+    /// `addresses` so the others still work.
+    failed_addresses: HashMap<AddressId, String>,
+    /// Why the lowest-ordered address did not open, when it did not.
+    default_failed: Option<String>,
     /// email → active (non-compromised) public keys, for authorship verification.
     public_keys: HashMap<String, Vec<PublicKey>>,
 }
@@ -193,8 +201,22 @@ impl AccountClient {
 
         let response: AddressListResponse = self.inner.http.get("core/v4/addresses").await?;
         let mut addresses = Vec::with_capacity(response.addresses.len());
+        let mut failed = HashMap::new();
+        let mut first_error = None;
         for dto in &response.addresses {
-            let (address, keys) = self.decrypt_address(dto).await?;
+            // An address whose keys do not open is left out rather than
+            // failing the account: the shares on every other address still
+            // work, and one broken address must not stop them all.
+            let (address, keys) = match self.decrypt_address(dto).await {
+                Ok(decrypted) => decrypted,
+                Err(ProtonError::InvalidOperation(reason)) => {
+                    tracing::warn!(address_id = %dto.id, %reason, "address keys do not open; skipping the address");
+                    failed.insert(dto.id.clone(), reason.clone());
+                    first_error.get_or_insert(reason);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             self.inner
                 .cache
                 .lock()
@@ -203,16 +225,50 @@ impl AccountClient {
                 .insert(address.id.clone(), keys);
             addresses.push(address);
         }
+        if addresses.is_empty()
+            && let Some(reason) = first_error
+        {
+            return Err(ProtonError::invalid_operation(reason));
+        }
         addresses.sort_by_key(|a| a.order);
+        let default_failed = response
+            .addresses
+            .iter()
+            .min_by_key(|dto| dto.order)
+            .and_then(|dto| failed.get(&dto.id).cloned());
 
-        self.inner.cache.lock().await.addresses = Some(addresses.clone());
+        let mut cache = self.inner.cache.lock().await;
+        cache.failed_addresses = failed;
+        cache.default_failed = default_failed;
+        cache.addresses = Some(addresses.clone());
         Ok(addresses)
     }
 
+    /// One address by id. An address whose keys did not open fails with the
+    /// reason, not as unknown.
+    pub async fn address(&self, address_id: &AddressId) -> Result<Address> {
+        let addresses = self.addresses().await?;
+        if let Some(address) = addresses.into_iter().find(|a| &a.id == address_id) {
+            return Ok(address);
+        }
+        let cache = self.inner.cache.lock().await;
+        Err(match cache.failed_addresses.get(address_id) {
+            Some(reason) => ProtonError::invalid_operation(reason.clone()),
+            None => ProtonError::invalid_operation(format!("no address {address_id}")),
+        })
+    }
+
     /// The default (lowest-ordered) address.
+    ///
+    /// When that address's keys did not open, this fails with the reason
+    /// rather than handing out the next address: what it signs would then be
+    /// signed by an address the user did not choose.
     pub async fn default_address(&self) -> Result<Address> {
-        self.addresses()
-            .await?
+        let addresses = self.addresses().await?;
+        if let Some(reason) = self.inner.cache.lock().await.default_failed.clone() {
+            return Err(ProtonError::invalid_operation(reason));
+        }
+        addresses
             .into_iter()
             .next()
             .ok_or_else(|| ProtonError::invalid_operation("user has no address"))
@@ -231,8 +287,12 @@ impl AccountClient {
         self.addresses().await?;
 
         let cache = self.inner.cache.lock().await;
-        cache.address_keys.get(address_id).cloned().ok_or_else(|| {
-            ProtonError::invalid_operation(format!("no keys for address {address_id}"))
+        if let Some(keys) = cache.address_keys.get(address_id) {
+            return Ok(keys.clone());
+        }
+        Err(match cache.failed_addresses.get(address_id) {
+            Some(reason) => ProtonError::invalid_operation(reason.clone()),
+            None => ProtonError::invalid_operation(format!("no keys for address {address_id}")),
         })
     }
 
@@ -316,7 +376,7 @@ impl AccountClient {
         self.user_keys().await.map(drop)
     }
 
-    /// Decrypted user (account) keys.
+    /// Decrypted active user (account) keys.
     async fn user_keys(&self) -> Result<Vec<PrivateKey>> {
         {
             let cache = self.inner.cache.lock().await;
@@ -329,16 +389,22 @@ impl AccountClient {
         let response: UserResponse = self.inner.http.get("core/v4/users").await?;
 
         let mut keys = Vec::new();
+        let mut inactive = Vec::new();
         for key_dto in &response.user.keys {
-            if !key_dto.is_active() {
-                continue;
-            }
             let Some(passphrase) = passphrases.get(key_dto.id.as_str()) else {
-                tracing::warn!(key_id = %key_dto.id, "no passphrase for user key");
+                if key_dto.is_active() {
+                    tracing::warn!(key_id = %key_dto.id, "no passphrase for user key");
+                }
                 continue;
             };
             match PrivateKey::from_armored(&key_dto.private_key, passphrase) {
-                Ok(key) => keys.push(key),
+                Ok(key) if key_dto.is_active() => keys.push(key),
+                Ok(key) => inactive.push(key),
+                // An inactive key is usually one whose passphrase went with an
+                // old password, so not opening is what it is expected to do.
+                Err(e) if !key_dto.is_active() => {
+                    tracing::debug!(key_id = %key_dto.id, error = %e, "inactive user key does not open")
+                }
                 Err(e) => {
                     tracing::warn!(key_id = %key_dto.id, error = %e, "failed to unlock user key")
                 }
@@ -356,8 +422,30 @@ impl AccountClient {
             });
         }
 
-        self.inner.cache.lock().await.user_keys = Some(keys.clone());
+        let mut cache = self.inner.cache.lock().await;
+        cache.token_keys = Some(keys.iter().cloned().chain(inactive).collect());
+        cache.user_keys = Some(keys.clone());
         Ok(keys)
+    }
+
+    /// Every user key that opens, active ones first, for decrypting address
+    /// key tokens.
+    ///
+    /// A token can be encrypted to an account key that has since been marked
+    /// inactive, for example after a key was replaced. That key still opens
+    /// with the password, and the address key behind the token is still the
+    /// one the address's shares are encrypted to, so the token must be tried
+    /// with it too. Only active keys are used for anything else.
+    async fn token_keys(&self) -> Result<Vec<PrivateKey>> {
+        self.user_keys().await?;
+        Ok(self
+            .inner
+            .cache
+            .lock()
+            .await
+            .token_keys
+            .clone()
+            .unwrap_or_default())
     }
 
     /// The per-key passphrases, key id → passphrase, derived (and cached) from
@@ -398,7 +486,7 @@ impl AccountClient {
 
     /// Build the public [`Address`] and unlock all of its active private keys.
     async fn decrypt_address(&self, dto: &AddressDto) -> Result<(Address, Vec<PrivateKey>)> {
-        let user_keys = self.user_keys().await?;
+        let user_keys = self.token_keys().await?;
         let passphrases = self.key_passphrases().await?;
 
         let mut keys = Vec::new();
@@ -672,14 +760,173 @@ mod tests {
         assert!(report.user_keys.iter().all(|key| key.unlocks));
         let keys = &report.addresses[0].keys;
         assert!(keys[0].unlocks && keys[0].error.is_none());
-        assert!(!keys[1].unlocks);
-        assert!(keys[1].error.as_deref().unwrap().contains("missing key"));
+        // The report tries the token with every key that opens, as the unlock
+        // path does.
+        assert!(keys[1].unlocks && keys[1].error.is_none());
         let recipients = keys[1].token_recipients.as_ref().unwrap();
         let meant_for = report
             .user_key_named(recipients[0].as_deref().unwrap())
             .unwrap();
         assert_eq!(meant_for.id.as_str(), "key-2");
         assert!(!meant_for.active);
+    }
+
+    /// A body answering both `core/v4/users` and `core/v4/addresses`: one
+    /// active account key and one inactive one, and `addresses` as given.
+    fn account_with(
+        active: &crate::crypto::GeneratedNodeKey,
+        inactive: &crate::crypto::GeneratedNodeKey,
+        addresses: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "User": {
+                "ID": "user-id", "MaxSpace": 1, "UsedSpace": 0,
+                "Keys": [
+                    { "ID": "key-1", "PrivateKey": active.locked_armored, "Primary": 1, "Active": 1 },
+                    { "ID": "key-2", "PrivateKey": inactive.locked_armored, "Primary": 0, "Active": 0 }
+                ]
+            },
+            "Addresses": addresses
+        })
+        .to_string()
+    }
+
+    /// An address key entry whose token, for `user_key`, carries the
+    /// passphrase of `address_key`.
+    fn address_key(
+        id: &str,
+        primary: bool,
+        user_key: &crate::crypto::GeneratedNodeKey,
+        address_key: &crate::crypto::GeneratedNodeKey,
+    ) -> serde_json::Value {
+        let token = PrivateKey::from_armored(&user_key.locked_armored, &user_key.passphrase)
+            .unwrap()
+            .encrypt(&address_key.passphrase)
+            .unwrap();
+        serde_json::json!({
+            "ID": id, "PrivateKey": address_key.locked_armored, "Token": token,
+            "Signature": "signature", "Primary": i32::from(primary), "Active": 1
+        })
+    }
+
+    fn both_passphrases(
+        active: &crate::crypto::GeneratedNodeKey,
+        inactive: &crate::crypto::GeneratedNodeKey,
+    ) -> KeyPassphrases {
+        KeyPassphrases::from_iter([
+            ("key-1", active.passphrase.clone()),
+            ("key-2", inactive.passphrase.clone()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn an_address_key_whose_token_is_for_an_inactive_account_key_opens() {
+        use crate::crypto::generate_node_key;
+
+        let (active, inactive) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let (first, second) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let body = account_with(
+            &active,
+            &inactive,
+            serde_json::json!([{
+                "ID": "address-1", "Email": "user@proton.me", "Status": 1, "Order": 1,
+                "Keys": [
+                    address_key("address-key-1", true, &inactive, &first),
+                    address_key("address-key-2", false, &active, &second)
+                ]
+            }]),
+        );
+        let (session, _) = session_serving(body).await;
+        let client =
+            AccountClient::with_key_passphrases(&session, both_passphrases(&active, &inactive));
+
+        let address = client.default_address().await.expect("primary key opens");
+        assert_eq!(address.primary_key_id.as_str(), "address-key-1");
+        let keys = client.address_private_keys(&address.id).await.unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_address_whose_keys_do_not_open_leaves_the_others_working() {
+        use crate::crypto::generate_node_key;
+
+        let (active, inactive) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let (good, broken, stranger) = (
+            generate_node_key().unwrap(),
+            generate_node_key().unwrap(),
+            generate_node_key().unwrap(),
+        );
+        // The broken address's only key has a token for a key not on the account.
+        let body = account_with(
+            &active,
+            &inactive,
+            serde_json::json!([
+                { "ID": "address-broken", "Email": "old@proton.me", "Status": 1, "Order": 1,
+                  "Keys": [address_key("address-key-b", true, &stranger, &broken)] },
+                { "ID": "address-good", "Email": "user@proton.me", "Status": 1, "Order": 2,
+                  "Keys": [address_key("address-key-g", true, &active, &good)] }
+            ]),
+        );
+        let (session, _) = session_serving(body).await;
+        let client =
+            AccountClient::with_key_passphrases(&session, both_passphrases(&active, &inactive));
+
+        let addresses = client.addresses().await.expect("one address opens");
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].id.as_str(), "address-good");
+        let good_id = addresses[0].id.clone();
+        assert_eq!(
+            client.address_private_keys(&good_id).await.unwrap().len(),
+            1
+        );
+
+        let broken_id: AddressId = "address-broken".to_owned().into();
+        for error in [
+            client
+                .address(&broken_id)
+                .await
+                .expect_err("broken")
+                .to_string(),
+            match client.address_private_keys(&broken_id).await {
+                Ok(_) => panic!("broken address opened"),
+                Err(e) => e.to_string(),
+            },
+            // The broken address is the default, so nothing is signed with
+            // another one in its place.
+            client
+                .default_address()
+                .await
+                .expect_err("default is broken")
+                .to_string(),
+        ] {
+            assert!(error.contains("address-broken"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_whose_addresses_all_fail_to_open_is_an_error() {
+        use crate::crypto::generate_node_key;
+
+        let (active, inactive) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let (broken, stranger) = (generate_node_key().unwrap(), generate_node_key().unwrap());
+        let body = account_with(
+            &active,
+            &inactive,
+            serde_json::json!([{
+                "ID": "address-broken", "Email": "old@proton.me", "Status": 1, "Order": 1,
+                "Keys": [address_key("address-key-b", true, &stranger, &broken)]
+            }]),
+        );
+        let (session, _) = session_serving(body).await;
+        let client =
+            AccountClient::with_key_passphrases(&session, both_passphrases(&active, &inactive));
+
+        let error = client.addresses().await.expect_err("nothing opens");
+        assert!(
+            matches!(error, ProtonError::InvalidOperation(_)),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
