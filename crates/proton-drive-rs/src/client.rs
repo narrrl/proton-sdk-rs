@@ -4737,13 +4737,7 @@ impl ProtonDriveClient {
     /// The `AddressKeyID` of an address's primary key (write requests that bind
     /// material to an address key need it alongside the `AddressID`).
     async fn address_primary_key_id(&self, address_id: &AddressId) -> Result<AddressKeyId> {
-        self.account
-            .addresses()
-            .await?
-            .into_iter()
-            .find(|address| &address.id == address_id)
-            .map(|address| address.primary_key_id)
-            .ok_or_else(|| ProtonError::invalid_operation("membership address not found"))
+        Ok(self.account.address(address_id).await?.primary_key_id)
     }
 
     /// Create a fresh-file draft: generate a node key + content key, encrypt the
@@ -5473,13 +5467,8 @@ impl ProtonDriveClient {
         &self,
         address_id: AddressId,
     ) -> Result<(AddressId, String, PrivateKey)> {
-        let address = self
-            .account
-            .addresses()
-            .await?
-            .into_iter()
-            .find(|a| a.id == address_id)
-            .ok_or_else(|| ProtonError::invalid_operation("membership address not found"))?;
+        // `address` names why an address whose keys did not open is missing.
+        let address = self.account.address(&address_id).await?;
 
         let keys = self.account.address_private_keys(&address_id).await?;
         let signing_key = keys
