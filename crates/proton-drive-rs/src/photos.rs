@@ -18,6 +18,7 @@ use proton_sdk::error::Result;
 use proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_sdk::session::ProtonApiSession;
 
+use crate::ModificationTime;
 use crate::client::ProtonDriveClient;
 use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{FileThumbnail, Node, RecentlyAccessedReportItem, Thumbnail, ThumbnailType};
@@ -92,6 +93,9 @@ pub struct AlbumItem {
 pub struct PhotoUploadMetadata {
     /// Capture time in seconds since the Unix epoch.
     pub capture_time: Option<i64>,
+    /// Modification time with its original UTC offset and fractional seconds.
+    /// Independent of capture time; omitted when unset.
+    pub last_modification_time: Option<ModificationTime>,
     /// The main photo this one is related to (live photo / burst grouping).
     pub main_photo_uid: Option<NodeUid>,
     pub tags: Vec<PhotoTag>,

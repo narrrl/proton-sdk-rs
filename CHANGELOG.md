@@ -7,6 +7,40 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.11.0] — 2026-11-05
+
+### Changed
+
+- **Modification timestamps retain their UTC offset and fractional seconds.**
+  Folder creation, streaming file uploads (including draft replacement), and
+  revision uploads accept `ModificationTime`, an alias for
+  `chrono::DateTime<chrono::FixedOffset>`. Ported from upstream `271f64e4`.
+  Downloaded claimed timestamps remain verbatim strings.
+
+### Added
+
+- `PhotoUploadMetadata::last_modification_time`, independent of `capture_time`.
+  An unset modification time is omitted; capture time still defaults to the
+  upload time.
+
+### Breaking
+
+- Modification-time parameters change from `Option<i64>` to
+  `Option<ModificationTime>`. `None` needs no change. For an offset timestamp:
+
+  ```rust
+  use proton_drive_rs::ModificationTime;
+  let modified: ModificationTime = "2026-11-05T09:55:00.1234567+08:00".parse()?;
+  // Pass Some(modified) to create_folder or a streaming upload.
+  ```
+
+  For epoch seconds, add `chrono = "0.4"` to the caller's dependencies and use
+  `chrono::DateTime::from_timestamp(seconds, 0).map(|time| time.fixed_offset())`.
+  This yields a UTC offset and returns `None` for an out-of-range timestamp.
+- `PhotoUploadMetadata` struct literals must provide `last_modification_time`
+  or use `..Default::default()`. Photo uploads no longer copy capture time into
+  modification time; set both fields explicitly when that is intended.
+
 ## [0.10.1] — 2026-10-31
 
 ### Fixed

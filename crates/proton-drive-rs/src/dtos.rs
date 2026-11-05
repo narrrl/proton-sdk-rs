@@ -1488,8 +1488,8 @@ pub struct ExtendedAttributes {
 pub struct CommonExtendedAttributes {
     #[serde(rename = "Size", skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
-    /// ISO-8601 UTC modification timestamp (C# `CommonExtendedAttributes
-    /// .ModificationTime`, written via `Iso8601DateTimeResultJsonConverter`).
+    /// ISO-8601 modification timestamp with UTC offset and fractional seconds
+    /// (C# `CommonExtendedAttributes.ModificationTime`).
     #[serde(rename = "ModificationTime", skip_serializing_if = "Option::is_none")]
     pub modification_time: Option<String>,
     #[serde(rename = "BlockSizes", skip_serializing_if = "Option::is_none")]

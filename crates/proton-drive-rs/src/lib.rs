@@ -45,6 +45,7 @@ mod public_link;
 mod revision;
 mod sharing;
 mod single_flight;
+mod timestamp;
 mod transport;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
@@ -72,5 +73,6 @@ pub use sharing::{
     Bookmark, ExternalInvitation, ExternalInvitationState, IncomingInvitation, MemberRole,
     PublicLink, ShareInvitation, ShareMember, ShareMembership, SharedWithMeItem,
 };
+pub use timestamp::ModificationTime;
 
 pub use proton_sdk;

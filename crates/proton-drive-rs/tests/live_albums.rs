@@ -11,6 +11,60 @@ mod common;
 
 use proton_drive_rs::{PhotoUploadMetadata, ProtonPhotosClient};
 
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn photo_capture_and_modification_times_are_independent() {
+    use proton_drive_rs::{ModificationTime, NodeKind};
+
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let photos = ProtonPhotosClient::from_drive_client(live.client.clone());
+    if photos.get_photos_root().await.unwrap().is_none() {
+        return;
+    }
+    let modified: ModificationTime = "2026-11-05T09:55:00.1234567+08:00".parse().unwrap();
+    for last_modification_time in [None, Some(modified)] {
+        let suffix = common::unique_suffix();
+        let content = format!("timestamp test {suffix}");
+        let photo = photos
+            .upload_photo(
+                &format!("timestamps-{suffix}.jpg"),
+                "image/jpeg",
+                content.as_bytes(),
+                PhotoUploadMetadata {
+                    capture_time: Some(1_700_000_000),
+                    last_modification_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("upload photo");
+        let node = photos.get_node(&photo).await;
+        // Clean up before asserting so a timestamp mismatch leaves no photo.
+        let drive = photos.drive_client();
+        let uids = [photo];
+        common::log_outcomes("trash", &drive.trash_nodes(&uids).await.unwrap());
+        common::log_outcomes("delete", &drive.delete_nodes(&uids).await.unwrap());
+
+        let node = node.expect("read photo").expect("photo exists");
+        assert_eq!(node.photo.unwrap().capture_time, 1_700_000_000);
+        let NodeKind::File {
+            claimed_modification_time,
+            ..
+        } = node.kind
+        else {
+            panic!("photo is a file");
+        };
+        let actual =
+            claimed_modification_time.map(|time| time.parse::<ModificationTime>().unwrap());
+        assert_eq!(actual, last_modification_time);
+        if let Some(actual) = actual {
+            assert_eq!(actual.offset(), modified.offset());
+        }
+    }
+}
+
 /// add → add again → cover → remove → add → delete keeping photos, on a photo
 /// that is also in the timeline.
 #[tokio::test]

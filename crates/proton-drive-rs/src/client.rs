@@ -97,6 +97,7 @@ use crate::sharing::{
     PublicLink, ShareInvitation, ShareMember, ShareMembership, SharedWithMeItem,
 };
 use crate::single_flight::SingleFlight;
+use crate::timestamp::{ModificationTime, format_modification_time};
 use crate::transport::{DEFAULT_BLOCK_SIZE, RevisionTransport, rank_block_sizes};
 
 /// Maximum encrypted multipart size accepted by the atomic upload endpoint.
@@ -2215,6 +2216,9 @@ impl ProtonDriveClient {
     /// size recorded in the revision's extended attributes is the actual number
     /// of bytes streamed.
     ///
+    /// `last_modification_time` preserves its UTC offset and fractional seconds;
+    /// `None` omits the modification timestamp.
+    ///
     /// `thumbnails` are caller-rendered preview images attached to the revision;
     /// pass an empty `Vec` for none. They are uploaded before the content blocks
     /// and their ciphertext digests lead the content manifest.
@@ -2235,7 +2239,7 @@ impl ProtonDriveClient {
         reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
-        last_modification_time: Option<i64>,
+        last_modification_time: Option<ModificationTime>,
         aead: bool,
     ) -> Result<NodeUid> {
         self.upload_file_from_inner(
@@ -2270,7 +2274,7 @@ impl ProtonDriveClient {
         reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
-        last_modification_time: Option<i64>,
+        last_modification_time: Option<ModificationTime>,
         aead: bool,
     ) -> Result<NodeUid> {
         self.upload_file_from_inner(
@@ -2296,7 +2300,7 @@ impl ProtonDriveClient {
         reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
-        last_modification_time: Option<i64>,
+        last_modification_time: Option<ModificationTime>,
         aead: bool,
         override_existing_draft: bool,
     ) -> Result<NodeUid> {
@@ -2356,7 +2360,7 @@ impl ProtonDriveClient {
         &self,
         file_uid: &NodeUid,
         contents: &[u8],
-        modification_time: Option<i64>,
+        modification_time: Option<ModificationTime>,
     ) -> Result<()> {
         let details = self
             .get_link_details(&file_uid.volume_id, std::slice::from_ref(&file_uid.link_id))
@@ -2413,7 +2417,7 @@ impl ProtonDriveClient {
         let extended_attributes = ExtendedAttributes {
             common: CommonExtendedAttributes {
                 size: Some(contents.len() as i64),
-                modification_time: modification_time.map(epoch_to_iso8601),
+                modification_time: modification_time.map(format_modification_time),
                 block_sizes: Some(block_sizes),
                 digests: Some(FileContentDigests {
                     sha1: hex::encode(Sha1::digest(contents)),
@@ -2455,7 +2459,7 @@ impl ProtonDriveClient {
         reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
-        last_modification_time: Option<i64>,
+        last_modification_time: Option<ModificationTime>,
     ) -> Result<()> {
         let mut timer = self.telemetry.start("upload_new_revision");
         let draft = self.create_revision_draft(file_uid, intended_size).await?;
@@ -2523,7 +2527,7 @@ impl ProtonDriveClient {
         self.seal_revision(
             &draft,
             &written,
-            metadata.capture_time,
+            metadata.last_modification_time,
             Some(photos_attributes),
         )
         .await?;
@@ -2533,7 +2537,8 @@ impl ProtonDriveClient {
     }
 
     /// Create a new (empty) folder named `name` under `parent_uid`, returning
-    /// its [`NodeUid`].
+    /// its [`NodeUid`]. The optional modification time preserves its UTC offset
+    /// and fractional seconds.
     ///
     /// Mirrors C# `NodeOperations.CreateFolderAsync` / `FolderCreationRequest`:
     /// generate a node key plus the folder's own child-name hash key, encrypt
@@ -2543,7 +2548,7 @@ impl ProtonDriveClient {
         &self,
         parent_uid: &NodeUid,
         name: &str,
-        last_modification_time: Option<i64>,
+        last_modification_time: Option<ModificationTime>,
     ) -> Result<NodeUid> {
         let mut timer = self.telemetry.start("create_folder");
         validate_node_name(name)?;
@@ -2573,7 +2578,7 @@ impl ProtonDriveClient {
                 let xattr = ExtendedAttributes {
                     common: CommonExtendedAttributes {
                         size: None,
-                        modification_time: last_modification_time.map(epoch_to_iso8601),
+                        modification_time: last_modification_time.map(format_modification_time),
                         block_sizes: None,
                         digests: None,
                     },
@@ -5357,7 +5362,7 @@ impl ProtonDriveClient {
         &self,
         draft: &RevisionDraft,
         written: &BlockWriteResult,
-        modification_time: Option<i64>,
+        modification_time: Option<ModificationTime>,
         photos_attributes: Option<PhotosAttributesDto>,
     ) -> Result<()> {
         let manifest_signature = draft.signing_key.sign_detached(&written.manifest)?;
@@ -5365,7 +5370,7 @@ impl ProtonDriveClient {
         let extended_attributes = ExtendedAttributes {
             common: CommonExtendedAttributes {
                 size: Some(written.total_size),
-                modification_time: modification_time.map(epoch_to_iso8601),
+                modification_time: modification_time.map(format_modification_time),
                 block_sizes: Some(written.block_sizes.clone()),
                 digests: Some(FileContentDigests {
                     sha1: written.sha1_hex.clone(),
@@ -8195,32 +8200,6 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// Format a Unix epoch (seconds, UTC) as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`
-/// string for the `ExtendedAttributes.ModificationTime` field. C# writes the
-/// round-trip ("O") format; this drops the fractional-second component, which
-/// the consuming parser (`DateTimeOffset.TryParse`, RoundtripKind) tolerates.
-/// Uses the civil-from-days algorithm (Howard Hinnant) so no date dependency is
-/// needed.
-fn epoch_to_iso8601(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-
-    // days since 1970-01-01 -> civil (year, month, day)
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
 /// Split a caller-supplied path into its non-empty segments.
 ///
 /// Leading, trailing, and repeated separators are ignored, so `/a/b/`, `a/b`,
@@ -8980,9 +8959,9 @@ mod tests {
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
         MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_file_names,
         alternate_folder_names, assemble_manifest, context_share_path, drive_items,
-        epoch_to_iso8601, has_active_regular_volume, is_expired_upload_token,
-        is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
-        path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
+        has_active_regular_volume, is_expired_upload_token, is_listable_revision_state,
+        is_upload_timeout, join_node_path, missing_related_links, path_segments,
+        photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
         run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
         small_upload_should_fall_back, split_link_password, take_block_target,
         take_thumbnail_target, to_drive_event, validate_node_name,
@@ -9375,17 +9354,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn epoch_formats_as_iso8601_utc() {
-        // 2026-06-26T14:01:00Z
-        assert_eq!(epoch_to_iso8601(1_782_482_460), "2026-06-26T14:01:00Z");
-        // Unix epoch and a pre-1970 (negative) instant.
-        assert_eq!(epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
-        assert_eq!(epoch_to_iso8601(-1), "1969-12-31T23:59:59Z");
-        // A leap-day timestamp: 2024-02-29T12:00:00Z.
-        assert_eq!(epoch_to_iso8601(1_709_208_000), "2024-02-29T12:00:00Z");
-    }
-
     fn event(event_type: i32, parent: Option<&str>) -> VolumeEventDto {
         VolumeEventDto {
             id: DriveEventId::new("evt-1"),
@@ -9504,6 +9472,7 @@ mod tests {
         };
         let metadata = PhotoUploadMetadata {
             capture_time: Some(1_700_000_000),
+            last_modification_time: Some("2026-11-05T09:55:00.1234567+08:00".parse().unwrap()),
             main_photo_uid: Some(NodeUid::new(
                 VolumeId::new("vol-1"),
                 LinkId::new("main-link"),
