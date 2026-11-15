@@ -57,6 +57,7 @@ mod tests {
                     block_sizes: None,
                     digests: None,
                 },
+                location: None,
             };
             let json = serde_json::to_vec(&attrs).unwrap();
             let encrypted = node
@@ -77,6 +78,7 @@ mod tests {
                 block_sizes: None,
                 digests: None,
             },
+            location: None,
         };
         assert_eq!(
             serde_json::to_value(attrs).unwrap(),

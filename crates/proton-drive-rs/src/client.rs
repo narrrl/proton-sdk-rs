@@ -63,11 +63,11 @@ use crate::dtos::{
     InvitationsListResponse, InviteEmailDetailsDto, InviteExternalUserRequest,
     InviteExternalUserResponse, InviteProtonUserInvitationDto, InviteProtonUserRequest,
     InviteProtonUserResponse, LatestVolumeEventResponse, LinkDetailsDto, LinkDetailsRequest,
-    LinkDetailsResponse, LinkDto, LinkType, ModulusResponse, MoveLinkRequest,
-    MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest, MyFilesShareResponse,
-    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, PhotoTagsRequest,
-    PhotosAttributesDto, PublicLinkSettingsDto, RemovePhotosFromAlbumRequest, RenameLinkRequest,
-    ReportRecentlyAccessedItem, ReportRecentlyAccessedRequest, RevisionConflict,
+    LinkDetailsResponse, LinkDto, LinkType, LocationExtendedAttributes, ModulusResponse,
+    MoveLinkRequest, MoveMultipleLinksItem, MoveMultipleLinksRequest, MultipleLinksRequest,
+    MyFilesShareResponse, NodeNameAvailabilityRequest, NodeNameAvailabilityResponse,
+    PhotoTagsRequest, PhotosAttributesDto, PublicLinkSettingsDto, RemovePhotosFromAlbumRequest,
+    RenameLinkRequest, ReportRecentlyAccessedItem, ReportRecentlyAccessedRequest, RevisionConflict,
     RevisionCreationRequest, RevisionCreationResponse, RevisionDto, RevisionListItemDto,
     RevisionListResponse, RevisionMetadataResponse, RevisionUpdateRequest, ShareInvitationDto,
     ShareInvitationsResponse, ShareMembersResponse, ShareMembershipSummaryDto, ShareResponse,
@@ -2177,6 +2177,7 @@ impl ProtonDriveClient {
                 block_sizes: Some(block_sizes),
                 digests: Some(FileContentDigests { sha1: sha1_hex }),
             },
+            location: None,
         };
         let encrypted_xattr = node.key.encrypt_and_sign(
             &signing_key,
@@ -2319,10 +2320,21 @@ impl ProtonDriveClient {
             .await?;
         let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
 
-        let written = self.write_blocks(&draft, reader, thumbnails).await?;
+        let written = match self.write_blocks(&draft, reader, thumbnails).await {
+            Ok(written) => written,
+            Err(error) => {
+                self.abandon_file_draft(&draft, &error, false).await;
+                return Err(error);
+            }
+        };
         timer.attr("size", written.total_size);
-        self.seal_revision(&draft, &written, last_modification_time, None)
-            .await?;
+        if let Err(error) = self
+            .seal_revision(&draft, &written, last_modification_time, None, None)
+            .await
+        {
+            self.abandon_file_draft(&draft, &error, true).await;
+            return Err(error);
+        }
 
         timer.success();
         Ok(file_uid)
@@ -2423,6 +2435,7 @@ impl ProtonDriveClient {
                     sha1: hex::encode(Sha1::digest(contents)),
                 }),
             },
+            location: None,
         };
         let encrypted_xattr = node_key.encrypt_and_sign(
             &signing_key,
@@ -2466,7 +2479,7 @@ impl ProtonDriveClient {
 
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
         timer.attr("size", written.total_size);
-        self.seal_revision(&draft, &written, last_modification_time, None)
+        self.seal_revision(&draft, &written, last_modification_time, None, None)
             .await?;
 
         timer.success();
@@ -2516,21 +2529,33 @@ impl ProtonDriveClient {
                 intended_upload_size: intended_size,
                 aead,
                 for_photos: true,
-                override_existing_draft: false,
+                override_existing_draft: metadata.replace_existing_draft,
             })
             .await?;
         let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
 
-        let written = self.write_blocks(&draft, reader, thumbnails).await?;
+        let written = match self.write_blocks(&draft, reader, thumbnails).await {
+            Ok(written) => written,
+            Err(error) => {
+                self.abandon_file_draft(&draft, &error, false).await;
+                return Err(error);
+            }
+        };
         timer.attr("size", written.total_size);
         let photos_attributes = build_photos_attributes(&draft.parent_hash_key, &written, metadata);
-        self.seal_revision(
-            &draft,
-            &written,
-            metadata.last_modification_time,
-            Some(photos_attributes),
-        )
-        .await?;
+        if let Err(error) = self
+            .seal_revision(
+                &draft,
+                &written,
+                metadata.last_modification_time,
+                Some(photos_attributes),
+                metadata.location,
+            )
+            .await
+        {
+            self.abandon_file_draft(&draft, &error, true).await;
+            return Err(error);
+        }
 
         timer.success();
         Ok(file_uid)
@@ -2582,6 +2607,7 @@ impl ProtonDriveClient {
                         block_sizes: None,
                         digests: None,
                     },
+                    location: None,
                 };
                 let xattr_json = serde_json::to_vec(&xattr).map_err(|e| {
                     ProtonError::invalid_operation(format!("serialize folder xattr: {e}"))
@@ -5039,6 +5065,27 @@ impl ProtonDriveClient {
         }
     }
 
+    /// Delete the draft of a new file whose upload failed, so it does not stand
+    /// in the way of the next attempt at that name. Mirrors C# `RevisionDraft`
+    /// disposal and TS `fileUploader` `deleteDraftNode`. Best effort: the
+    /// caller reports the upload's own error, a failed cleanup is only logged.
+    ///
+    /// `sealing` says the failure came from the seal request. A seal lost in
+    /// transit may still have been applied, and deleting the link would then
+    /// delete the file that was just committed, so after a seal only a definite
+    /// rejection by the server is cleaned up.
+    async fn abandon_file_draft(&self, draft: &RevisionDraft, error: &ProtonError, sealing: bool) {
+        if !draft_cleanup_is_safe(error, sealing) {
+            return;
+        }
+        if let Err(cleanup) = self
+            .delete_draft_nodes(&draft.volume_id, std::slice::from_ref(&draft.link_id))
+            .await
+        {
+            tracing::debug!(error = %cleanup, link = %draft.link_id, "deleting an abandoned upload draft failed");
+        }
+    }
+
     /// Encrypt, sign, verify and upload every content block of a draft revision,
     /// accumulating the content manifest and extended-attribute metadata.
     ///
@@ -5364,6 +5411,7 @@ impl ProtonDriveClient {
         written: &BlockWriteResult,
         modification_time: Option<ModificationTime>,
         photos_attributes: Option<PhotosAttributesDto>,
+        location: Option<PhotoLocation>,
     ) -> Result<()> {
         let manifest_signature = draft.signing_key.sign_detached(&written.manifest)?;
 
@@ -5376,6 +5424,10 @@ impl ProtonDriveClient {
                     sha1: written.sha1_hex.clone(),
                 }),
             },
+            location: location.map(|location| LocationExtendedAttributes {
+                latitude: location.latitude,
+                longitude: location.longitude,
+            }),
         };
         let xattr_json = serde_json::to_vec(&extended_attributes)
             .map_err(|e| ProtonError::invalid_operation(format!("serialize xattr: {e}")))?;
@@ -6010,8 +6062,6 @@ impl ProtonDriveClient {
         name: &str,
         contents: &[u8],
     ) -> Result<Vec<NodeUid>> {
-        const ACTIVE_LINK_STATE: i32 = 1;
-
         if !self.ensure_photos().await? {
             return Err(ProtonError::invalid_operation(
                 "account has no photos volume",
@@ -6041,33 +6091,17 @@ impl ProtonDriveClient {
             )
             .await?;
 
-        let candidates: Vec<_> = response
-            .duplicate_hashes
-            .into_iter()
-            .filter(|duplicate| {
-                duplicate.link_id.is_some()
-                    && duplicate.link_state == Some(ACTIVE_LINK_STATE)
-                    && !duplicate.name_hash.is_empty()
-                    && !duplicate.content_hash.is_empty()
-            })
-            .collect();
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let sha1_hex = hex::encode(Sha1::digest(contents));
         let content_hash = hex::encode(hmac_sha256(&hash_key, sha1_hex.as_bytes()));
-        Ok(candidates
-            .into_iter()
-            .filter(|duplicate| {
-                duplicate.name_hash.eq_ignore_ascii_case(&name_hash)
-                    && duplicate.content_hash.eq_ignore_ascii_case(&content_hash)
-            })
-            .map(|duplicate| {
-                NodeUid::new(
-                    photos_root.volume_id.clone(),
-                    duplicate.link_id.expect("candidate link id checked above"),
-                )
+        Ok(response
+            .duplicate_hashes
+            .iter()
+            .filter_map(|duplicate| {
+                let (link_id, found_name_hash) = duplicate.active_name_hash()?;
+                let found_content_hash = duplicate.known_content_hash()?;
+                (found_name_hash == name_hash
+                    && found_content_hash.eq_ignore_ascii_case(&content_hash))
+                .then(|| NodeUid::new(photos_root.volume_id.clone(), link_id.clone()))
             })
             .collect())
     }
@@ -6087,7 +6121,6 @@ impl ProtonDriveClient {
         &self,
         items: &[(String, String)],
     ) -> Result<Vec<Vec<NodeUid>>> {
-        const ACTIVE_LINK_STATE: i32 = 1;
         /// Name hashes per duplicates request.
         const DUPLICATE_BATCH: usize = 150;
 
@@ -6145,26 +6178,22 @@ impl ProtonDriveClient {
                 )
                 .await?;
 
-            for duplicate in response.duplicate_hashes {
-                let Some(link_id) = duplicate.link_id else {
+            for duplicate in &response.duplicate_hashes {
+                // Drafts (an interrupted upload), trashed and deleted links
+                // are not duplicates; neither is a candidate the server sent
+                // without hashes.
+                let (Some((link_id, found_name_hash)), Some(found_content_hash)) =
+                    (duplicate.active_name_hash(), duplicate.known_content_hash())
+                else {
                     continue;
                 };
-                if duplicate.link_state != Some(ACTIVE_LINK_STATE)
-                    || duplicate.name_hash.is_empty()
-                    || duplicate.content_hash.is_empty()
-                {
-                    continue;
-                }
                 // The server echoes the name hash it matched; find the inputs
                 // that asked for it and keep the ones whose content agrees too.
-                let Some(indices) = positions.get(&duplicate.name_hash.to_ascii_lowercase()) else {
+                let Some(indices) = positions.get(&found_name_hash) else {
                     continue;
                 };
                 for &index in indices {
-                    if duplicate
-                        .content_hash
-                        .eq_ignore_ascii_case(&content_hashes[index])
-                    {
+                    if found_content_hash.eq_ignore_ascii_case(&content_hashes[index]) {
                         out[index]
                             .push(NodeUid::new(photos_root.volume_id.clone(), link_id.clone()));
                     }
@@ -6182,7 +6211,6 @@ impl ProtonDriveClient {
     /// therefore no reading of the candidate files. A `true` is "maybe a
     /// duplicate, hash it and ask again"; a `false` is conclusive.
     pub(crate) async fn photo_name_collisions(&self, names: &[String]) -> Result<Vec<bool>> {
-        const ACTIVE_LINK_STATE: i32 = 1;
         const DUPLICATE_BATCH: usize = 150;
 
         let mut out = vec![false; names.len()];
@@ -6230,11 +6258,11 @@ impl ProtonDriveClient {
                     },
                 )
                 .await?;
-            for duplicate in response.duplicate_hashes {
-                if duplicate.link_id.is_none() || duplicate.link_state != Some(ACTIVE_LINK_STATE) {
+            for duplicate in &response.duplicate_hashes {
+                let Some((_, found_name_hash)) = duplicate.active_name_hash() else {
                     continue;
-                }
-                if let Some(indices) = positions.get(&duplicate.name_hash.to_ascii_lowercase()) {
+                };
+                if let Some(indices) = positions.get(&found_name_hash) {
                     for &index in indices {
                         out[index] = true;
                     }
@@ -8472,6 +8500,15 @@ fn build_photos_attributes(
     }
 }
 
+/// Whether a new file's draft may be deleted after its upload failed with
+/// `error`. Before the seal the link holds no committed revision, so it always
+/// may. After a failed seal only a definite, non-retriable rejection by the API
+/// proves the revision was not committed; a transport error or a 5xx might
+/// have been applied before the response was lost.
+fn draft_cleanup_is_safe(error: &ProtonError, sealing: bool) -> bool {
+    !sealing || (matches!(error, ProtonError::Api(_)) && !error.is_retriable())
+}
+
 /// HMAC-SHA256 of `data` under `key` (the parent folder hash key).
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key length");
@@ -9478,6 +9515,7 @@ mod tests {
                 LinkId::new("main-link"),
             )),
             tags: vec![PhotoTag::Video, PhotoTag::Selfie],
+            ..Default::default()
         };
 
         let attrs = build_photos_attributes(&hash_key, &written, &metadata);
@@ -9492,6 +9530,64 @@ mod tests {
             attrs.tags,
             vec![PhotoTag::Video as i32, PhotoTag::Selfie as i32]
         );
+    }
+
+    #[test]
+    fn draft_cleanup_only_after_a_definite_seal_rejection() {
+        use super::draft_cleanup_is_safe;
+        use proton_sdk::api::ResponseCode;
+        use proton_sdk::error::ProtonApiError;
+
+        let api = |code, http_status| {
+            ProtonError::Api(ProtonApiError {
+                code,
+                http_status,
+                message: String::new(),
+                details: None,
+            })
+        };
+        let rejected = api(ResponseCode::InvalidRequirements, 422);
+        let unavailable = api(ResponseCode::Unknown, 503);
+        let lost = ProtonError::invalid_operation("connection reset");
+
+        // Blocks never reached the seal: the draft holds nothing committed.
+        assert!(draft_cleanup_is_safe(&lost, false));
+        assert!(draft_cleanup_is_safe(&unavailable, false));
+        // The seal may have been applied unless the server clearly refused it.
+        assert!(draft_cleanup_is_safe(&rejected, true));
+        assert!(!draft_cleanup_is_safe(&unavailable, true));
+        assert!(!draft_cleanup_is_safe(&lost, true));
+    }
+
+    #[test]
+    fn photo_xattr_carries_location_only_when_set() {
+        use crate::dtos::{
+            CommonExtendedAttributes, ExtendedAttributes, LocationExtendedAttributes,
+        };
+
+        let common = || CommonExtendedAttributes {
+            size: Some(3),
+            modification_time: None,
+            block_sizes: None,
+            digests: None,
+        };
+        let with = serde_json::to_value(ExtendedAttributes {
+            common: common(),
+            location: Some(LocationExtendedAttributes {
+                latitude: 64.1466,
+                longitude: -21.9426,
+            }),
+        })
+        .unwrap();
+        assert_eq!(with["Location"]["Latitude"], 64.1466);
+        assert_eq!(with["Location"]["Longitude"], -21.9426);
+
+        let without = serde_json::to_value(ExtendedAttributes {
+            common: common(),
+            location: None,
+        })
+        .unwrap();
+        assert!(without.get("Location").is_none());
     }
 
     #[test]

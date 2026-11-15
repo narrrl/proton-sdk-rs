@@ -10,6 +10,21 @@ use proton_sdk::ids::{
     AddressId, AddressKeyId, DeviceUid, DriveEventId, LinkId, ShareId, ShareMembershipId, VolumeId,
 };
 
+/// Read an explicit JSON `null` as the type's default.
+///
+/// `#[serde(default)]` only covers a field that is *missing*; a field that is
+/// present as `null` still goes to `T::deserialize` and fails for `String`,
+/// `Vec` and the like. The API sends `null` for many "empty" values, so a field
+/// that has a sensible default takes both: `#[serde(default, deserialize_with =
+/// "null_as_default")]`.
+pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// `GET v2/shares/my-files`
 #[derive(Debug, Deserialize)]
 pub struct MyFilesShareResponse {
@@ -101,23 +116,53 @@ pub struct FindPhotoDuplicatesRequest {
 /// `POST volumes/{vid}/photos/duplicates` response.
 #[derive(Debug, Deserialize)]
 pub struct FindPhotoDuplicatesResponse {
-    #[serde(rename = "DuplicateHashes", default)]
+    #[serde(
+        rename = "DuplicateHashes",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub duplicate_hashes: Vec<FoundPhotoDuplicateDto>,
 }
 
 /// One server-side photo duplicate candidate.
+///
+/// Every field is nullable on the wire (API schema `FoundDuplicate`): a draft
+/// left by an interrupted upload has no `ContentHash` yet, and a deleted link
+/// has no `LinkID`. Callers skip candidates that lack what they match on.
 #[derive(Debug, Deserialize)]
 pub struct FoundPhotoDuplicateDto {
     #[serde(rename = "Hash", default)]
-    pub name_hash: String,
+    pub name_hash: Option<String>,
     #[serde(rename = "ContentHash", default)]
-    pub content_hash: String,
+    pub content_hash: Option<String>,
     #[serde(rename = "LinkState")]
     pub link_state: Option<i32>,
     #[serde(rename = "ClientUID")]
     pub client_uid: Option<String>,
     #[serde(rename = "LinkID")]
     pub link_id: Option<LinkId>,
+}
+
+impl FoundPhotoDuplicateDto {
+    /// `LinkState` of a committed photo (0 is a draft, 2 trashed).
+    const ACTIVE: i32 = 1;
+
+    /// The link and lowercase name hash of an *active* photo. `None` for a
+    /// draft left by an interrupted upload, a trashed or deleted link, or a
+    /// candidate the server sent without a name hash.
+    pub fn active_name_hash(&self) -> Option<(&LinkId, String)> {
+        let link_id = self.link_id.as_ref()?;
+        if self.link_state != Some(Self::ACTIVE) {
+            return None;
+        }
+        let hash = self.name_hash.as_deref().filter(|hash| !hash.is_empty())?;
+        Some((link_id, hash.to_ascii_lowercase()))
+    }
+
+    /// The content hash, when the server sent a non-empty one.
+    pub fn known_content_hash(&self) -> Option<&str> {
+        self.content_hash.as_deref().filter(|hash| !hash.is_empty())
+    }
 }
 
 /// One timeline entry (C# `TimelinePhotoDto`). Only the id + capture time are
@@ -148,7 +193,7 @@ pub struct ShareTrashDto {
     pub share_id: ShareId,
     #[serde(rename = "LinkIDs")]
     pub link_ids: Vec<LinkId>,
-    #[serde(rename = "ParentIDs", default)]
+    #[serde(rename = "ParentIDs", default, deserialize_with = "null_as_default")]
     pub parent_ids: Vec<LinkId>,
 }
 
@@ -196,7 +241,7 @@ pub struct ShareMembershipSummaryDto {
     pub share_id: ShareId,
     #[serde(rename = "MembershipID")]
     pub membership_id: ShareMembershipId,
-    #[serde(rename = "Permissions", default)]
+    #[serde(rename = "Permissions", default, deserialize_with = "null_as_default")]
     pub permissions: i32,
     /// When the node was shared with us, epoch seconds.
     #[serde(rename = "InviteTime", default)]
@@ -252,7 +297,7 @@ pub struct PhotoDto {
     #[serde(flatten)]
     pub file: FileDto,
     /// Capture time in seconds since the Unix epoch.
-    #[serde(rename = "CaptureTime", default)]
+    #[serde(rename = "CaptureTime", default, deserialize_with = "null_as_default")]
     pub capture_time: i64,
     /// Lowercase-hex HMAC of the plaintext SHA-1 under the photos root's hash
     /// key — the second half of duplicate detection.
@@ -263,14 +308,18 @@ pub struct PhotoDto {
     #[serde(rename = "MainPhotoLinkID", default)]
     pub main_photo_link_id: Option<LinkId>,
     /// The related photos of this (main) photo.
-    #[serde(rename = "RelatedPhotosLinkIDs", default)]
+    #[serde(
+        rename = "RelatedPhotosLinkIDs",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub related_photo_link_ids: Vec<LinkId>,
     /// Classification tags as their `PhotoTag` discriminants; unknown values are
     /// dropped when the node is built.
-    #[serde(rename = "Tags", default)]
+    #[serde(rename = "Tags", default, deserialize_with = "null_as_default")]
     pub tags: Vec<i32>,
     /// The albums this photo has been added to.
-    #[serde(rename = "Albums", default)]
+    #[serde(rename = "Albums", default, deserialize_with = "null_as_default")]
     pub album_inclusions: Vec<PhotoAlbumInclusionDto>,
 }
 
@@ -279,7 +328,7 @@ pub struct PhotoDto {
 pub struct PhotoAlbumInclusionDto {
     #[serde(rename = "AlbumLinkID")]
     pub album_link_id: LinkId,
-    #[serde(rename = "AddedTime", default)]
+    #[serde(rename = "AddedTime", default, deserialize_with = "null_as_default")]
     pub creation_time: i64,
 }
 
@@ -291,12 +340,16 @@ pub struct AlbumDto {
     pub hash_key: String,
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<String>,
-    #[serde(rename = "PhotoCount", default)]
+    #[serde(rename = "PhotoCount", default, deserialize_with = "null_as_default")]
     pub photo_count: i32,
     #[serde(rename = "CoverLinkID", default)]
     pub cover_link_id: Option<LinkId>,
     /// Epoch seconds of the last change to the album's contents.
-    #[serde(rename = "LastActivityTime", default)]
+    #[serde(
+        rename = "LastActivityTime",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub last_activity_time: i64,
 }
 
@@ -304,9 +357,9 @@ pub struct AlbumDto {
 /// `AnchorID` (C# `AlbumListResponse`).
 #[derive(Debug, Deserialize)]
 pub struct AlbumListResponse {
-    #[serde(rename = "Albums", default)]
+    #[serde(rename = "Albums", default, deserialize_with = "null_as_default")]
     pub albums: Vec<AlbumListItemDto>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<LinkId>,
@@ -322,9 +375,9 @@ pub struct AlbumListItemDto {
 /// capture first, paged on `AnchorID` (C# `AlbumItemListResponse`).
 #[derive(Debug, Deserialize)]
 pub struct AlbumItemListResponse {
-    #[serde(rename = "Photos", default)]
+    #[serde(rename = "Photos", default, deserialize_with = "null_as_default")]
     pub photos: Vec<AlbumItemDto>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<LinkId>,
@@ -334,7 +387,7 @@ pub struct AlbumItemListResponse {
 pub struct AlbumItemDto {
     #[serde(rename = "LinkID")]
     pub id: LinkId,
-    #[serde(rename = "CaptureTime", default)]
+    #[serde(rename = "CaptureTime", default, deserialize_with = "null_as_default")]
     pub capture_time: i64,
 }
 
@@ -342,9 +395,9 @@ pub struct AlbumItemDto {
 /// `v2/sharedwithme` each row carries its own volume (C# `SharedAlbumsResponse`).
 #[derive(Debug, Deserialize)]
 pub struct SharedAlbumsResponse {
-    #[serde(rename = "Albums", default)]
+    #[serde(rename = "Albums", default, deserialize_with = "null_as_default")]
     pub albums: Vec<SharedAlbumDto>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<LinkId>,
@@ -505,7 +558,7 @@ pub struct PhotoLinkOutcome {
 
 #[derive(Debug, Deserialize)]
 pub struct PhotoLinkOutcomeBody {
-    #[serde(rename = "Code", default)]
+    #[serde(rename = "Code", default, deserialize_with = "null_as_default")]
     pub code: i32,
     #[serde(rename = "Error", default)]
     pub error: Option<String>,
@@ -516,7 +569,7 @@ pub struct PhotoLinkOutcomeBody {
 
 #[derive(Debug, Deserialize)]
 pub struct PhotoLinkOutcomeDetails {
-    #[serde(rename = "Missing", default)]
+    #[serde(rename = "Missing", default, deserialize_with = "null_as_default")]
     pub missing: Vec<LinkId>,
 }
 
@@ -566,7 +619,7 @@ pub struct TransferPhotoLinkItem {
 /// `AggregateApiResponse<TransferPhotoResponsePair>`).
 #[derive(Debug, Deserialize)]
 pub struct TransferPhotosResponse {
-    #[serde(rename = "Responses", default)]
+    #[serde(rename = "Responses", default, deserialize_with = "null_as_default")]
     pub responses: Vec<PhotoLinkOutcome>,
 }
 
@@ -708,10 +761,10 @@ pub struct LinkDto {
     pub name_signature_email: Option<String>,
     /// Created by a client other than Proton's own (upstream `f257c20e`, for
     /// telemetry's `CreatedBy`). Absent on older backends, hence `false`.
-    #[serde(rename = "ThirdParty", default)]
+    #[serde(rename = "ThirdParty", default, deserialize_with = "null_as_default")]
     pub third_party: bool,
     /// Created through the SDK; only meaningful with [`third_party`](Self::third_party).
-    #[serde(rename = "Sdk", default)]
+    #[serde(rename = "Sdk", default, deserialize_with = "null_as_default")]
     pub sdk: bool,
 }
 
@@ -773,10 +826,10 @@ pub struct ActiveRevisionDto {
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<String>,
     /// As [`LinkDto::third_party`], for the revision (upstream `f257c20e`).
-    #[serde(rename = "ThirdParty", default)]
+    #[serde(rename = "ThirdParty", default, deserialize_with = "null_as_default")]
     pub third_party: bool,
     /// As [`LinkDto::sdk`], for the revision.
-    #[serde(rename = "Sdk", default)]
+    #[serde(rename = "Sdk", default, deserialize_with = "null_as_default")]
     pub sdk: bool,
 }
 
@@ -844,9 +897,9 @@ pub struct RevisionDto {
     pub signature_email: Option<String>,
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<String>,
-    #[serde(rename = "Thumbnails", default)]
+    #[serde(rename = "Thumbnails", default, deserialize_with = "null_as_default")]
     pub thumbnails: Vec<ThumbnailDto>,
-    #[serde(rename = "Blocks", default)]
+    #[serde(rename = "Blocks", default, deserialize_with = "null_as_default")]
     pub blocks: Vec<BlockDto>,
 }
 
@@ -887,9 +940,9 @@ pub struct ThumbnailBlockListRequest {
 /// `POST volumes/{vid}/thumbnails` response (C# `ThumbnailBlockListResponse`).
 #[derive(Debug, Deserialize)]
 pub struct ThumbnailBlockListResponse {
-    #[serde(rename = "Thumbnails", default)]
+    #[serde(rename = "Thumbnails", default, deserialize_with = "null_as_default")]
     pub blocks: Vec<ThumbnailBlock>,
-    #[serde(rename = "Errors", default)]
+    #[serde(rename = "Errors", default, deserialize_with = "null_as_default")]
     pub errors: Vec<ThumbnailBlockError>,
 }
 
@@ -912,7 +965,7 @@ pub struct ThumbnailBlockError {
     pub thumbnail_id: String,
     #[serde(rename = "Error")]
     pub error: String,
-    #[serde(rename = "Code", default)]
+    #[serde(rename = "Code", default, deserialize_with = "null_as_default")]
     pub code: i32,
 }
 
@@ -1249,9 +1302,17 @@ pub struct NodeNameAvailabilityRequest {
 /// subset of the requested hashes that are available, plus the taken ones.
 #[derive(Debug, Deserialize)]
 pub struct NodeNameAvailabilityResponse {
-    #[serde(rename = "AvailableHashes", default)]
+    #[serde(
+        rename = "AvailableHashes",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub available_hashes: Vec<String>,
-    #[serde(rename = "PendingHashes", default)]
+    #[serde(
+        rename = "PendingHashes",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub unavailable_hashes: Vec<NameHashUnavailabilityDto>,
 }
 
@@ -1280,7 +1341,7 @@ pub struct MultipleLinksRequest<'a> {
 /// in each [`LinkIdResponsePair`]. Mirrors C# `AggregateApiResponse<LinkIdResponsePair>`.
 #[derive(Debug, Deserialize)]
 pub struct AggregateLinksResponse {
-    #[serde(rename = "Responses", default)]
+    #[serde(rename = "Responses", default, deserialize_with = "null_as_default")]
     pub responses: Vec<LinkIdResponsePair>,
 }
 
@@ -1409,7 +1470,11 @@ pub struct ThumbnailCreationRequest {
 pub struct BlockUploadPreparationResponse {
     #[serde(rename = "UploadLinks")]
     pub upload_targets: Vec<BlockUploadTarget>,
-    #[serde(rename = "ThumbnailLinks", default)]
+    #[serde(
+        rename = "ThumbnailLinks",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub thumbnail_upload_targets: Vec<BlockUploadTarget>,
 }
 
@@ -1478,6 +1543,19 @@ pub struct PhotosAttributesDto {
 pub struct ExtendedAttributes {
     #[serde(rename = "Common")]
     pub common: CommonExtendedAttributes,
+    /// Where a photo was taken (TS `FileExtendedAttributesSchema.Location`).
+    /// Only photo uploads set it; omitted otherwise.
+    #[serde(rename = "Location", skip_serializing_if = "Option::is_none")]
+    pub location: Option<LocationExtendedAttributes>,
+}
+
+/// `Location` in the upload-side `XAttr` payload: WGS 84 decimal degrees.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LocationExtendedAttributes {
+    #[serde(rename = "Latitude")]
+    pub latitude: f64,
+    #[serde(rename = "Longitude")]
+    pub longitude: f64,
 }
 
 /// All fields are optional, mirroring C# `CommonExtendedAttributes` (every
@@ -1520,7 +1598,7 @@ pub struct VolumeEventListResponse {
     /// Cursor to use for the next request (the last event id in this page).
     #[serde(rename = "EventID")]
     pub last_event_id: DriveEventId,
-    #[serde(rename = "Events", default)]
+    #[serde(rename = "Events", default, deserialize_with = "null_as_default")]
     pub events: Vec<VolumeEventDto>,
     /// More pages exist beyond this one.
     #[serde(rename = "More")]
@@ -1549,9 +1627,9 @@ pub struct VolumeEventLinkDto {
     pub id: LinkId,
     #[serde(rename = "ParentLinkID")]
     pub parent_id: Option<LinkId>,
-    #[serde(rename = "IsShared", default)]
+    #[serde(rename = "IsShared", default, deserialize_with = "null_as_default")]
     pub is_shared: bool,
-    #[serde(rename = "IsTrashed", default)]
+    #[serde(rename = "IsTrashed", default, deserialize_with = "null_as_default")]
     pub is_trashed: bool,
 }
 
@@ -1572,12 +1650,12 @@ pub struct ShareResponse {
 /// C# `SharedWithMeResponse`.
 #[derive(Debug, Deserialize)]
 pub struct SharedWithMeResponse {
-    #[serde(rename = "Links", default)]
+    #[serde(rename = "Links", default, deserialize_with = "null_as_default")]
     pub links: Vec<SharedWithMeLinkDto>,
     /// Cursor for the next page.
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<String>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
 }
 
@@ -1591,7 +1669,11 @@ pub struct SharedWithMeLinkDto {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
     /// What kind of item is shared. See [`ShareTargetType`].
-    #[serde(rename = "ShareTargetType", default)]
+    #[serde(
+        rename = "ShareTargetType",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub share_target_type: i32,
 }
 
@@ -1600,12 +1682,12 @@ pub struct SharedWithMeLinkDto {
 /// TS SDK `SharedByMeResponseDto`.
 #[derive(Debug, Deserialize)]
 pub struct SharedByMeResponse {
-    #[serde(rename = "Links", default)]
+    #[serde(rename = "Links", default, deserialize_with = "null_as_default")]
     pub links: Vec<SharedByMeLinkDto>,
     /// Cursor for the next page.
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<String>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
 }
 
@@ -1668,7 +1750,7 @@ impl ShareTargetType {
 /// `GET devices` — the account's registered devices. C# `DeviceListResponse`.
 #[derive(Debug, Deserialize)]
 pub struct DeviceListResponse {
-    #[serde(rename = "Devices", default)]
+    #[serde(rename = "Devices", default, deserialize_with = "null_as_default")]
     pub devices: Vec<DeviceListItemDto>,
 }
 
@@ -2067,7 +2149,11 @@ pub struct CreateShareResponse {
 pub struct CreatedShareDto {
     #[serde(rename = "ID")]
     pub id: ShareId,
-    #[serde(rename = "EditorsCanShare", default)]
+    #[serde(
+        rename = "EditorsCanShare",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub editors_can_share: bool,
 }
 
@@ -2116,7 +2202,7 @@ pub struct InviteProtonUserResponse {
 /// `GET v2/shares/{shareID}/invitations`
 #[derive(Debug, Deserialize)]
 pub struct ShareInvitationsResponse {
-    #[serde(rename = "Invitations", default)]
+    #[serde(rename = "Invitations", default, deserialize_with = "null_as_default")]
     pub invitations: Vec<ShareInvitationDto>,
 }
 
@@ -2130,14 +2216,14 @@ pub struct ShareInvitationDto {
     pub invitee_email: String,
     #[serde(rename = "Permissions", default)]
     pub permissions: Option<i32>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
 }
 
 /// `GET v2/shares/{shareID}/members`
 #[derive(Debug, Deserialize)]
 pub struct ShareMembersResponse {
-    #[serde(rename = "Members", default)]
+    #[serde(rename = "Members", default, deserialize_with = "null_as_default")]
     pub members: Vec<ShareMemberDto>,
 }
 
@@ -2151,7 +2237,7 @@ pub struct ShareMemberDto {
     pub email: String,
     #[serde(rename = "Permissions", default)]
     pub permissions: Option<i32>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
 }
 
@@ -2171,9 +2257,9 @@ pub struct UpdatePermissionsRequest {
 /// `GET v2/shares/invitations` — the invitations where we are the invitee.
 #[derive(Debug, Deserialize)]
 pub struct InvitationsListResponse {
-    #[serde(rename = "Invitations", default)]
+    #[serde(rename = "Invitations", default, deserialize_with = "null_as_default")]
     pub invitations: Vec<InvitationListItemDto>,
-    #[serde(rename = "More", default)]
+    #[serde(rename = "More", default, deserialize_with = "null_as_default")]
     pub more: bool,
     #[serde(rename = "AnchorID", default)]
     pub anchor_id: Option<String>,
@@ -2183,9 +2269,13 @@ pub struct InvitationsListResponse {
 pub struct InvitationListItemDto {
     #[serde(rename = "InvitationID")]
     pub invitation_id: String,
-    #[serde(rename = "ShareID", default)]
+    #[serde(rename = "ShareID", default, deserialize_with = "null_as_default")]
     pub share_id: String,
-    #[serde(rename = "ShareTargetType", default)]
+    #[serde(
+        rename = "ShareTargetType",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub share_target_type: i32,
 }
 
@@ -2211,11 +2301,15 @@ pub struct IncomingInvitationDto {
     pub invitee_email: String,
     #[serde(rename = "KeyPacket")]
     pub key_packet: String,
-    #[serde(rename = "KeyPacketSignature", default)]
+    #[serde(
+        rename = "KeyPacketSignature",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub key_packet_signature: String,
     #[serde(rename = "Permissions", default)]
     pub permissions: Option<i32>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
 }
 
@@ -2225,11 +2319,15 @@ pub struct InvitationShareDto {
     pub share_key: String,
     #[serde(rename = "Passphrase")]
     pub passphrase: String,
-    #[serde(rename = "CreatorEmail", default)]
+    #[serde(rename = "CreatorEmail", default, deserialize_with = "null_as_default")]
     pub creator_email: String,
     #[serde(rename = "VolumeID")]
     pub volume_id: String,
-    #[serde(rename = "ShareTargetType", default)]
+    #[serde(
+        rename = "ShareTargetType",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub share_target_type: i32,
 }
 
@@ -2237,7 +2335,7 @@ pub struct InvitationShareDto {
 pub struct InvitationLinkDto {
     #[serde(rename = "LinkID")]
     pub link_id: String,
-    #[serde(rename = "Type", default)]
+    #[serde(rename = "Type", default, deserialize_with = "null_as_default")]
     pub link_type: i32,
     #[serde(rename = "MIMEType", default)]
     pub mime_type: Option<String>,
@@ -2288,7 +2386,11 @@ pub struct InviteExternalUserResponse {
 /// `GET v2/shares/{shareID}/external-invitations`.
 #[derive(Debug, Deserialize)]
 pub struct ExternalInvitationsResponse {
-    #[serde(rename = "ExternalInvitations", default)]
+    #[serde(
+        rename = "ExternalInvitations",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub external_invitations: Vec<ExternalInvitationResponseDto>,
 }
 
@@ -2302,10 +2404,10 @@ pub struct ExternalInvitationResponseDto {
     pub invitee_email: String,
     #[serde(rename = "Permissions", default)]
     pub permissions: Option<i32>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
     /// `1` = pending (invitee has no Proton account yet), else user-registered.
-    #[serde(rename = "State", default)]
+    #[serde(rename = "State", default, deserialize_with = "null_as_default")]
     pub state: i32,
 }
 
@@ -2316,7 +2418,7 @@ pub struct ExternalInvitationResponseDto {
 /// `GET v2/shared-bookmarks`.
 #[derive(Debug, Deserialize)]
 pub struct BookmarksResponse {
-    #[serde(rename = "Bookmarks", default)]
+    #[serde(rename = "Bookmarks", default, deserialize_with = "null_as_default")]
     pub bookmarks: Vec<BookmarkDto>,
 }
 
@@ -2324,7 +2426,7 @@ pub struct BookmarksResponse {
 pub struct BookmarkDto {
     #[serde(rename = "Token")]
     pub token: BookmarkTokenDto,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
     #[serde(rename = "EncryptedUrlPassword", default)]
     pub encrypted_url_password: Option<String>,
@@ -2340,15 +2442,19 @@ pub struct BookmarkTokenDto {
     pub share_passphrase: String,
     #[serde(rename = "SharePasswordSalt")]
     pub share_password_salt: String,
-    #[serde(rename = "LinkType", default)]
+    #[serde(rename = "LinkType", default, deserialize_with = "null_as_default")]
     pub link_type: i32,
     #[serde(rename = "MIMEType", default)]
     pub mime_type: Option<String>,
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "NodeKey", default)]
+    #[serde(rename = "NodeKey", default, deserialize_with = "null_as_default")]
     pub node_key: String,
-    #[serde(rename = "NodePassphrase", default)]
+    #[serde(
+        rename = "NodePassphrase",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub node_passphrase: String,
     #[serde(rename = "ContentKeyPacket", default)]
     pub content_key_packet: Option<String>,
@@ -2438,7 +2544,7 @@ pub struct CreatePublicLinkResponse {
 /// `GET shares/{shareID}/urls`
 #[derive(Debug, Deserialize)]
 pub struct ShareUrlsResponse {
-    #[serde(rename = "ShareURLs", default)]
+    #[serde(rename = "ShareURLs", default, deserialize_with = "null_as_default")]
     pub share_urls: Vec<ShareUrlDto>,
 }
 
@@ -2448,22 +2554,22 @@ pub struct ShareUrlDto {
     pub share_url_id: String,
     #[serde(rename = "ShareID", default)]
     pub share_id: Option<ShareId>,
-    #[serde(rename = "PublicUrl", default)]
+    #[serde(rename = "PublicUrl", default, deserialize_with = "null_as_default")]
     pub public_url: String,
     /// The link password (generated portion + any custom password), PGP-encrypted
     /// to the share creator's address key. Decrypting it recovers the secret URL
     /// fragment. Absent on the create response, present when listing.
     #[serde(rename = "Password", default)]
     pub password: Option<String>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub create_time: i64,
     #[serde(rename = "ExpirationTime", default)]
     pub expiration_time: Option<i64>,
     #[serde(rename = "Permissions", default)]
     pub permissions: Option<i32>,
-    #[serde(rename = "Flags", default)]
+    #[serde(rename = "Flags", default, deserialize_with = "null_as_default")]
     pub flags: i32,
-    #[serde(rename = "NumAccesses", default)]
+    #[serde(rename = "NumAccesses", default, deserialize_with = "null_as_default")]
     pub num_accesses: i64,
 }
 
@@ -2477,26 +2583,34 @@ pub struct ShareUrlDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublicLinkInfoResponse {
     /// SRP auth version.
-    #[serde(rename = "Version", default)]
+    #[serde(rename = "Version", default, deserialize_with = "null_as_default")]
     pub version: i32,
     /// The cleartext-signed SRP modulus.
-    #[serde(rename = "Modulus", default)]
+    #[serde(rename = "Modulus", default, deserialize_with = "null_as_default")]
     pub modulus: String,
     /// base64 server ephemeral `B`.
-    #[serde(rename = "ServerEphemeral", default)]
+    #[serde(
+        rename = "ServerEphemeral",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub server_ephemeral: String,
     /// base64 SRP salt for the URL password.
-    #[serde(rename = "UrlPasswordSalt", default)]
+    #[serde(
+        rename = "UrlPasswordSalt",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub url_password_salt: String,
-    #[serde(rename = "SRPSession", default)]
+    #[serde(rename = "SRPSession", default, deserialize_with = "null_as_default")]
     pub srp_session: String,
     /// Bit 0 set = the link also needs a custom password. `0` or `1` alone marks
     /// a legacy link the SDK no longer supports.
-    #[serde(rename = "Flags", default)]
+    #[serde(rename = "Flags", default, deserialize_with = "null_as_default")]
     pub flags: i32,
     /// Non-zero for vendor links (Proton Docs and friends) that belong to
     /// another app rather than to Drive.
-    #[serde(rename = "VendorType", default)]
+    #[serde(rename = "VendorType", default, deserialize_with = "null_as_default")]
     pub vendor_type: i32,
 }
 
@@ -2527,10 +2641,10 @@ pub struct PublicLinkAuthRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublicLinkAuthResponse {
     /// base64 `M2`, to be checked against the locally computed expectation.
-    #[serde(rename = "ServerProof", default)]
+    #[serde(rename = "ServerProof", default, deserialize_with = "null_as_default")]
     pub server_proof: String,
     /// The session id for subsequent requests (`x-pm-uid`).
-    #[serde(rename = "UID", default)]
+    #[serde(rename = "UID", default, deserialize_with = "null_as_default")]
     pub uid: String,
     /// Bearer token. Absent when the caller already has a Proton session that
     /// the server accepted instead of minting an anonymous one.
@@ -2549,14 +2663,22 @@ pub struct PublicLinkShareDto {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
     /// base64 bcrypt salt for deriving the key password from the link password.
-    #[serde(rename = "SharePasswordSalt", default)]
+    #[serde(
+        rename = "SharePasswordSalt",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub share_password_salt: String,
     /// The armored share private key.
-    #[serde(rename = "ShareKey", default)]
+    #[serde(rename = "ShareKey", default, deserialize_with = "null_as_default")]
     pub share_key: String,
     /// The share key's passphrase, symmetrically encrypted under the derived
     /// key password.
-    #[serde(rename = "SharePassphrase", default)]
+    #[serde(
+        rename = "SharePassphrase",
+        default,
+        deserialize_with = "null_as_default"
+    )]
     pub share_passphrase: String,
     #[serde(rename = "PublicPermissions", default)]
     pub public_permissions: Option<i32>,
@@ -2569,7 +2691,7 @@ pub struct PublicLinkShareDto {
 /// `GET v2/volumes/{vid}/files/{lid}/revisions` — a file's revision history.
 #[derive(Debug, Deserialize)]
 pub struct RevisionListResponse {
-    #[serde(rename = "Revisions", default)]
+    #[serde(rename = "Revisions", default, deserialize_with = "null_as_default")]
     pub revisions: Vec<RevisionListItemDto>,
 }
 
@@ -2597,10 +2719,10 @@ pub struct RevisionListItemDto {
     /// Wire `ApiRevisionState`: 0 draft, 1 active, 2 obsolete/superseded.
     #[serde(rename = "State", default)]
     pub state: Option<i32>,
-    #[serde(rename = "CreateTime", default)]
+    #[serde(rename = "CreateTime", default, deserialize_with = "null_as_default")]
     pub creation_time: i64,
     /// Encrypted size on cloud storage.
-    #[serde(rename = "Size", default)]
+    #[serde(rename = "Size", default, deserialize_with = "null_as_default")]
     pub size: i64,
     #[serde(rename = "ManifestSignature", default)]
     pub manifest_signature: Option<String>,
@@ -2609,6 +2731,6 @@ pub struct RevisionListItemDto {
     pub signature_email: Option<String>,
     #[serde(rename = "XAttr", default)]
     pub extended_attributes: Option<String>,
-    #[serde(rename = "Thumbnails", default)]
+    #[serde(rename = "Thumbnails", default, deserialize_with = "null_as_default")]
     pub thumbnails: Vec<ThumbnailDto>,
 }

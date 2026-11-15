@@ -7,6 +7,44 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.0] — 2026-11-15
+
+### Fixed
+
+- **Photo duplicate checks no longer fail on drafts.** The duplicates endpoint
+  sends `Hash` and `ContentHash` as `null` for a draft left by an interrupted
+  upload. Both fields were `String`, so one such draft failed the whole
+  `find_duplicates`, `find_duplicates_many` or `name_collisions` call with
+  "invalid type: null, expected a string". Drafts, trashed and deleted links
+  and candidates without hashes are now skipped, like the TypeScript SDK does.
+- **`null` for a defaulted field.** `#[serde(default)]` only covers a missing
+  field. The DTO fields with a default (lists, strings, numbers, flags) now
+  also read an explicit `null` as that default.
+- **Failed uploads remove their draft.** A new file or photo whose block upload
+  failed left its draft on the server, and the draft then blocked the next
+  attempt at that name. The draft is now deleted, as in the C# and TypeScript
+  SDKs. After a failed seal it is only deleted when the server clearly
+  rejected the seal, because a seal lost in transit may have been applied.
+- A response that cannot be decoded is logged with its API path.
+
+### Added
+
+- `PhotoUploadMetadata::replace_existing_draft`: replace an unsealed draft of
+  the same name from any client, not only this session (C#
+  `overrideExistingDraftByOtherClient`). A resumed import needs it after a
+  fresh login, because the server compares drafts against the session id.
+- `PhotoUploadMetadata::location`: write the photo's position to the encrypted
+  extended attributes (`Location { Latitude, Longitude }`), as the web client
+  does. Build it with `PhotoLocation::from_claimed`.
+- `FoundPhotoDuplicateDto::active_name_hash` and `known_content_hash`.
+
+### Breaking
+
+- `PhotoUploadMetadata` has two new fields. Struct literals must set them or
+  use `..Default::default()`.
+- `FoundPhotoDuplicateDto::name_hash` and `content_hash` are `Option<String>`.
+- `ExtendedAttributes` has a new `location` field.
+
 ## [0.11.0] — 2026-11-05
 
 ### Changed

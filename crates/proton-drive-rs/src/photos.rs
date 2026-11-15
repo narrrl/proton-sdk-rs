@@ -21,7 +21,9 @@ use proton_sdk::session::ProtonApiSession;
 use crate::ModificationTime;
 use crate::client::ProtonDriveClient;
 use crate::events::{DriveEvent, DriveEventScopeId};
-use crate::node::{FileThumbnail, Node, RecentlyAccessedReportItem, Thumbnail, ThumbnailType};
+use crate::node::{
+    FileThumbnail, Node, PhotoLocation, RecentlyAccessedReportItem, Thumbnail, ThumbnailType,
+};
 
 /// One photos-timeline entry: a photo node and its capture time (epoch
 /// seconds). C# `PhotosTimelineItem(NodeUid Uid, DateTime CaptureTime)`.
@@ -99,6 +101,18 @@ pub struct PhotoUploadMetadata {
     /// The main photo this one is related to (live photo / burst grouping).
     pub main_photo_uid: Option<NodeUid>,
     pub tags: Vec<PhotoTag>,
+    /// Where the photo was taken, written to the encrypted extended
+    /// attributes. Build it with [`PhotoLocation::from_claimed`], which
+    /// rejects positions off the globe.
+    pub location: Option<PhotoLocation>,
+    /// Replace an unsealed draft of the same name left by *any* client, not
+    /// only by this session. A committed photo of that name is never touched.
+    ///
+    /// Mirrors C# `overrideExistingDraftByOtherClient`. Set it where a leftover
+    /// draft is expected to be this application's own interrupted upload, e.g.
+    /// an import resumed after a restart and a fresh login, which changes the
+    /// session id the server compares against.
+    pub replace_existing_draft: bool,
 }
 
 /// High-level Proton Photos client.
@@ -559,9 +573,52 @@ mod tests {
         }"#;
         let parsed: FindPhotoDuplicatesResponse = serde_json::from_str(raw).unwrap();
         let duplicate = &parsed.duplicate_hashes[0];
-        assert_eq!(duplicate.name_hash, "deadbeef");
-        assert_eq!(duplicate.content_hash, "cafe");
+        assert_eq!(duplicate.name_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(duplicate.content_hash.as_deref(), Some("cafe"));
         assert_eq!(duplicate.link_state, Some(1));
         assert_eq!(duplicate.link_id.as_ref().unwrap().to_string(), "photo-1");
+        let (link_id, name_hash) = duplicate.active_name_hash().unwrap();
+        assert_eq!(link_id.to_string(), "photo-1");
+        assert_eq!(name_hash, "deadbeef");
+        assert_eq!(duplicate.known_content_hash(), Some("cafe"));
+    }
+
+    /// An upload interrupted after its draft was created leaves a link whose
+    /// `ContentHash` is `null`. The response must still parse, and the draft
+    /// must not count as a duplicate (issue: a resumed Takeout import failed
+    /// with "invalid type: null, expected a string").
+    #[test]
+    fn duplicate_response_tolerates_null_fields_and_skips_drafts() {
+        let raw = r#"{
+            "DuplicateHashes": [
+                {"Hash": "aa", "ContentHash": null, "LinkState": 0,
+                 "ClientUID": "old-session", "LinkID": "draft-1", "RevisionID": "rev-1"},
+                {"Hash": null, "ContentHash": null, "LinkState": null,
+                 "ClientUID": null, "LinkID": null, "RevisionID": null},
+                {"Hash": "BB", "ContentHash": "cc", "LinkState": 1,
+                 "ClientUID": null, "LinkID": "photo-2", "RevisionID": "rev-2"},
+                {"Hash": "dd", "ContentHash": "ee", "LinkState": 2,
+                 "ClientUID": null, "LinkID": "trashed-3", "RevisionID": "rev-3"}
+            ],
+            "Code": 1000
+        }"#;
+        let parsed: FindPhotoDuplicatesResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.duplicate_hashes.len(), 4);
+
+        let active: Vec<_> = parsed
+            .duplicate_hashes
+            .iter()
+            .filter_map(|duplicate| duplicate.active_name_hash())
+            .map(|(link_id, hash)| (link_id.to_string(), hash))
+            .collect();
+        assert_eq!(active, vec![("photo-2".to_string(), "bb".to_string())]);
+        assert_eq!(parsed.duplicate_hashes[0].known_content_hash(), None);
+    }
+
+    #[test]
+    fn duplicate_response_tolerates_a_null_list() {
+        let parsed: FindPhotoDuplicatesResponse =
+            serde_json::from_str(r#"{"DuplicateHashes": null, "Code": 1000}"#).unwrap();
+        assert!(parsed.duplicate_hashes.is_empty());
     }
 }

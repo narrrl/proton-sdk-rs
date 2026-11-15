@@ -774,7 +774,12 @@ fn parse_buffered<T: DeserializeOwned>(response: Buffered) -> Result<T> {
         return Err(api_error(status, &bytes));
     }
 
-    Ok(serde_json::from_slice::<T>(&bytes)?)
+    // The error text alone ("invalid type: null, expected a string at line 1
+    // column 2063") does not say which endpoint sent it; the log line does.
+    serde_json::from_slice::<T>(&bytes).map_err(|error| {
+        tracing::warn!(path, %error, "cannot decode a proton api response");
+        error.into()
+    })
 }
 
 /// The envelope's `Code` exactly as sent, before [`ResponseCode`] maps it.
