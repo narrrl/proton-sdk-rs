@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
