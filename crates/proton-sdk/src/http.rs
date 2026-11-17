@@ -878,6 +878,7 @@ where
     loop {
         let retry = match build().send().await {
             Ok(response) => {
+                note_server_time(&response);
                 if attempt < policy.max_retries && is_retryable_status(response.status()) {
                     let delay = retry_after(&response)
                         .map(|delay| delay.min(policy.max_retry_after))
@@ -918,13 +919,27 @@ where
     let mut attempt: u32 = 0;
     loop {
         match build().send().await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                note_server_time(&response);
+                return Ok(response);
+            }
             Err(err) if attempt < policy.max_retries && err.is_connect() => {
                 tokio::time::sleep(backoff(policy, attempt)).await;
                 attempt += 1;
             }
             Err(err) => return Err(err.into()),
         }
+    }
+}
+
+/// Keep the clock that new keys are stamped with in step with the server.
+fn note_server_time(response: &reqwest::Response) {
+    if let Some(date) = response
+        .headers()
+        .get(reqwest::header::DATE)
+        .and_then(|value| value.to_str().ok())
+    {
+        crate::crypto::note_server_date(date);
     }
 }
 

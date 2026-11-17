@@ -12,6 +12,7 @@ mod errors;
 mod keys;
 mod messages;
 mod srp;
+mod time;
 mod verify;
 
 pub use content::ContentKey;
@@ -26,6 +27,7 @@ pub use errors::CryptoError;
 pub use keys::{PrivateKey, decrypt_armored_with_keys, key_ids};
 pub use messages::{decrypt_armored_with_password, recipients};
 pub use srp::{DEFAULT_BIT_LENGTH, SrpProofs, SrpVerifier, generate_proofs, generate_verifier};
+pub use time::note_server_date;
 pub use verify::{
     PublicKey, VerificationKeyRing, VerificationStatus, verify_detached,
     verify_detached_with_context,

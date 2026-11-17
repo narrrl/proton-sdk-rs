@@ -7,6 +7,27 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.1] — 2026-11-17
+
+### Fixed
+
+- **Uploads from a device whose clock runs ahead of Proton's.** A new node key
+  and its self-signatures were dated with the device clock. Proton's servers
+  ignore self-signatures dated after their own clock, so a phone only a few
+  seconds fast created keys without a usable encryption subkey, and every new
+  file or photo failed with 422 "Could not verify the nodeKey was used for
+  encrypting contentKeyPacket" (code 200501). New keys and their
+  self-signatures are now dated with the server's time, taken from the `Date`
+  header of its latest response, as the C# SDK's
+  `CryptographyTimeProvisionHandler` does. Before the first response the
+  device clock is used.
+
+### Added
+
+- `proton_sdk::crypto::note_server_date`, which records a server `Date`
+  header. `ApiHttpClient` calls it for every response; only a client that
+  talks to the API through its own HTTP stack needs it.
+
 ## [0.12.0] — 2026-11-15
 
 ### Fixed
