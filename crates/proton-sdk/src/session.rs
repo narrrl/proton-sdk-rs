@@ -25,17 +25,30 @@ pub enum PasswordMode {
 }
 
 impl PasswordMode {
-    /// Map the wire value (`1` = single, `2` = dual); anything else defaults to dual.
-    fn from_wire(value: i32) -> Self {
+    /// Map Proton's number (`1` single, `2` separate mailbox password).
+    /// Anything else reads as dual, which at worst asks for a mailbox password
+    /// that is the login password.
+    pub fn from_wire(value: i32) -> Self {
         match value {
             1 => PasswordMode::Single,
             _ => PasswordMode::Dual,
         }
     }
+
+    /// Proton's number for this mode: the inverse of [`Self::from_wire`], for
+    /// callers that store it.
+    pub fn to_wire(self) -> i32 {
+        match self {
+            PasswordMode::Single => 1,
+            PasswordMode::Dual => 2,
+        }
+    }
 }
 
 /// Parameters required to resume a session from persisted credentials.
-#[derive(Debug, Clone)]
+///
+/// `Debug` leaves the tokens out.
+#[derive(Clone)]
 pub struct ResumeParameters {
     pub session_id: SessionId,
     pub username: String,
@@ -45,6 +58,22 @@ pub struct ResumeParameters {
     pub scopes: Vec<String>,
     pub is_waiting_for_second_factor_code: bool,
     pub password_mode: PasswordMode,
+}
+
+impl std::fmt::Debug for ResumeParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeParameters")
+            .field("session_id", &self.session_id)
+            .field("username", &self.username)
+            .field("user_id", &self.user_id)
+            .field("scopes", &self.scopes)
+            .field(
+                "is_waiting_for_second_factor_code",
+                &self.is_waiting_for_second_factor_code,
+            )
+            .field("password_mode", &self.password_mode)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An authenticated Proton API session.
@@ -276,6 +305,28 @@ impl ProtonApiSession {
     pub async fn current_tokens(&self) -> Tokens {
         self.http.current_tokens().await
     }
+
+    /// What [`resume`](Self::resume) needs to rebuild this session, with the
+    /// tokens as they are now.
+    pub async fn resume_parameters(&self) -> ResumeParameters {
+        self.resume_parameters_with(self.current_tokens().await)
+    }
+
+    /// [`resume_parameters`](Self::resume_parameters) with given `tokens`,
+    /// such as the pair a refresh handed to
+    /// [`ApiHttpClient::set_on_tokens_refreshed`](crate::http::ApiHttpClient::set_on_tokens_refreshed).
+    pub fn resume_parameters_with(&self, tokens: Tokens) -> ResumeParameters {
+        ResumeParameters {
+            session_id: self.session_id.clone(),
+            username: self.username.clone(),
+            user_id: self.user_id.clone(),
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            scopes: self.scopes.clone(),
+            is_waiting_for_second_factor_code: self.is_waiting_for_second_factor,
+            password_mode: self.password_mode,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -357,6 +408,33 @@ struct SecondFactorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_modes_round_trip_through_proton_numbers() {
+        for mode in [PasswordMode::Single, PasswordMode::Dual] {
+            assert_eq!(PasswordMode::from_wire(mode.to_wire()), mode);
+        }
+        assert_eq!(PasswordMode::Single.to_wire(), 1);
+        assert_eq!(PasswordMode::Dual.to_wire(), 2);
+        assert_eq!(PasswordMode::from_wire(0), PasswordMode::Dual);
+    }
+
+    #[test]
+    fn resume_parameters_hide_their_tokens() {
+        let params = ResumeParameters {
+            session_id: SessionId::from("sid".to_owned()),
+            username: "user".into(),
+            user_id: UserId::from("uid".to_owned()),
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            scopes: vec!["full".into()],
+            is_waiting_for_second_factor_code: false,
+            password_mode: PasswordMode::Single,
+        };
+        let shown = format!("{params:?}");
+        assert!(shown.contains("user"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+    }
 
     #[test]
     fn second_factor_methods_read_from_the_login_bitmask() {

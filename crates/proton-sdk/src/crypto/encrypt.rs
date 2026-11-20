@@ -16,7 +16,7 @@ use pgp::composed::{
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Notation, SignatureConfig, SignatureType, Subpacket, SubpacketData};
-use pgp::types::{CompressionAlgorithm, EncryptionKey, KeyDetails, KeyVersion};
+use pgp::types::{CompressionAlgorithm, EncryptionKey, KeyDetails, KeyVersion, Tag, Timestamp};
 use rand_08::RngCore;
 
 use super::errors::CryptoError;
@@ -131,8 +131,10 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
     let pw_string = String::from_utf8(passphrase.clone())
         .map_err(|e| CryptoError::Encrypt(format!("passphrase is not ascii: {e}")))?;
 
+    let created = super::time::key_time();
     let subkey = SubkeyParamsBuilder::default()
         .version(version)
+        .created_at(created)
         .key_type(KeyType::X25519)
         .can_encrypt(EncryptionCaps::All)
         .passphrase(Some(pw_string.clone()))
@@ -141,6 +143,7 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
 
     let params = SecretKeyParamsBuilder::default()
         .version(version)
+        .created_at(created)
         .key_type(KeyType::Ed25519)
         .can_certify(true)
         .can_sign(true)
@@ -155,6 +158,7 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
     let signed = params
         .generate(&mut rng)
         .map_err(|e| CryptoError::Encrypt(format!("generate node key: {e}")))?;
+    let signed = restamp_self_signatures(signed, &passphrase, created)?;
     let locked_armored = signed
         .to_armored_string(None.into())
         .map_err(|e| CryptoError::Encrypt(format!("armor node key: {e}")))?;
@@ -166,6 +170,81 @@ fn generate_node_key_versioned(version: KeyVersion) -> Result<GeneratedNodeKey, 
         locked_armored,
         passphrase,
     })
+}
+
+/// Sign a freshly generated key's self-signatures again, dated `at`.
+///
+/// rPGP dates a generated key's certification and binding signatures with the
+/// device clock, which can be ahead of Proton's; see [`super::time`]. Each
+/// signature keeps its subpackets and only its creation time changes.
+fn restamp_self_signatures(
+    key: SignedSecretKey,
+    passphrase: &[u8],
+    at: Timestamp,
+) -> Result<SignedSecretKey, CryptoError> {
+    let password = super::keys::password_from_bytes(passphrase);
+    let SignedSecretKey {
+        primary_key,
+        mut details,
+        public_subkeys,
+        mut secret_subkeys,
+    } = key;
+    let primary_public = primary_key.public_key();
+    let failed = |e: pgp::errors::Error| CryptoError::Encrypt(format!("restamp node key: {e}"));
+    for signature in &mut details.direct_signatures {
+        *signature = dated(signature, at)?
+            .sign_key(&primary_key, &password, primary_public)
+            .map_err(failed)?;
+    }
+    for user in &mut details.users {
+        for signature in &mut user.signatures {
+            *signature = dated(signature, at)?
+                .sign_certification(
+                    &primary_key,
+                    primary_public,
+                    &password,
+                    Tag::UserId,
+                    &user.id,
+                )
+                .map_err(failed)?;
+        }
+    }
+    for subkey in &mut secret_subkeys {
+        for signature in &mut subkey.signatures {
+            *signature = dated(signature, at)?
+                .sign_subkey_binding(
+                    &primary_key,
+                    primary_public,
+                    &password,
+                    subkey.key.public_key(),
+                )
+                .map_err(failed)?;
+        }
+    }
+    Ok(SignedSecretKey {
+        primary_key,
+        details,
+        public_subkeys,
+        secret_subkeys,
+    })
+}
+
+/// The configuration of `signature` with its creation time set to `at`.
+fn dated(
+    signature: &pgp::packet::Signature,
+    at: Timestamp,
+) -> Result<SignatureConfig, CryptoError> {
+    let mut config = signature
+        .config()
+        .cloned()
+        .ok_or_else(|| CryptoError::Encrypt("self-signature has no configuration".into()))?;
+    for subpacket in &mut config.hashed_subpackets {
+        if matches!(subpacket.data, SubpacketData::SignatureCreationTime(_)) {
+            *subpacket = Subpacket::regular(SubpacketData::SignatureCreationTime(at))
+                .map_err(|e| CryptoError::Encrypt(format!("signature time: {e}")))?;
+        }
+    }
+    Ok(config)
 }
 
 /// 32 random bytes, base64-encoded (the locking passphrase format).
@@ -564,6 +643,36 @@ impl RecipientOp for EncryptSignOp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_key_self_signatures_carry_the_key_time() {
+        for generated in [
+            generate_node_key().unwrap(),
+            generate_node_key_aead().unwrap(),
+        ] {
+            let (key, _) = <SignedSecretKey as pgp::composed::Deserializable>::from_string(
+                &generated.locked_armored,
+            )
+            .unwrap();
+            key.verify_bindings().unwrap();
+            let created = key.primary_key.created_at();
+            let signatures = key
+                .details
+                .direct_signatures
+                .iter()
+                .chain(key.details.users.iter().flat_map(|u| &u.signatures))
+                .chain(key.secret_subkeys.iter().flat_map(|s| &s.signatures));
+            let mut count = 0;
+            for signature in signatures {
+                assert_eq!(signature.created(), Some(created));
+                count += 1;
+            }
+            assert!(count >= 2);
+            for subkey in &key.secret_subkeys {
+                assert_eq!(subkey.key.created_at(), created);
+            }
+        }
+    }
 
     #[test]
     fn generated_node_key_encrypt_sign_round_trip() {

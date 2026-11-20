@@ -8194,24 +8194,29 @@ fn external_invitation_from_dto(
     }
 }
 
-/// Split a public-link URL (`https://drive.proton.me/urls/{token}#{password}`)
-/// into its token and password. Mirrors JS `getTokenAndPasswordFromUrl`: the
-/// token is the last path segment, the password the fragment after `#`.
 /// Split a public share URL into its token and secret fragment.
 ///
 /// The format is `https://drive.proton.me/urls/{token}#{password}`
 /// (TS `getTokenAndPasswordFromUrl`). Both halves are required: a URL with no
-/// fragment carries no secret and opens nothing.
+/// fragment carries no secret and opens nothing. A query string before the
+/// fragment (`…/urls/{token}?ref=x#{password}`) is not part of the token.
 ///
 /// The token is taken as the segment *after* `/urls/` rather than as the last
 /// path segment, so a URL with an empty token (`…/urls/#password`) is rejected
 /// instead of silently yielding the container segment `"urls"` as the token.
-pub(crate) fn parse_public_link_url(url: &str) -> Result<(String, String)> {
+///
+/// Public so an app can check a pasted link, or key its own records by the
+/// token, before opening anything. Keep the password out of anything stored
+/// in the clear.
+pub fn parse_public_link_url(url: &str) -> Result<(String, String)> {
     const CONTAINER: &str = "/urls/";
     let invalid = || ProtonError::invalid_operation("invalid public link url");
 
-    let (before_hash, password) = url.split_once('#').ok_or_else(invalid)?;
-    let (_, after_container) = before_hash.rsplit_once(CONTAINER).ok_or_else(invalid)?;
+    let (before_hash, password) = url.trim().split_once('#').ok_or_else(invalid)?;
+    let before_query = before_hash
+        .split_once('?')
+        .map_or(before_hash, |(path, _)| path);
+    let (_, after_container) = before_query.rsplit_once(CONTAINER).ok_or_else(invalid)?;
     let token = after_container.trim_end_matches('/');
 
     if token.is_empty() || token.contains('/') || password.is_empty() {

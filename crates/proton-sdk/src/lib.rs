@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod error;
 pub mod http;
 pub mod ids;
+pub mod login;
 pub mod session;
 pub mod telemetry;
 
