@@ -7,7 +7,7 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
-## [0.12.2] — Unreleased
+## [0.12.2] — 2026-11-20
 
 ### Added
 
