@@ -68,6 +68,32 @@ impl HumanVerification {
             urlencoding_minimal(&self.token),
         )
     }
+
+    /// The solved token out of a message the verification page posted to its
+    /// host, or `None` for anything that is not a completion.
+    ///
+    /// The page posts plenty besides (resize requests, readiness pings), and
+    /// taking those for success would retry the sign-in with a garbage token.
+    /// Both spellings of the success type have shipped, and some hosts hand
+    /// the message over stringified twice. Wrap the result with
+    /// [`HumanVerificationCredential::captcha`].
+    pub fn token_from_message(raw: &str) -> Option<String> {
+        let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        if let Some(inner) = value.as_str()
+            && let Ok(parsed) = serde_json::from_str(inner)
+        {
+            value = parsed;
+        }
+        let kind = value.get("type")?.as_str()?;
+        if !matches!(
+            kind,
+            "HUMAN_VERIFICATION_SUCCESS" | "human_verification_success"
+        ) {
+            return None;
+        }
+        let token = value.get("payload")?.get("token")?.as_str()?;
+        (!token.is_empty()).then(|| token.to_owned())
+    }
 }
 
 /// Percent-encode the characters that actually occur in Proton's HV tokens and
@@ -227,6 +253,23 @@ impl<'de> Deserialize<'de> for ResponseCode {
 mod tests {
     use super::*;
     use crate::error::ProtonApiError;
+
+    #[test]
+    fn only_completion_messages_yield_a_verification_token() {
+        let token = HumanVerification::token_from_message;
+        let done = r#"{"type":"HUMAN_VERIFICATION_SUCCESS","payload":{"token":"abc"}}"#;
+        assert_eq!(token(done).as_deref(), Some("abc"));
+        let twice = serde_json::to_string(done).unwrap();
+        assert_eq!(token(&twice).as_deref(), Some("abc"));
+        let lower = r#"{"type":"human_verification_success","payload":{"token":"x"}}"#;
+        assert_eq!(token(lower).as_deref(), Some("x"));
+        assert_eq!(token(r#"{"type":"RESIZE","payload":{"height":3}}"#), None);
+        assert_eq!(
+            token(r#"{"type":"HUMAN_VERIFICATION_SUCCESS","payload":{"token":""}}"#),
+            None
+        );
+        assert_eq!(token("not json"), None);
+    }
 
     /// The envelope a gated login actually returns, as captured from the live
     /// API. Before `9001` was mapped this deserialized to `Unknown`, which is

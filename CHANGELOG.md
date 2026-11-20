@@ -7,6 +7,39 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.2] — Unreleased
+
+### Added
+
+- **`proton_sdk::login`: the whole sign-in as a small state machine.**
+  `login::begin` runs the password step and returns a `Step`:
+  `SecondFactor`, `MailboxPassword`, or `Unlock` for a one-password account.
+  `Pending::second_factor` takes a code. `Pending::mailbox_password` and
+  `Pending::unlock` derive the key passphrases and hand back `Unlocked`
+  (session, key passphrases, key salts). Both work by reference, so a mistyped
+  mailbox password or a dropped connection can be retried on the same
+  session. `LoginError` sorts failures into what a frontend acts on:
+  a CAPTCHA gate, an account whose only second factor is a security key, a
+  blocked client, a refused password, a wrong code, a wrong mailbox password.
+  This sequence previously lived in each app; it moves here from
+  `proton-auth-rs`.
+- `ProtonApiSession::resume_parameters` and `resume_parameters_with(tokens)`,
+  which build the `ResumeParameters` for storing a session, with the current
+  tokens or the pair a refresh handed over.
+- `PasswordMode::from_wire` is public, with its inverse `PasswordMode::to_wire`,
+  for callers that store Proton's number.
+- `HumanVerification::token_from_message`, which takes the solved token out of
+  a message the verification page posts, and ignores the page's other
+  messages.
+- `proton_drive_rs::parse_public_link_url` is public, so apps can check a
+  pasted share link, or key their records by its token, without opening it.
+
+### Changed
+
+- `parse_public_link_url` ignores surrounding whitespace and a query string
+  before the fragment (`…/urls/TOKEN?ref=x#password`).
+- `ResumeParameters`' `Debug` output leaves the access and refresh tokens out.
+
 ## [0.12.1] — 2026-11-17
 
 ### Fixed

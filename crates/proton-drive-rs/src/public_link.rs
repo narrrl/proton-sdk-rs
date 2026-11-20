@@ -1351,6 +1351,17 @@ mod tests {
     }
 
     #[test]
+    fn a_query_string_is_not_part_of_the_token() {
+        let (token, password) =
+            parse_public_link_url("https://drive.proton.me/urls/ABC123?ref=mail#s3cr3t").unwrap();
+        assert_eq!(token, "ABC123");
+        assert_eq!(password, "s3cr3t");
+        let (token, _) =
+            parse_public_link_url("  https://drive.proton.me/urls/ABC123#pw\n").unwrap();
+        assert_eq!(token, "ABC123");
+    }
+
+    #[test]
     fn rejects_urls_without_a_usable_secret() {
         // No fragment at all: the URL carries no password to open anything with.
         assert!(parse_public_link_url("https://drive.proton.me/urls/ABC123").is_err());
