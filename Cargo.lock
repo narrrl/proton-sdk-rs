@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
@@ -3581,3 +3581,27 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "proton-auth-rs"
+version = "0.1.2"
+
+[[patch.unused]]
+name = "proton-base-rs"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "proton-gallery-app-rs"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "proton-gallery-drive-rs"
+version = "0.1.2"
+
+[[patch.unused]]
+name = "proton-gallery-rs"
+version = "0.1.2"
+
+[[patch.unused]]
+name = "proton-media-rs"
+version = "0.1.1"
