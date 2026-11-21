@@ -7,6 +7,13 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.4] — 2026-11-21
+
+### Added
+
+- `ProtonPhotosClient::find_missing_thumbnails` lists which photos have no
+  thumbnail, from link details read in batches, without downloading any.
+
 ## [0.12.3] — 2026-11-21
 
 ### Changed
