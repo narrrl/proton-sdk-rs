@@ -2162,6 +2162,60 @@ impl ProtonDriveClient {
         Ok(ThumbnailTargets { content_key, ids })
     }
 
+    /// Which of `uids` have no thumbnail at all on their active revision,
+    /// without downloading or decrypting anything. Link details are read in
+    /// batches; a file whose listing names no thumbnail is confirmed by
+    /// reading its revision, since listings may leave them out. Folders and
+    /// files without an active revision are not reported.
+    pub(crate) async fn missing_thumbnails_ctx(
+        &self,
+        uids: &[NodeUid],
+        for_photos: bool,
+    ) -> Result<Vec<NodeUid>> {
+        let mut by_volume: Vec<(VolumeId, Vec<LinkId>)> = Vec::new();
+        for uid in uids {
+            match by_volume
+                .iter_mut()
+                .find(|(volume, _)| *volume == uid.volume_id)
+            {
+                Some((_, links)) => links.push(uid.link_id.clone()),
+                None => by_volume.push((uid.volume_id.clone(), vec![uid.link_id.clone()])),
+            }
+        }
+        let mut unlisted: Vec<(NodeUid, String)> = Vec::new();
+        for (volume_id, link_ids) in &by_volume {
+            for chunk in link_ids.chunks(MAX_BATCH_COUNT) {
+                let details = self
+                    .get_link_details_ctx(volume_id, chunk, for_photos)
+                    .await?;
+                for detail in details.links {
+                    let uid = NodeUid::new(volume_id.clone(), detail.link.id.clone());
+                    let Some(revision) = detail
+                        .file
+                        .or(detail.photo.map(|photo| photo.file))
+                        .and_then(|file| file.active_revision)
+                    else {
+                        continue;
+                    };
+                    if !revision.thumbnails.iter().any(|t| t.id.is_some()) {
+                        unlisted.push((uid, revision.id));
+                    }
+                }
+            }
+        }
+        let checked: Vec<Option<NodeUid>> = stream::iter(unlisted)
+            .map(|(uid, revision_id)| async move {
+                let (revision, _blocks) = self
+                    .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
+                    .await?;
+                Ok::<_, ProtonError>(revision.thumbnails.is_empty().then_some(uid))
+            })
+            .buffer_unordered(MAX_CONCURRENT_DETAIL_FETCHES)
+            .try_collect()
+            .await?;
+        Ok(checked.into_iter().flatten().collect())
+    }
+
     /// Upload a new file under `parent_uid` with the given plaintext `contents`.
     ///
     /// Core single-file path (legacy SEIPDv1, no thumbnails, buffered). Mirrors

@@ -256,6 +256,12 @@ impl ProtonPhotosClient {
             .await
     }
 
+    /// Which of the photos `uids` have no thumbnail at all. Reads link
+    /// details in batches and downloads nothing.
+    pub async fn find_missing_thumbnails(&self, uids: &[NodeUid]) -> Result<Vec<NodeUid>> {
+        self.drive.missing_thumbnails_ctx(uids, true).await
+    }
+
     /// Download and decrypt a single photo's thumbnail of the given type, or
     /// `None` when the photo has none. C# `ProtonPhotosClient` single-thumbnail
     /// access (routes through the photos endpoints).
