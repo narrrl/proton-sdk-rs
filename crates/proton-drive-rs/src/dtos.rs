@@ -828,6 +828,10 @@ pub struct ActiveRevisionDto {
     /// As [`LinkDto::third_party`], for the revision (upstream `f257c20e`).
     #[serde(rename = "ThirdParty", default, deserialize_with = "null_as_default")]
     pub third_party: bool,
+    /// The revision's thumbnails, when the listing includes them. Saves
+    /// reading the revision just to find the thumbnail block ids.
+    #[serde(rename = "Thumbnails", default, deserialize_with = "null_as_default")]
+    pub thumbnails: Vec<ThumbnailDto>,
     /// As [`LinkDto::sdk`], for the revision.
     #[serde(rename = "Sdk", default, deserialize_with = "null_as_default")]
     pub sdk: bool,
@@ -1922,6 +1926,33 @@ mod tests {
         }))
         .expect("revision");
         assert!(!revision.third_party && !revision.sdk);
+    }
+
+    #[test]
+    fn an_active_revision_lists_its_thumbnails_when_given() {
+        let listed: ActiveRevisionDto = serde_json::from_value(serde_json::json!({
+            "RevisionID": "r", "CreateTime": 1, "EncryptedSize": 2,
+            "Thumbnails": [
+                {"ThumbnailID": "small", "Type": 1, "Hash": "aGFzaA=="},
+                {"ThumbnailID": "large", "Type": 2, "Hash": null}
+            ]
+        }))
+        .expect("revision");
+        let ids: Vec<_> = listed
+            .thumbnails
+            .iter()
+            .map(|t| (t.thumbnail_type, t.id.as_deref()))
+            .collect();
+        assert_eq!(ids, [(1, Some("small")), (2, Some("large"))]);
+        for absent in [serde_json::Value::Null, serde_json::json!("missing")] {
+            let mut value =
+                serde_json::json!({"RevisionID": "r", "CreateTime": 1, "EncryptedSize": 2});
+            if absent.is_null() {
+                value["Thumbnails"] = absent;
+            }
+            let revision: ActiveRevisionDto = serde_json::from_value(value).expect("revision");
+            assert!(revision.thumbnails.is_empty());
+        }
     }
 
     #[test]

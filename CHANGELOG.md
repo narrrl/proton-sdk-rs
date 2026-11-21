@@ -7,6 +7,23 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.3] — Unreleased
+
+### Changed
+
+- **Thumbnails need fewer round trips.** `download_thumbnail` used to make
+  four requests in a row for each thumbnail: link details, the revision's
+  full block list (only to find the thumbnail ids), the thumbnail URL, and
+  the blob.
+  - The thumbnail ids now come from the link details when the API lists them
+    there (`ActiveRevisionDto::thumbnails`). The revision is read only when
+    it doesn't.
+  - The client remembers each file's content key and thumbnail ids, for up to
+    4096 files. A repeat request, a retry, or a fall back from the small
+    thumbnail to the preview then needs only the URL and the blob.
+  - A node's events drop its entry, and so does a failed fetch from a
+    remembered entry, which then looks the file up again.
+
 ## [0.12.2] — 2026-11-20
 
 ### Added

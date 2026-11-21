@@ -298,6 +298,20 @@ const FOLDER_KEY_CACHE_CAP: usize = 512;
 /// the context endpoint is read-only and repopulates the entry.
 const CONTEXT_SHARE_CACHE_CAP: usize = 512;
 
+/// Upper bound on files whose thumbnail lookup is remembered (about 200 bytes
+/// each). A gallery grid asks for the same files again when it scrolls back,
+/// retries, or falls back from a thumbnail to a preview; a miss repeats the
+/// link and revision requests.
+const THUMBNAIL_TARGET_CACHE_CAP: usize = 4096;
+
+/// What fetching a file's thumbnails needs: its content key and the
+/// thumbnail block ids of its active revision, by thumbnail type.
+#[derive(Clone)]
+struct ThumbnailTargets {
+    content_key: ContentKey,
+    ids: Vec<(i32, String)>,
+}
+
 struct DriveCache {
     main_volume_id: Option<VolumeId>,
     my_files_share: Option<ShareKey>,
@@ -316,6 +330,9 @@ struct DriveCache {
     /// them. Entries are also dropped on the matching remote event
     /// ([`ProtonDriveClient::invalidate_caches_for_event`]).
     folder_keys: LruCache<NodeUid, PrivateKey>,
+    /// Thumbnail lookups per file. Dropped with the node's events, and on a
+    /// failed fetch, since a new revision has new thumbnail ids.
+    thumbnail_targets: LruCache<NodeUid, ThumbnailTargets>,
     /// The membership share behind each node another user shares with us, keyed
     /// by the shared node itself (which is that share's root link). `None` until
     /// [`ProtonDriveClient::shared_with_me_shares`] pages `v2/sharedwithme`.
@@ -337,6 +354,9 @@ impl Default for DriveCache {
             photos_volume_exists: None,
             folder_keys: LruCache::new(
                 NonZeroUsize::new(FOLDER_KEY_CACHE_CAP).expect("cap is non-zero"),
+            ),
+            thumbnail_targets: LruCache::new(
+                NonZeroUsize::new(THUMBNAIL_TARGET_CACHE_CAP).expect("cap is non-zero"),
             ),
             shared_with_me_shares: None,
             context_share_ids: LruCache::new(
@@ -1301,7 +1321,11 @@ impl ProtonDriveClient {
     pub async fn invalidate_caches_for_event(&self, event: &DriveEvent) -> Result<()> {
         match event {
             DriveEvent::NodeUpdated { node_uid, .. } => {
-                self.cache.lock().await.folder_keys.pop(node_uid);
+                {
+                    let mut cache = self.cache.lock().await;
+                    cache.folder_keys.pop(node_uid);
+                    cache.thumbnail_targets.pop(node_uid);
+                }
                 {
                     let _context_guard = self.context_share_gate.write().await;
                     self.cache.lock().await.context_share_ids.clear();
@@ -1309,7 +1333,11 @@ impl ProtonDriveClient {
                 self.entities.remove_node(node_uid).await?;
             }
             DriveEvent::NodeDeleted { node_uid, .. } => {
-                self.cache.lock().await.folder_keys.pop(node_uid);
+                {
+                    let mut cache = self.cache.lock().await;
+                    cache.folder_keys.pop(node_uid);
+                    cache.thumbnail_targets.pop(node_uid);
+                }
                 {
                     let _context_guard = self.context_share_gate.write().await;
                     self.cache.lock().await.context_share_ids.clear();
@@ -1317,7 +1345,11 @@ impl ProtonDriveClient {
                 self.entities.remove_node(node_uid).await?;
             }
             DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
-                self.cache.lock().await.folder_keys.clear();
+                {
+                    let mut cache = self.cache.lock().await;
+                    cache.folder_keys.clear();
+                    cache.thumbnail_targets.clear();
+                }
                 {
                     let _context_guard = self.context_share_gate.write().await;
                     self.cache.lock().await.context_share_ids.clear();
@@ -1842,13 +1874,45 @@ impl ProtonDriveClient {
         thumbnail_type: ThumbnailType,
         for_photos: bool,
     ) -> Result<Option<Vec<u8>>> {
-        let (content_key, thumbnail_id) = self
-            .file_thumbnail_target(uid, thumbnail_type, for_photos)
-            .await?;
-        let thumbnail_id = match thumbnail_id {
-            Some(id) => id,
-            None => return Ok(None),
+        let cached = self.cache.lock().await.thumbnail_targets.get(uid).cloned();
+        if let Some(targets) = cached {
+            match self.fetch_thumbnail(uid, &targets, thumbnail_type).await {
+                Ok(found) => return Ok(found),
+                // The file may have a new revision since: look it up again.
+                Err(_) => {
+                    self.cache.lock().await.thumbnail_targets.pop(uid);
+                }
+            }
+        }
+        let targets = self.thumbnail_targets(uid, for_photos).await?;
+        let found = self.fetch_thumbnail(uid, &targets, thumbnail_type).await;
+        if found.is_ok() {
+            self.cache
+                .lock()
+                .await
+                .thumbnail_targets
+                .put(uid.clone(), targets);
+        }
+        found
+    }
+
+    /// Download and decrypt one thumbnail of a file whose lookup is done.
+    async fn fetch_thumbnail(
+        &self,
+        uid: &NodeUid,
+        targets: &ThumbnailTargets,
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>> {
+        let wanted = thumbnail_type.as_i32();
+        let Some(thumbnail_id) = targets
+            .ids
+            .iter()
+            .find(|(kind, _)| *kind == wanted)
+            .map(|(_, id)| id.clone())
+        else {
+            return Ok(None);
         };
+        let content_key = &targets.content_key;
 
         let response: ThumbnailBlockListResponse = self
             .http
@@ -2032,6 +2096,20 @@ impl ProtonDriveClient {
         thumbnail_type: ThumbnailType,
         for_photos: bool,
     ) -> Result<(ContentKey, Option<String>)> {
+        let targets = self.thumbnail_targets(uid, for_photos).await?;
+        let wanted = thumbnail_type.as_i32();
+        let thumbnail_id = targets
+            .ids
+            .iter()
+            .find(|(kind, _)| *kind == wanted)
+            .map(|(_, id)| id.clone());
+        Ok((targets.content_key, thumbnail_id))
+    }
+
+    /// Look up a file's content key and the thumbnail ids of its active
+    /// revision. The link details usually carry the ids; only when they
+    /// don't is the revision itself read.
+    async fn thumbnail_targets(&self, uid: &NodeUid, for_photos: bool) -> Result<ThumbnailTargets> {
         let details = self
             .get_link_details_ctx(
                 &uid.volume_id,
@@ -2056,9 +2134,9 @@ impl ProtonDriveClient {
         let content_key_packet = BASE64.decode(content_key_packet_b64.trim()).map_err(|e| {
             ProtonError::invalid_operation(format!("decode content key packet: {e}"))
         })?;
-        let revision_id = file
+        let (revision_id, revision_thumbnails) = file
             .active_revision
-            .map(|r| r.id)
+            .map(|r| (r.id, r.thumbnails))
             .ok_or_else(|| ProtonError::invalid_operation("file has no active revision"))?;
 
         let parent_key = self
@@ -2067,18 +2145,21 @@ impl ProtonDriveClient {
         let node_key = decrypt_link(&parent_key, &link)?.node_key;
         let content_key = node_key.decrypt_content_key(&content_key_packet)?;
 
-        // The revision's thumbnail headers carry the block id we resolve below.
-        let (revision, _blocks) = self
-            .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
-            .await?;
-        let wanted = thumbnail_type.as_i32();
-        let thumbnail_id = revision
-            .thumbnails
-            .iter()
-            .find(|t| t.thumbnail_type == wanted)
-            .and_then(|t| t.id.clone());
-
-        Ok((content_key, thumbnail_id))
+        let listed = |thumbnails: &[ThumbnailDto]| -> Vec<(i32, String)> {
+            thumbnails
+                .iter()
+                .filter_map(|t| Some((t.thumbnail_type, t.id.clone()?)))
+                .collect()
+        };
+        let mut ids = listed(&revision_thumbnails);
+        if ids.is_empty() {
+            // The revision's thumbnail headers carry the block ids.
+            let (revision, _blocks) = self
+                .fetch_revision_blocks(&uid.volume_id, &uid.link_id, &revision_id)
+                .await?;
+            ids = listed(&revision.thumbnails);
+        }
+        Ok(ThumbnailTargets { content_key, ids })
     }
 
     /// Upload a new file under `parent_uid` with the given plaintext `contents`.
