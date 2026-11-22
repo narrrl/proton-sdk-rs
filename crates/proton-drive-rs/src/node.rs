@@ -117,6 +117,14 @@ pub struct Node {
     pub verification: NodeVerification,
 }
 
+/// A node in the trash, with the time it was trashed.
+#[derive(Debug, Clone)]
+pub struct TrashedNode {
+    pub node: Node,
+    /// When the node was trashed, epoch seconds, if the server said.
+    pub trash_time: Option<i64>,
+}
+
 /// Photo-only metadata on a photos-volume file node. Mirrors the fields C#
 /// `PhotoNode` adds to `FileNode`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

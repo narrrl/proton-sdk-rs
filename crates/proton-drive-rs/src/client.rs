@@ -83,7 +83,7 @@ use crate::events::{DriveEvent, DriveEventScopeId};
 use crate::node::{
     AlbumProperties, AvailableNameTarget, FileThumbnail, FolderSize, Node, NodeKind, NodeMoveItem,
     PhotoLocation, PhotoProperties, RecentlyAccessedReportItem, RevisionState, Thumbnail,
-    ThumbnailType,
+    ThumbnailType, TrashedNode,
 };
 use crate::photos::{
     AlbumItem, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata, PhotosTimelineItem,
@@ -172,6 +172,41 @@ const MAX_BLOCK_UPLOAD_ATTEMPTS: usize = 3;
 /// Trashed links requested per page when enumerating the trash (C#
 /// `VolumeOperations.TrashPageSize`).
 const TRASH_PAGE_SIZE: usize = 500;
+
+/// Upper bound on trash pages read in one enumeration (5 million links), so a
+/// server that keeps answering full pages can never keep the loop going.
+const MAX_TRASH_PAGES: usize = 10_000;
+
+/// The links gathered while paging the trash, and whether to ask for more.
+#[derive(Default)]
+struct TrashPages {
+    links: Vec<LinkId>,
+    seen: HashSet<LinkId>,
+}
+
+impl TrashPages {
+    /// Take one page. Returns whether another page may hold more links.
+    ///
+    /// A short page ends the listing (C# `mustTryMoreResults`). So does a page
+    /// that brings nothing new: a server that ignores the page number answers
+    /// the same full page every time, which would otherwise never end.
+    fn push(&mut self, page: impl IntoIterator<Item = LinkId>) -> bool {
+        let mut count = 0_usize;
+        let mut fresh = 0_usize;
+        for link_id in page {
+            count += 1;
+            if self.seen.insert(link_id.clone()) {
+                fresh += 1;
+                self.links.push(link_id);
+            }
+        }
+        if count >= TRASH_PAGE_SIZE && fresh == 0 {
+            tracing::warn!(count, "trash page repeated an earlier one; stopping");
+            return false;
+        }
+        count >= TRASH_PAGE_SIZE
+    }
+}
 
 /// Photos returned per timeline page (C# `PhotosNodeOperations.TimelinePageSize`).
 const TIMELINE_PAGE_SIZE: usize = 500;
@@ -906,6 +941,21 @@ impl ProtonDriveClient {
         self.enumerate_nodes_detail(uids, NodeDetail::Light).await
     }
 
+    /// As [`enumerate_nodes_light`](Self::enumerate_nodes_light), for nodes in
+    /// the trash: each comes with the time it was trashed, which [`Node`] does
+    /// not carry. The time is `None` when the server gave none.
+    pub async fn enumerate_trashed_nodes_light(
+        &self,
+        uids: &[NodeUid],
+    ) -> Result<Vec<TrashedNode>> {
+        Ok(self
+            .enumerate_links_detail(uids, NodeDetail::Light)
+            .await?
+            .into_iter()
+            .map(|(node, trash_time)| TrashedNode { node, trash_time })
+            .collect())
+    }
+
     /// The shared body of [`enumerate_nodes`](Self::enumerate_nodes) and
     /// [`enumerate_nodes_light`](Self::enumerate_nodes_light).
     ///
@@ -925,6 +975,21 @@ impl ProtonDriveClient {
         uids: &[NodeUid],
         detail: NodeDetail,
     ) -> Result<Vec<Node>> {
+        Ok(self
+            .enumerate_links_detail(uids, detail)
+            .await?
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect())
+    }
+
+    /// The body of [`enumerate_nodes_detail`](Self::enumerate_nodes_detail),
+    /// keeping each link's trash time next to its node.
+    async fn enumerate_links_detail(
+        &self,
+        uids: &[NodeUid],
+        detail: NodeDetail,
+    ) -> Result<Vec<(Node, Option<i64>)>> {
         let mut nodes = Vec::new();
 
         for (volume_id, link_ids) in group_by_volume(uids) {
@@ -957,11 +1022,15 @@ impl ProtonDriveClient {
                     let volume_id = volume_id.clone();
                     async move {
                         let link_id = link_details.link.id.clone();
+                        let trash_time = link_details
+                            .link
+                            .trash_time
+                            .or(link_details.link.trashed_legacy);
                         match client
                             .build_node(&volume_id, &link_details, &parent_key, detail)
                             .await
                         {
-                            Ok(node) => Some(node),
+                            Ok(node) => Some((node, trash_time)),
                             Err(e) => {
                                 tracing::warn!(link_id = %link_id, error = %e, "skipping undecryptable node");
                                 None
@@ -1191,29 +1260,24 @@ impl ProtonDriveClient {
     pub async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
         let volume_id = self.main_volume_id().await?;
 
-        let mut uids = Vec::new();
-        let mut page = 0_usize;
-
-        loop {
-            let path = format!("volumes/{volume_id}/trash?pageSize={TRASH_PAGE_SIZE}&page={page}");
+        let mut pages = TrashPages::default();
+        for page in 0..MAX_TRASH_PAGES {
+            let path = format!("volumes/{volume_id}/trash?PageSize={TRASH_PAGE_SIZE}&Page={page}");
             let response: VolumeTrashResponse = self.http.get(&path).await?;
-
-            let mut count = 0_usize;
-            for group in &response.trash_by_share {
-                for link_id in &group.link_ids {
-                    count += 1;
-                    uids.push(NodeUid::new(volume_id.clone(), link_id.clone()));
-                }
-            }
-
-            // A full page implies there may be more (C# `mustTryMoreResults`).
-            if count < TRASH_PAGE_SIZE {
+            let links = response
+                .trash_by_share
+                .into_iter()
+                .flat_map(|group| group.link_ids);
+            if !pages.push(links) {
                 break;
             }
-            page += 1;
         }
 
-        Ok(uids)
+        Ok(pages
+            .links
+            .into_iter()
+            .map(|link_id| NodeUid::new(volume_id.clone(), link_id))
+            .collect())
     }
 
     /// The main volume id, resolved via My Files.
@@ -3550,8 +3614,9 @@ impl ProtonDriveClient {
     }
 
     /// Permanently empty the main volume's trash. Mirrors C#
-    /// `TrashApiClient.EmptyAsync` (`DELETE volumes/{vid}/trash`). Live
-    /// validation pending.
+    /// `TrashApiClient.EmptyAsync` (`DELETE volumes/{vid}/trash`). The server
+    /// may finish deleting after it answers, so a listing right after can
+    /// still show some of the links.
     pub async fn empty_trash(&self) -> Result<()> {
         let mut timer = self.telemetry.start("empty_trash");
         let volume_id = self.main_volume_id().await?;
@@ -9134,11 +9199,11 @@ fn drive_items(page: &SharedWithMeResponse) -> Vec<SharedWithMeItem> {
 mod tests {
     use super::{
         CONTEXT_SHARE_CACHE_CAP, DriveCache, DriveEvent, FOLDER_KEY_CACHE_CAP,
-        MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, aggregate_outcomes, alternate_file_names,
-        alternate_folder_names, assemble_manifest, context_share_path, drive_items,
-        has_active_regular_volume, is_expired_upload_token, is_listable_revision_state,
-        is_upload_timeout, join_node_path, missing_related_links, path_segments,
-        photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
+        MAX_NODE_NAME_LENGTH, NodeAction, ParentKeyId, TRASH_PAGE_SIZE, TrashPages,
+        aggregate_outcomes, alternate_file_names, alternate_folder_names, assemble_manifest,
+        context_share_path, drive_items, has_active_regular_volume, is_expired_upload_token,
+        is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
+        path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
         run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
         small_upload_should_fall_back, split_link_password, take_block_target,
         take_thumbnail_target, to_drive_event, validate_node_name,
@@ -9157,6 +9222,36 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Mutex, Notify, RwLock};
+
+    fn trash_page(from: usize, count: usize) -> Vec<LinkId> {
+        (from..from + count)
+            .map(|i| LinkId::new(format!("link-{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn trash_paging_stops_on_a_short_page() {
+        let mut pages = TrashPages::default();
+        assert!(pages.push(trash_page(0, TRASH_PAGE_SIZE)));
+        assert!(!pages.push(trash_page(TRASH_PAGE_SIZE, 3)));
+        assert_eq!(pages.links.len(), TRASH_PAGE_SIZE + 3);
+    }
+
+    #[test]
+    fn trash_paging_stops_when_a_full_page_repeats() {
+        let mut pages = TrashPages::default();
+        assert!(pages.push(trash_page(0, TRASH_PAGE_SIZE)));
+        assert!(!pages.push(trash_page(0, TRASH_PAGE_SIZE)));
+        assert_eq!(pages.links.len(), TRASH_PAGE_SIZE);
+    }
+
+    #[test]
+    fn trash_paging_keeps_each_link_once() {
+        let mut pages = TrashPages::default();
+        assert!(pages.push(trash_page(0, TRASH_PAGE_SIZE)));
+        assert!(pages.push(trash_page(10, TRASH_PAGE_SIZE)));
+        assert_eq!(pages.links.len(), TRASH_PAGE_SIZE + 10);
+    }
 
     #[test]
     fn a_link_password_splits_into_the_generated_part_and_the_custom_one() {
