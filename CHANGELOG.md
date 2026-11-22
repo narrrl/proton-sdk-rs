@@ -7,6 +7,21 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.5] — 2026-11-22
+
+### Fixed
+
+- **Listing a large trash no longer runs forever.** `enumerate_trash_node_uids`
+  sent its paging parameters in lower case, unlike every other paged request,
+  and asked for another page as long as pages came back full. On a large trash
+  it never finished. It now sends `Page` and `PageSize`, and it stops when a
+  page brings no link it has not seen, after at most 10 000 pages.
+
+### Added
+
+- `ProtonDriveClient::enumerate_trashed_nodes_light` returns trashed nodes
+  with the time each was trashed (`TrashedNode`), which `Node` does not carry.
+
 ## [0.12.4] — 2026-11-21
 
 ### Added
