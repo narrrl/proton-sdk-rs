@@ -3614,14 +3614,24 @@ impl ProtonDriveClient {
     }
 
     /// Permanently empty the main volume's trash. Mirrors C#
-    /// `TrashApiClient.EmptyAsync` (`DELETE volumes/{vid}/trash`). The server
-    /// may finish deleting after it answers, so a listing right after can
-    /// still show some of the links.
+    /// `TrashApiClient.EmptyAsync` (`DELETE volumes/{vid}/trash`).
+    ///
+    /// **The empty is asynchronous.** The server answers HTTP 202 and deletes
+    /// in the background, so a listing right after can still show some of the
+    /// links.
     pub async fn empty_trash(&self) -> Result<()> {
         let mut timer = self.telemetry.start("empty_trash");
         let volume_id = self.main_volume_id().await?;
         let path = format!("volumes/{volume_id}/trash");
-        let _: proton_sdk::api::ApiResponse = self.http.delete(&path).await?;
+        let result: Result<proton_sdk::api::ApiResponse> = self.http.delete(&path).await;
+        match result {
+            Ok(_) => {}
+            // HTTP 202 carries an envelope whose code is not `1000`, which the
+            // generic response parser reports as an error. The server accepted
+            // the request, so it is a success (same as `restore_revision`).
+            Err(ProtonError::Api(e)) if e.http_status == 202 => {}
+            Err(e) => return Err(e),
+        }
         timer.success();
         Ok(())
     }

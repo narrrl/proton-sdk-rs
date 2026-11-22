@@ -7,6 +7,15 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.6] — 2026-11-22
+
+### Fixed
+
+- **Emptying the trash no longer reports an error when it works.** The server
+  answers `DELETE volumes/{vid}/trash` with HTTP 202 and empties the trash in
+  the background. `empty_trash` treated that answer as a failure. It now treats
+  it as success, as `restore_revision` already does.
+
 ## [0.12.5] — 2026-11-22
 
 ### Fixed
