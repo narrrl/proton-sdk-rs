@@ -7,6 +7,25 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.7] — unreleased
+
+### Added
+
+- **Uploads can return the revision they sealed.** `upload_file_replacing_draft_sealed`
+  and `upload_new_revision_sealed` work like `upload_file_replacing_draft_from`
+  and `upload_new_revision_from`, and return a `SealedUpload` with the file's
+  uid and the id of the revision they sealed. Drive often does not list a node
+  made a moment ago, so a client that read the file back to learn that id
+  often got nothing. The existing functions are unchanged.
+
+### Fixed
+
+- **A file read right after a new revision of it is uploaded shows that
+  revision.** Sealing a revision left the file's node in the entity cache, so
+  `get_node` kept reporting the replaced revision as active until a Drive event
+  invalidated it. Sealing now drops the node from the cache, as
+  `restore_revision` already did.
+
 ## [0.12.6] — 2026-11-22
 
 ### Fixed

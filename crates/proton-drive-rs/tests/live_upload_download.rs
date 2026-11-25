@@ -171,6 +171,63 @@ async fn new_revision_roundtrip() {
     cleanup(client, &[uid]).await;
 }
 
+/// The sealed uploads return the revision they made, which is the one the
+/// file then reads as active.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn sealed_uploads_return_the_active_revision() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = &live.client;
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+    let name = format!("rt-sealed-{}.txt", common::unique_suffix());
+    let v1 = b"first".to_vec();
+    let v2 = b"second, longer".to_vec();
+
+    let first = client
+        .upload_file_replacing_draft_sealed(
+            &root.uid,
+            &name,
+            "text/plain",
+            std::io::Cursor::new(&v1),
+            v1.len() as i64,
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("upload v1");
+    let active = |node: Option<proton_drive_rs::Node>| match node.map(|n| n.kind) {
+        Some(proton_drive_rs::NodeKind::File {
+            active_revision_id, ..
+        }) => active_revision_id,
+        _ => None,
+    };
+    let read = client.get_node(&first.node_uid).await.expect("read v1");
+    assert_eq!(active(read), Some(first.revision_id.clone()));
+
+    let second = client
+        .upload_new_revision_sealed(
+            &first.node_uid,
+            std::io::Cursor::new(&v2),
+            v2.len() as i64,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("upload v2");
+    assert_eq!(second.node_uid, first.node_uid);
+    assert_ne!(second.revision_id, first.revision_id);
+    let read = client.get_node(&first.node_uid).await.expect("read v2");
+    assert_eq!(active(read), Some(second.revision_id));
+
+    cleanup(client, &[first.node_uid]).await;
+}
+
 /// Single-block partial reads: every `download_range` slice must equal the
 /// corresponding plaintext slice, with clamping/empty edge cases.
 #[tokio::test]
