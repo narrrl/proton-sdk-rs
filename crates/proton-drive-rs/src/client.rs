@@ -422,6 +422,15 @@ struct FileDraftSpec<'a> {
 /// Produced by [`ProtonDriveClient::create_file_draft`] (new file) or
 /// [`ProtonDriveClient::create_revision_draft`] (new revision on an existing
 /// file); consumed by `write_blocks` + `seal_revision`.
+/// A file revision an upload sealed: the file, and the id of the revision,
+/// which is the file's active revision once the upload returns. The same id
+/// as [`NodeKind::File`]'s `active_revision_id` when the file is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedUpload {
+    pub node_uid: NodeUid,
+    pub revision_id: String,
+}
+
 struct RevisionDraft {
     volume_id: VolumeId,
     link_id: LinkId,
@@ -2454,6 +2463,7 @@ impl ProtonDriveClient {
             false,
         )
         .await
+        .map(|sealed| sealed.node_uid)
     }
 
     /// Like [`upload_file_from`](Self::upload_file_from) but recovers a name
@@ -2489,6 +2499,37 @@ impl ProtonDriveClient {
             true,
         )
         .await
+        .map(|sealed| sealed.node_uid)
+    }
+
+    /// Like [`upload_file_replacing_draft_from`](Self::upload_file_replacing_draft_from),
+    /// but also returns the id of the revision it sealed. A node made a moment
+    /// ago is often not listed yet, so reading it back is no way to learn that
+    /// id; this is.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_file_replacing_draft_sealed<R: Read + Send>(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        media_type: &str,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+        aead: bool,
+    ) -> Result<SealedUpload> {
+        self.upload_file_from_inner(
+            parent_uid,
+            name,
+            media_type,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+            aead,
+            true,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2503,7 +2544,7 @@ impl ProtonDriveClient {
         last_modification_time: Option<ModificationTime>,
         aead: bool,
         override_existing_draft: bool,
-    ) -> Result<NodeUid> {
+    ) -> Result<SealedUpload> {
         let mut timer = self.telemetry.start("upload_file");
         timer.attr("aead", aead);
         let draft = self
@@ -2536,7 +2577,10 @@ impl ProtonDriveClient {
         }
 
         timer.success();
-        Ok(file_uid)
+        Ok(SealedUpload {
+            node_uid: file_uid,
+            revision_id: draft.revision_id.clone(),
+        })
     }
 
     /// Upload a new revision of an existing file with the given plaintext
@@ -2673,6 +2717,28 @@ impl ProtonDriveClient {
         thumbnails: Vec<Thumbnail>,
         last_modification_time: Option<ModificationTime>,
     ) -> Result<()> {
+        self.upload_new_revision_sealed(
+            file_uid,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Like [`upload_new_revision_from`](Self::upload_new_revision_from), but
+    /// returns the file and the id of the revision it sealed, which is now the
+    /// file's active revision.
+    pub async fn upload_new_revision_sealed<R: Read + Send>(
+        &self,
+        file_uid: &NodeUid,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+    ) -> Result<SealedUpload> {
         let mut timer = self.telemetry.start("upload_new_revision");
         let draft = self.create_revision_draft(file_uid, intended_size).await?;
 
@@ -2682,7 +2748,10 @@ impl ProtonDriveClient {
             .await?;
 
         timer.success();
-        Ok(())
+        Ok(SealedUpload {
+            node_uid: file_uid.clone(),
+            revision_id: draft.revision_id.clone(),
+        })
     }
 
     /// Upload a photo under the Photos root, sealing the revision with photo
@@ -5658,6 +5727,14 @@ impl ProtonDriveClient {
             draft.volume_id, draft.link_id, draft.revision_id
         );
         let _: proton_sdk::api::ApiResponse = self.http.put(&seal_path, &seal_request).await?;
+        // The cached node still names the revision this one replaced, and a
+        // read served from it reported that as active until an event came in.
+        // The revision is sealed whatever happens here, so a cache that cannot
+        // let go of the node does not fail the upload.
+        let file_uid = NodeUid::new(draft.volume_id.clone(), draft.link_id.clone());
+        if let Err(error) = self.entities.remove_node(&file_uid).await {
+            tracing::warn!(%error, "could not drop the cached node after sealing a revision");
+        }
         Ok(())
     }
 
