@@ -2291,11 +2291,11 @@ impl ProtonDriveClient {
 
     /// Upload a new file under `parent_uid` with the given plaintext `contents`.
     ///
-    /// Core single-file path (legacy SEIPDv1, no thumbnails, buffered). Mirrors
-    /// C# `NewFileDraftProvider` + `RevisionWriter`: create a draft (new node
-    /// key + content key), encrypt/sign/verify/upload each 4 MiB block, then
-    /// seal the revision with a signed manifest and encrypted extended
-    /// attributes. Returns the new file's [`NodeUid`].
+    /// The buffered form of [`upload_file_from`](Self::upload_file_from): no
+    /// thumbnails, no modification time, and a legacy (SEIPDv1) content key. A
+    /// small enough file goes up in one request when small uploads are on (see
+    /// [`with_small_file_upload`](Self::with_small_file_upload)). Returns the
+    /// new file's [`NodeUid`].
     pub async fn upload_file(
         &self,
         parent_uid: &NodeUid,
@@ -2303,24 +2303,7 @@ impl ProtonDriveClient {
         media_type: &str,
         contents: &[u8],
     ) -> Result<NodeUid> {
-        // Upstream budgets roughly 10% encryption overhead. This convenience
-        // method already owns a seekable in-memory slice, so it is the safe
-        // place to select the one-request backend without changing streaming
-        // reader bounds or buffering arbitrary inputs.
-        if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
-        {
-            match self
-                .upload_small_file(parent_uid, name, media_type, contents)
-                .await
-            {
-                Ok(uid) => return Ok(uid),
-                Err(error) if small_upload_should_fall_back(&error) => {
-                    tracing::debug!(%error, "small file upload conflicted; falling back to blocks");
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.upload_file_from(
+        self.upload_file_from_inner(
             parent_uid,
             name,
             media_type,
@@ -2329,22 +2312,44 @@ impl ProtonDriveClient {
             Vec::new(),
             None,
             false,
+            false,
         )
         .await
+        .map(|sealed| sealed.node_uid)
     }
 
+    /// Create `name` under `parent_uid` and seal its only revision in one
+    /// request (`POST v2/volumes/{vid}/files/small`). The content block and the
+    /// thumbnails travel in the same multipart body. Mirrors C#
+    /// `SmallRevisionUploadBackend` for a new file.
+    ///
+    /// The request is not idempotent, so it is never sent twice: a lost reply
+    /// leaves the caller not knowing whether the file exists (see
+    /// [`small_upload_should_fall_back`]).
+    #[allow(clippy::too_many_arguments)]
     async fn upload_small_file(
         &self,
         parent_uid: &NodeUid,
         name: &str,
         media_type: &str,
         contents: &[u8],
-    ) -> Result<NodeUid> {
+        thumbnails: &[Thumbnail],
+        modification_time: Option<ModificationTime>,
+        aead: bool,
+    ) -> Result<SealedUpload> {
+        let mut timer = self.telemetry.start("upload_file");
+        timer.attr("backend", "small");
+        timer.attr("aead", aead);
         let parent_key = self.folder_node_key(parent_uid).await?;
         let parent_hash_key = self.parent_hash_key(parent_uid, &parent_key).await?;
         let (_address_id, email, signing_key) = self.membership_address().await?;
-        let node = generate_node_key()?;
-        let content_key = ContentKey::generate();
+        // As in `create_file_draft`: an AEAD file gets a v6 node key, so its v6
+        // content-key PKESK has a matching recipient.
+        let (node, content_key) = if aead {
+            (generate_node_key_aead()?, ContentKey::generate_aead())
+        } else {
+            (generate_node_key()?, ContentKey::generate())
+        };
 
         let encrypted_name =
             parent_key.encrypt_and_sign(&signing_key, name.as_bytes(), true, false)?;
@@ -2353,45 +2358,14 @@ impl ProtonDriveClient {
         let passphrase_signature = signing_key.sign_detached(&node.passphrase)?;
         let content_key_packet = content_key.to_packet(&node.key)?;
         let content_key_signature = node.key.sign_detached(&content_key.export()?)?;
-
-        let mut manifest = Vec::new();
-        let mut binary_parts = Vec::new();
-        let (block_sizes, encrypted_signature, verification_token) = if contents.is_empty() {
-            (Vec::new(), None, None)
-        } else {
-            let ciphertext = content_key.encrypt_block(contents)?;
-            manifest.extend_from_slice(&Sha256::digest(&ciphertext));
-            let encrypted_signature = node
-                .key
-                .encrypt(signing_key.sign_detached(contents)?.as_bytes())?;
-            let code_start = content_key_packet.len().checked_sub(32).ok_or_else(|| {
-                ProtonError::invalid_operation("content key packet has no verification code")
-            })?;
-            let token = verification_token(&content_key_packet[code_start..], &ciphertext);
-            binary_parts.push(("ContentBlock".to_owned(), ciphertext));
-            (
-                vec![contents.len() as i32],
-                Some(encrypted_signature),
-                Some(BASE64.encode(token)),
-            )
-        };
-
-        let sha1_hex = hex::encode(Sha1::digest(contents));
-        let manifest_signature = signing_key.sign_detached(&manifest)?;
-        let extended_attributes = ExtendedAttributes {
-            common: CommonExtendedAttributes {
-                size: Some(contents.len() as i64),
-                modification_time: None,
-                block_sizes: Some(block_sizes),
-                digests: Some(FileContentDigests { sha1: sha1_hex }),
-            },
-            location: None,
-        };
-        let encrypted_xattr = node.key.encrypt_and_sign(
+        let body = small_upload_body(
+            &content_key,
+            &node.key,
             &signing_key,
-            &serde_json::to_vec(&extended_attributes)?,
-            false,
-            true,
+            &content_key_packet,
+            contents,
+            thumbnails,
+            modification_time,
         )?;
         let metadata = SmallFileUploadMetadataRequest {
             name: encrypted_name,
@@ -2403,20 +2377,25 @@ impl ProtonDriveClient {
             media_type: media_type.to_owned(),
             content_key_packet: BASE64.encode(content_key_packet),
             content_key_signature,
-            manifest_signature,
+            manifest_signature: body.manifest_signature,
             checksum_verified: false,
             signature_email: email,
-            content_block_verification_token: verification_token,
-            extended_attributes: encrypted_xattr,
+            content_block_verification_token: body.verification_token,
+            extended_attributes: body.extended_attributes,
             photo: None,
-            content_block_encrypted_signature: encrypted_signature,
+            content_block_encrypted_signature: body.encrypted_signature,
         };
         let path = format!("v2/volumes/{}/files/small", parent_uid.volume_id);
         let response: SmallUploadResponse = self
             .http
-            .post_multipart(&path, &metadata, &binary_parts)
+            .post_multipart(&path, &metadata, &body.parts)
             .await?;
-        Ok(NodeUid::new(parent_uid.volume_id.clone(), response.link_id))
+        timer.attr("size", contents.len());
+        timer.success();
+        Ok(SealedUpload {
+            node_uid: NodeUid::new(parent_uid.volume_id.clone(), response.link_id),
+            revision_id: response.revision_id,
+        })
     }
 
     /// Streaming variant of [`upload_file`]: read the plaintext from `reader`
@@ -2532,8 +2511,98 @@ impl ProtonDriveClient {
         .await
     }
 
+    /// Every new-file upload ends here. A file that fits the small-upload
+    /// budget, with its thumbnails, goes up in one request; anything else, or a
+    /// small upload the API turns down, takes the block path.
+    ///
+    /// To know whether the file fits, up to the budget plus one byte is read
+    /// ahead into memory, at most about 116 KiB. A reader with more than that
+    /// sends the bytes read ahead first and then the rest, so a file that grew
+    /// since `intended_size` was taken still uploads whole. Upstream makes the
+    /// same choice from a seekable stream (`RevisionUploadBackendFactory`).
     #[allow(clippy::too_many_arguments)]
     async fn upload_file_from_inner<R: Read + Send>(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        media_type: &str,
+        mut reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+        aead: bool,
+        override_existing_draft: bool,
+    ) -> Result<SealedUpload> {
+        let Some(budget) = self.small_upload_budget(intended_size, &thumbnails) else {
+            return self
+                .upload_file_blocks(
+                    parent_uid,
+                    name,
+                    media_type,
+                    reader,
+                    intended_size,
+                    thumbnails,
+                    last_modification_time,
+                    aead,
+                    override_existing_draft,
+                )
+                .await;
+        };
+        let ahead = read_ahead(&mut reader, budget)?;
+        if ahead.len() > budget {
+            return self
+                .upload_file_blocks(
+                    parent_uid,
+                    name,
+                    media_type,
+                    Cursor::new(ahead).chain(reader),
+                    intended_size,
+                    thumbnails,
+                    last_modification_time,
+                    aead,
+                    override_existing_draft,
+                )
+                .await;
+        }
+        match self
+            .upload_small_file(
+                parent_uid,
+                name,
+                media_type,
+                &ahead,
+                &thumbnails,
+                last_modification_time,
+                aead,
+            )
+            .await
+        {
+            Ok(sealed) => return Ok(sealed),
+            // The name is taken, by a file or by a draft. The block path tells
+            // the two apart and clears a stale draft of ours.
+            Err(error) if small_upload_should_fall_back(&error) => {
+                tracing::debug!(%error, "small file upload conflicted; falling back to blocks");
+            }
+            Err(error) => return Err(error),
+        }
+        let size = ahead.len() as i64;
+        self.upload_file_blocks(
+            parent_uid,
+            name,
+            media_type,
+            Cursor::new(ahead),
+            size,
+            thumbnails,
+            last_modification_time,
+            aead,
+            override_existing_draft,
+        )
+        .await
+    }
+
+    /// The block path for a new file: create a draft, upload the blocks and the
+    /// thumbnails, then seal the revision.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_file_blocks<R: Read + Send>(
         &self,
         parent_uid: &NodeUid,
         name: &str,
@@ -2546,6 +2615,7 @@ impl ProtonDriveClient {
         override_existing_draft: bool,
     ) -> Result<SealedUpload> {
         let mut timer = self.telemetry.start("upload_file");
+        timer.attr("backend", "blocks");
         timer.attr("aead", aead);
         let draft = self
             .create_file_draft(FileDraftSpec {
@@ -2583,25 +2653,29 @@ impl ProtonDriveClient {
         })
     }
 
+    /// How many content bytes a small upload can take next to `thumbnails`,
+    /// or `None` when this upload should not try one: small uploads are off,
+    /// the thumbnails alone use up the budget, or `intended_size` says the file
+    /// is bigger (or is not a size).
+    fn small_upload_budget(&self, intended_size: i64, thumbnails: &[Thumbnail]) -> Option<usize> {
+        if !self.small_file_upload.load(Ordering::Relaxed) {
+            return None;
+        }
+        let budget = small_upload_content_budget(thumbnails)?;
+        let intended = usize::try_from(intended_size).ok()?;
+        (intended <= budget).then_some(budget)
+    }
+
     /// Upload a new revision of an existing file with the given plaintext
     /// `contents`, superseding its currently active revision.
     ///
-    /// Mirrors C# `NewRevisionDraftProvider`: reuse the file's existing node and
-    /// content keys (no new key generation, no name/passphrase), open a draft
-    /// revision based on the active one, then write blocks and seal exactly as a
-    /// fresh upload. The new revision becomes active once sealed.
+    /// The buffered form of
+    /// [`upload_new_revision_from`](Self::upload_new_revision_from), with no
+    /// thumbnails and no modification time. Mirrors C#
+    /// `NewRevisionDraftProvider`: the file's node and content keys are reused,
+    /// and the new revision becomes active once sealed.
     pub async fn upload_new_revision(&self, file_uid: &NodeUid, contents: &[u8]) -> Result<()> {
-        if self.small_file_upload.load(Ordering::Relaxed) && small_upload_applicable(contents.len())
-        {
-            match self.upload_small_revision(file_uid, contents, None).await {
-                Ok(()) => return Ok(()),
-                Err(error) if small_upload_should_fall_back(&error) => {
-                    tracing::debug!(%error, "small revision upload conflicted; falling back to blocks");
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.upload_new_revision_from(
+        self.upload_new_revision_sealed(
             file_uid,
             Cursor::new(contents),
             contents.len() as i64,
@@ -2609,14 +2683,12 @@ impl ProtonDriveClient {
             None,
         )
         .await
+        .map(|_| ())
     }
 
-    async fn upload_small_revision(
-        &self,
-        file_uid: &NodeUid,
-        contents: &[u8],
-        modification_time: Option<ModificationTime>,
-    ) -> Result<()> {
+    /// The file's keys and active revision, which a small revision upload
+    /// needs before it can build its request.
+    async fn small_revision_keys(&self, file_uid: &NodeUid) -> Result<SmallRevisionKeys> {
         let details = self
             .get_link_details(&file_uid.volume_id, std::slice::from_ref(&file_uid.link_id))
             .await?;
@@ -2627,7 +2699,7 @@ impl ProtonDriveClient {
         let file = detail.file.ok_or_else(|| {
             ProtonError::invalid_operation(format!("node {file_uid} is not a file"))
         })?;
-        let packet = BASE64
+        let content_key_packet = BASE64
             .decode(
                 file.content_key_packet
                     .ok_or_else(|| {
@@ -2646,64 +2718,69 @@ impl ProtonDriveClient {
             .resolve_parent_key(&file_uid.volume_id, &detail.link)
             .await?;
         let node_key = decrypt_link(&parent_key, &detail.link)?.node_key;
-        let content_key = node_key.decrypt_content_key(&packet)?;
+        let content_key = node_key.decrypt_content_key(&content_key_packet)?;
         let (_address_id, email, signing_key) = self.membership_address().await?;
+        Ok(SmallRevisionKeys {
+            current_revision_id,
+            node_key,
+            content_key,
+            content_key_packet,
+            email,
+            signing_key,
+        })
+    }
 
-        let mut manifest = Vec::new();
-        let mut binary_parts = Vec::new();
-        let (block_sizes, encrypted_signature, verification_token) = if contents.is_empty() {
-            (Vec::new(), None, None)
-        } else {
-            let ciphertext = content_key.encrypt_block(contents)?;
-            manifest.extend_from_slice(&Sha256::digest(&ciphertext));
-            let encrypted_signature =
-                node_key.encrypt(signing_key.sign_detached(contents)?.as_bytes())?;
-            let code_start = packet.len().checked_sub(32).ok_or_else(|| {
-                ProtonError::invalid_operation("content key packet has no verification code")
-            })?;
-            let token = verification_token(&packet[code_start..], &ciphertext);
-            binary_parts.push(("ContentBlock".to_owned(), ciphertext));
-            (
-                vec![contents.len() as i32],
-                Some(encrypted_signature),
-                Some(BASE64.encode(token)),
-            )
-        };
-        let extended_attributes = ExtendedAttributes {
-            common: CommonExtendedAttributes {
-                size: Some(contents.len() as i64),
-                modification_time: modification_time.map(format_modification_time),
-                block_sizes: Some(block_sizes),
-                digests: Some(FileContentDigests {
-                    sha1: hex::encode(Sha1::digest(contents)),
-                }),
-            },
-            location: None,
-        };
-        let encrypted_xattr = node_key.encrypt_and_sign(
-            &signing_key,
-            &serde_json::to_vec(&extended_attributes)?,
-            false,
-            true,
+    /// Add a revision to `file_uid` and seal it in one request
+    /// (`POST v2/volumes/{vid}/files/{lid}/revisions/small`). The content key is
+    /// the file's own, so the revision is AEAD exactly when the file is. Like
+    /// [`upload_small_file`](Self::upload_small_file), it is never sent twice.
+    async fn upload_small_revision(
+        &self,
+        file_uid: &NodeUid,
+        keys: SmallRevisionKeys,
+        contents: &[u8],
+        thumbnails: &[Thumbnail],
+        modification_time: Option<ModificationTime>,
+    ) -> Result<SealedUpload> {
+        let mut timer = self.telemetry.start("upload_new_revision");
+        timer.attr("backend", "small");
+        let body = small_upload_body(
+            &keys.content_key,
+            &keys.node_key,
+            &keys.signing_key,
+            &keys.content_key_packet,
+            contents,
+            thumbnails,
+            modification_time,
         )?;
         let metadata = SmallRevisionUploadMetadataRequest {
-            current_revision_id,
-            manifest_signature: signing_key.sign_detached(&manifest)?,
+            current_revision_id: keys.current_revision_id,
+            manifest_signature: body.manifest_signature,
             checksum_verified: false,
-            signature_email: email,
-            content_block_encrypted_signature: encrypted_signature,
-            content_block_verification_token: verification_token,
-            extended_attributes: encrypted_xattr,
+            signature_email: keys.email,
+            content_block_encrypted_signature: body.encrypted_signature,
+            content_block_verification_token: body.verification_token,
+            extended_attributes: body.extended_attributes,
         };
         let path = format!(
             "v2/volumes/{}/files/{}/revisions/small",
             file_uid.volume_id, file_uid.link_id
         );
-        let _: SmallUploadResponse = self
+        let response: SmallUploadResponse = self
             .http
-            .post_multipart(&path, &metadata, &binary_parts)
+            .post_multipart(&path, &metadata, &body.parts)
             .await?;
-        Ok(())
+        // As after a seal: the cached node still names the revision this one
+        // replaced.
+        if let Err(error) = self.entities.remove_node(file_uid).await {
+            tracing::warn!(%error, "could not drop the cached node after a small revision");
+        }
+        timer.attr("size", contents.len());
+        timer.success();
+        Ok(SealedUpload {
+            node_uid: file_uid.clone(),
+            revision_id: response.revision_id,
+        })
     }
 
     /// Streaming variant of [`upload_new_revision`]: read the plaintext from
@@ -2731,7 +2808,71 @@ impl ProtonDriveClient {
     /// Like [`upload_new_revision_from`](Self::upload_new_revision_from), but
     /// returns the file and the id of the revision it sealed, which is now the
     /// file's active revision.
+    ///
+    /// A revision that fits the small-upload budget goes up in one request, as
+    /// in [`upload_file_from`](Self::upload_file_from). It falls back to the
+    /// block path when the file's keys cannot be read first (upstream does the
+    /// same) or when the API reports a conflicting draft.
     pub async fn upload_new_revision_sealed<R: Read + Send>(
+        &self,
+        file_uid: &NodeUid,
+        mut reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+    ) -> Result<SealedUpload> {
+        let Some(budget) = self.small_upload_budget(intended_size, &thumbnails) else {
+            return self
+                .upload_revision_blocks(
+                    file_uid,
+                    reader,
+                    intended_size,
+                    thumbnails,
+                    last_modification_time,
+                )
+                .await;
+        };
+        let ahead = read_ahead(&mut reader, budget)?;
+        if ahead.len() > budget {
+            return self
+                .upload_revision_blocks(
+                    file_uid,
+                    Cursor::new(ahead).chain(reader),
+                    intended_size,
+                    thumbnails,
+                    last_modification_time,
+                )
+                .await;
+        }
+        match self.small_revision_keys(file_uid).await {
+            Ok(keys) => match self
+                .upload_small_revision(file_uid, keys, &ahead, &thumbnails, last_modification_time)
+                .await
+            {
+                Ok(sealed) => return Ok(sealed),
+                Err(error) if small_upload_should_fall_back(&error) => {
+                    tracing::debug!(%error, "small revision upload conflicted; falling back to blocks");
+                }
+                Err(error) => return Err(error),
+            },
+            Err(error) => {
+                tracing::debug!(%error, "cannot read the file's keys for a small revision; falling back to blocks");
+            }
+        }
+        let size = ahead.len() as i64;
+        self.upload_revision_blocks(
+            file_uid,
+            Cursor::new(ahead),
+            size,
+            thumbnails,
+            last_modification_time,
+        )
+        .await
+    }
+
+    /// The block path for a new revision: open a revision draft, upload the
+    /// blocks and the thumbnails, then seal it.
+    async fn upload_revision_blocks<R: Read + Send>(
         &self,
         file_uid: &NodeUid,
         reader: R,
@@ -2740,6 +2881,7 @@ impl ProtonDriveClient {
         last_modification_time: Option<ModificationTime>,
     ) -> Result<SealedUpload> {
         let mut timer = self.telemetry.start("upload_new_revision");
+        timer.attr("backend", "blocks");
         let draft = self.create_revision_draft(file_uid, intended_size).await?;
 
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
@@ -8808,9 +8950,126 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Upstream's 10% encryption-overhead budget for the 128 KiB endpoint limit.
+/// Whether `plaintext_size` bytes of content and thumbnails fit one small
+/// upload: upstream budgets 10% encryption overhead against the endpoint's
+/// 128 KiB limit, so the plaintext times 1.1 must stay under it.
+#[cfg(test)]
 fn small_upload_applicable(plaintext_size: usize) -> bool {
     plaintext_size.saturating_mul(11) < SMALL_UPLOAD_SIZE_LIMIT * 10
+}
+
+/// The most content bytes a small upload can carry next to `thumbnails`, or
+/// `None` when the thumbnails alone do not fit. Upstream counts the thumbnails
+/// in the same budget (`RevisionUploadBackendFactory.GetTotalPlaintextSize`).
+fn small_upload_content_budget(thumbnails: &[Thumbnail]) -> Option<usize> {
+    let total = (SMALL_UPLOAD_SIZE_LIMIT * 10 - 1) / 11;
+    let thumbnails: usize = thumbnails.iter().map(|t| t.content.len()).sum();
+    total.checked_sub(thumbnails)
+}
+
+/// Read up to `budget + 1` bytes of `reader`: all of it when it fits the
+/// budget, and one byte more than fits when it does not.
+fn read_ahead<R: Read>(reader: &mut R, budget: usize) -> Result<Vec<u8>> {
+    let mut ahead = vec![0u8; budget + 1];
+    let n = read_full_block(reader, &mut ahead)?;
+    ahead.truncate(n);
+    Ok(ahead)
+}
+
+/// The file's keys and active revision, for a small revision upload.
+struct SmallRevisionKeys {
+    current_revision_id: String,
+    node_key: PrivateKey,
+    content_key: ContentKey,
+    content_key_packet: Vec<u8>,
+    email: String,
+    signing_key: PrivateKey,
+}
+
+/// The parts of a small upload that do not depend on whether it makes a file
+/// or a revision.
+struct SmallUploadBody {
+    manifest_signature: String,
+    encrypted_signature: Option<String>,
+    verification_token: Option<String>,
+    extended_attributes: String,
+    /// `ContentBlock` (absent for an empty file), then one
+    /// `ThumbnailBlockType_{type}` per thumbnail, in type order.
+    parts: Vec<(String, Vec<u8>)>,
+}
+
+/// Encrypt and sign one small upload's content block, thumbnails and extended
+/// attributes. The manifest is the thumbnails' digests in type order, then the
+/// content block's, as on the block path. Mirrors C#
+/// `SmallRevisionUploadBackend` and `FilesApiClient.BuildSmallUploadContent`.
+fn small_upload_body(
+    content_key: &ContentKey,
+    node_key: &PrivateKey,
+    signing_key: &PrivateKey,
+    content_key_packet: &[u8],
+    contents: &[u8],
+    thumbnails: &[Thumbnail],
+    modification_time: Option<ModificationTime>,
+) -> Result<SmallUploadBody> {
+    let mut parts = Vec::with_capacity(1 + thumbnails.len());
+    let (block_sizes, content_digests, encrypted_signature, verification_token) =
+        if contents.is_empty() {
+            (Vec::new(), Vec::new(), None, None)
+        } else {
+            let ciphertext = content_key.encrypt_block(contents)?;
+            let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+            let encrypted_signature =
+                node_key.encrypt(signing_key.sign_detached(contents)?.as_bytes())?;
+            let code_start = content_key_packet.len().checked_sub(32).ok_or_else(|| {
+                ProtonError::invalid_operation("content key packet has no verification code")
+            })?;
+            let token = verification_token(&content_key_packet[code_start..], &ciphertext);
+            parts.push(("ContentBlock".to_owned(), ciphertext));
+            (
+                vec![contents.len() as i32],
+                vec![(1, digest)],
+                Some(encrypted_signature),
+                Some(BASE64.encode(token)),
+            )
+        };
+
+    let mut sorted: Vec<&Thumbnail> = thumbnails.iter().collect();
+    sorted.sort_by_key(|t| t.thumbnail_type);
+    let mut thumbnail_digests = Vec::with_capacity(sorted.len());
+    for thumbnail in sorted {
+        let ciphertext = content_key.encrypt_thumbnail(signing_key, &thumbnail.content)?;
+        thumbnail_digests.push(Sha256::digest(&ciphertext).into());
+        parts.push((
+            format!("ThumbnailBlockType_{}", thumbnail.thumbnail_type.as_i32()),
+            ciphertext,
+        ));
+    }
+    let manifest = assemble_manifest(&thumbnail_digests, content_digests);
+
+    let extended_attributes = ExtendedAttributes {
+        common: CommonExtendedAttributes {
+            size: Some(contents.len() as i64),
+            modification_time: modification_time.map(format_modification_time),
+            block_sizes: Some(block_sizes),
+            digests: Some(FileContentDigests {
+                sha1: hex::encode(Sha1::digest(contents)),
+            }),
+        },
+        location: None,
+    };
+    let extended_attributes = node_key.encrypt_and_sign(
+        signing_key,
+        &serde_json::to_vec(&extended_attributes)?,
+        false,
+        true,
+    )?;
+    Ok(SmallUploadBody {
+        manifest_signature: signing_key.sign_detached(&manifest)?,
+        encrypted_signature,
+        verification_token,
+        extended_attributes,
+        parts,
+    })
 }
 
 /// Whether a failed one-request small upload should be retried on the regular
@@ -9290,8 +9549,9 @@ mod tests {
         aggregate_outcomes, alternate_file_names, alternate_folder_names, assemble_manifest,
         context_share_path, drive_items, has_active_regular_volume, is_expired_upload_token,
         is_listable_revision_state, is_upload_timeout, join_node_path, missing_related_links,
-        path_segments, photos_only_in_album, record_transfer_outcome, resolve_parent_keys,
-        run_context_share_mutation, share_membership_from_dto, small_upload_applicable,
+        path_segments, photos_only_in_album, read_ahead, record_transfer_outcome,
+        resolve_parent_keys, run_context_share_mutation, share_membership_from_dto,
+        small_upload_applicable, small_upload_body, small_upload_content_budget,
         small_upload_should_fall_back, split_link_password, take_block_target,
         take_thumbnail_target, to_drive_event, validate_node_name,
     };
@@ -9490,6 +9750,119 @@ mod tests {
         assert!(small_upload_applicable(119_156));
         assert!(!small_upload_applicable(119_157));
         assert!(!small_upload_applicable(usize::MAX));
+    }
+
+    fn thumbnail(
+        thumbnail_type: crate::node::ThumbnailType,
+        size: usize,
+    ) -> crate::node::Thumbnail {
+        crate::node::Thumbnail {
+            thumbnail_type,
+            content: vec![7; size],
+        }
+    }
+
+    #[test]
+    fn thumbnails_count_against_the_small_upload_budget() {
+        use crate::node::ThumbnailType;
+        assert_eq!(small_upload_content_budget(&[]), Some(119_156));
+        assert!(small_upload_applicable(
+            small_upload_content_budget(&[]).unwrap()
+        ));
+        let thumbnails = [
+            thumbnail(ThumbnailType::Thumbnail, 10_000),
+            thumbnail(ThumbnailType::Preview, 50_000),
+        ];
+        assert_eq!(small_upload_content_budget(&thumbnails), Some(59_156));
+        let too_big = [thumbnail(ThumbnailType::Preview, 119_157)];
+        assert_eq!(small_upload_content_budget(&too_big), None);
+    }
+
+    #[test]
+    fn read_ahead_takes_a_whole_small_reader_and_one_byte_past_the_budget_of_a_big_one() {
+        use std::io::{Cursor, Read};
+        let small = vec![1u8; 100];
+        let mut reader = Cursor::new(small.clone());
+        assert_eq!(read_ahead(&mut reader, 100).unwrap(), small);
+
+        let big: Vec<u8> = (0..=255).cycle().take(1_000).collect();
+        let mut reader = Cursor::new(big.clone());
+        let ahead = read_ahead(&mut reader, 100).unwrap();
+        assert_eq!(ahead.len(), 101);
+        // What the block path is then given is the whole file, in order.
+        let mut rest = Vec::new();
+        Cursor::new(ahead)
+            .chain(reader)
+            .read_to_end(&mut rest)
+            .unwrap();
+        assert_eq!(rest, big);
+    }
+
+    #[test]
+    fn a_small_upload_body_carries_the_block_then_the_thumbnails_in_type_order() {
+        use crate::node::ThumbnailType;
+        use proton_sdk::crypto::{ContentKey, generate_node_key, generate_node_key_aead};
+        for aead in [false, true] {
+            let (node, content_key) = if aead {
+                (
+                    generate_node_key_aead().unwrap(),
+                    ContentKey::generate_aead(),
+                )
+            } else {
+                (generate_node_key().unwrap(), ContentKey::generate())
+            };
+            let packet = content_key.to_packet(&node.key).unwrap();
+            let thumbnails = [
+                thumbnail(ThumbnailType::Preview, 300),
+                thumbnail(ThumbnailType::Thumbnail, 200),
+            ];
+            let body = small_upload_body(
+                &content_key,
+                &node.key,
+                &node.key,
+                &packet,
+                b"small file",
+                &thumbnails,
+                None,
+            )
+            .unwrap();
+            let names: Vec<&str> = body.parts.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "ContentBlock",
+                    "ThumbnailBlockType_1",
+                    "ThumbnailBlockType_2"
+                ]
+            );
+            assert_eq!(
+                &content_key.decrypt_block(&body.parts[0].1).unwrap()[..],
+                b"small file"
+            );
+            assert_eq!(
+                content_key.decrypt_thumbnail(&body.parts[1].1).unwrap(),
+                vec![7; 200]
+            );
+            assert_eq!(
+                content_key.decrypt_thumbnail(&body.parts[2].1).unwrap(),
+                vec![7; 300]
+            );
+            assert!(body.verification_token.is_some());
+            assert!(body.encrypted_signature.is_some());
+        }
+    }
+
+    #[test]
+    fn an_empty_small_upload_sends_no_content_block() {
+        use proton_sdk::crypto::{ContentKey, generate_node_key};
+        let node = generate_node_key().unwrap();
+        let content_key = ContentKey::generate();
+        let packet = content_key.to_packet(&node.key).unwrap();
+        let body =
+            small_upload_body(&content_key, &node.key, &node.key, &packet, b"", &[], None).unwrap();
+        assert!(body.parts.is_empty());
+        assert!(body.verification_token.is_none());
+        assert!(body.encrypted_signature.is_none());
     }
 
     #[test]
