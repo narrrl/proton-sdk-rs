@@ -372,6 +372,7 @@ impl ApiHttpClient {
         let metadata = serde_json::to_vec(metadata)?;
         let mut timer = self.telemetry().start("http_request");
         timer.attr("method", "POST");
+        timer.attr("endpoint", endpoint(path));
         let rejected_token = self.tokens().access_token.clone();
         let response = self
             .send_multipart_with_token(path, &metadata, binary_parts, &rejected_token)
@@ -433,6 +434,7 @@ impl ApiHttpClient {
     ) -> Result<T> {
         let mut timer = self.telemetry().start("http_request");
         timer.attr("method", method.as_str());
+        timer.attr("endpoint", endpoint(path));
 
         let access_token = self.tokens().access_token.clone();
 
@@ -1581,5 +1583,39 @@ mod tests {
         assert!(client.get::<ApiResponse>("needs-refresh").await.is_err());
         assert_eq!(refreshes.load(Ordering::SeqCst), 1, "one refresh, no retry");
         server.abort();
+    }
+}
+
+/// `path` with its ids replaced by `{id}` and without its query, so telemetry
+/// can group requests by endpoint without carrying volume, share or link ids.
+fn endpoint(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    path.split('/')
+        .map(|segment| {
+            let id_like = segment.len() >= 16
+                || segment.contains('=')
+                || (segment.chars().any(|c| c.is_ascii_digit())
+                    && segment.chars().any(|c| c.is_ascii_alphabetic())
+                    && !segment.starts_with('v'));
+            if id_like { "{id}" } else { segment }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::endpoint;
+
+    #[test]
+    fn an_endpoint_keeps_the_route_and_drops_the_ids() {
+        assert_eq!(
+            endpoint(
+                "v2/volumes/AbC123xyz-_09AbC123xyz==/files/Zz9_8yY7xX6wW5vV4uU==/revisions/Rr1?Page=2"
+            ),
+            "v2/volumes/{id}/files/{id}/revisions/{id}"
+        );
+        assert_eq!(endpoint("drive/shares/my-files"), "drive/shares/my-files");
+        assert_eq!(endpoint("core/v4/addresses"), "core/v4/addresses");
     }
 }
