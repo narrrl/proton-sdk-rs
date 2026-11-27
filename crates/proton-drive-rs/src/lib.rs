@@ -49,7 +49,7 @@ mod timestamp;
 mod transport;
 
 pub use cache::{CachedNodeInfo, DriveEntityCache};
-pub use client::{ProtonDriveClient, SealedUpload, parse_public_link_url};
+pub use client::{ProtonDriveClient, RevisionUpload, SealedUpload, parse_public_link_url};
 pub use devices::{Device, DeviceType};
 pub use event_manager::{
     CursorStore, DEFAULT_BACKGROUND_INTERVAL, DEFAULT_FOREGROUND_INTERVAL, EventManager,
