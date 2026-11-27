@@ -787,3 +787,282 @@ async fn upload_throughput_pipelined_vs_serial() {
 
     cleanup(client, &uploaded).await;
 }
+
+/// The active revision id, modification time and SHA-1 of a file, as read back.
+async fn file_facts(
+    client: &proton_drive_rs::ProtonDriveClient,
+    uid: &NodeUid,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let node = client
+        .get_node(uid)
+        .await
+        .expect("get_node")
+        .expect("the uploaded file is listed");
+    match node.kind {
+        proton_drive_rs::NodeKind::File {
+            active_revision_id,
+            claimed_modification_time,
+            content_sha1,
+            ..
+        } => (active_revision_id, claimed_modification_time, content_sha1),
+        proton_drive_rs::NodeKind::Folder => panic!("{uid} is a folder"),
+    }
+}
+
+/// A small file streamed through the mirror's call goes up in one request:
+/// nothing is stored through the block storage endpoint, and the thumbnail,
+/// the modification time and the sealed revision id all come through.
+/// A small revision of it then does the same.
+///
+/// The small-upload setting is shared by every clone of the client, so this
+/// turns it on for the rest of the binary's tests too. Both paths are valid
+/// for them.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_small_file_and_its_revision_go_up_in_one_request_each() {
+    use proton_drive_rs::{ModificationTime, Thumbnail, ThumbnailType};
+    use sha1::Digest as _;
+
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let counter = Arc::new(OpCounter::default());
+    let client = live
+        .client
+        .clone()
+        .with_telemetry(counter.clone())
+        .with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let payload: Vec<u8> = (0..50_000u32).map(|i| (i * 7) as u8).collect();
+    let thumbnail = b"small-upload-thumbnail".to_vec();
+    let mtime: ModificationTime = "2026-11-05T09:55:00+01:00".parse().unwrap();
+    let name = format!("rt-small-one-{}.bin", common::unique_suffix());
+    let sealed = client
+        .upload_file_replacing_draft_sealed(
+            &root.uid,
+            &name,
+            "application/octet-stream",
+            std::io::Cursor::new(payload.clone()),
+            payload.len() as i64,
+            vec![Thumbnail::new(ThumbnailType::Thumbnail, thumbnail.clone()).expect("thumbnail")],
+            Some(mtime),
+            false,
+        )
+        .await
+        .expect("small upload");
+    assert_eq!(
+        counter.count("storage_upload"),
+        0,
+        "no block went to storage"
+    );
+
+    assert_eq!(
+        client.download_file(&sealed.node_uid).await.unwrap(),
+        payload
+    );
+    assert_eq!(
+        client
+            .download_thumbnail(&sealed.node_uid, ThumbnailType::Thumbnail)
+            .await
+            .unwrap(),
+        Some(thumbnail)
+    );
+    let (revision, modified, sha1) = file_facts(&client, &sealed.node_uid).await;
+    assert_eq!(revision.as_deref(), Some(sealed.revision_id.as_str()));
+    let modified: ModificationTime = modified.expect("modification time").parse().unwrap();
+    assert_eq!(modified, mtime);
+    assert_eq!(
+        sha1.as_deref(),
+        Some(hex::encode(sha1::Sha1::digest(&payload)).as_str())
+    );
+
+    counter.reset();
+    let edit = b"the edited small file".to_vec();
+    let revised = client
+        .upload_new_revision_sealed(
+            &sealed.node_uid,
+            std::io::Cursor::new(edit.clone()),
+            edit.len() as i64,
+            Vec::new(),
+            Some(mtime),
+        )
+        .await
+        .expect("small revision");
+    assert_eq!(
+        counter.count("storage_upload"),
+        0,
+        "no block went to storage"
+    );
+    assert_ne!(revised.revision_id, sealed.revision_id);
+    assert_eq!(client.download_file(&sealed.node_uid).await.unwrap(), edit);
+    let (revision, _, _) = file_facts(&client, &sealed.node_uid).await;
+    assert_eq!(revision.as_deref(), Some(revised.revision_id.as_str()));
+
+    cleanup(&client, &[sealed.node_uid]).await;
+}
+
+/// An AEAD file is small-uploaded with an AEAD content key, and a revision of
+/// it keeps that key.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_small_aead_file_and_its_revision_round_trip() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let counter = Arc::new(OpCounter::default());
+    let client = live
+        .client
+        .clone()
+        .with_telemetry(counter.clone())
+        .with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let payload = b"aead small upload".to_vec();
+    let name = format!("rt-small-aead-{}.txt", common::unique_suffix());
+    let uid = match client
+        .upload_file_from(
+            &root.uid,
+            &name,
+            "text/plain",
+            std::io::Cursor::new(payload.clone()),
+            payload.len() as i64,
+            Vec::new(),
+            None,
+            true,
+        )
+        .await
+    {
+        Ok(uid) => uid,
+        // AEAD is server-gated (see `live_transfer_ops::aead_upload_download_roundtrip`),
+        // and the block path is refused the same way.
+        Err(e) if e.to_string().contains("Could not verify the nodeKey") => {
+            eprintln!("[skip] AEAD not enabled for this account (server-gated): {e}");
+            return;
+        }
+        Err(e) => panic!("small aead upload: {e}"),
+    };
+    assert_eq!(counter.count("storage_upload"), 0);
+    assert_eq!(client.download_file(&uid).await.unwrap(), payload);
+
+    let edit = b"aead small revision".to_vec();
+    client
+        .upload_new_revision_from(
+            &uid,
+            std::io::Cursor::new(edit.clone()),
+            edit.len() as i64,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("small aead revision");
+    assert_eq!(counter.count("storage_upload"), 0);
+    assert_eq!(client.download_file(&uid).await.unwrap(), edit);
+
+    cleanup(&client, &[uid]).await;
+}
+
+/// A reader with more than `intended_size` promised, and more than a small
+/// upload can take, still goes up whole, through the block path: the bytes
+/// read ahead to decide are sent first, then the rest.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_file_that_outgrew_its_intended_size_goes_up_whole_through_blocks() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let counter = Arc::new(OpCounter::default());
+    let client = live
+        .client
+        .clone()
+        .with_telemetry(counter.clone())
+        .with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i * 13) as u8).collect();
+    let name = format!("rt-small-grew-{}.bin", common::unique_suffix());
+    let uid = client
+        .upload_file_from(
+            &root.uid,
+            &name,
+            "application/octet-stream",
+            std::io::Cursor::new(payload.clone()),
+            1_000,
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("upload of a file that grew");
+    assert!(
+        counter.count("storage_upload") >= 1,
+        "the block path stored it"
+    );
+    assert_eq!(client.download_file(&uid).await.unwrap(), payload);
+
+    cleanup(&client, &[uid]).await;
+}
+
+/// A small upload over a name a committed file already holds falls back to the
+/// block path, which refuses it as a real conflict: the caller gets
+/// `AlreadyExists`, and the folder still holds one file of that name, with its
+/// first content.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_small_upload_over_a_taken_name_is_refused_and_makes_no_duplicate() {
+    use proton_sdk::api::ResponseCode;
+    use proton_sdk::error::ProtonError;
+
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let client = live.client.clone().with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let name = format!("rt-small-taken-{}.txt", common::unique_suffix());
+    let first = b"first".to_vec();
+    let uid = client
+        .upload_file(&root.uid, &name, "text/plain", &first)
+        .await
+        .expect("first upload");
+
+    let error = client
+        .upload_file_replacing_draft_from(
+            &root.uid,
+            &name,
+            "text/plain",
+            std::io::Cursor::new(b"second".to_vec()),
+            6,
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("a committed file of that name is a real conflict");
+    assert!(
+        matches!(&error, ProtonError::Api(e) if e.code == ResponseCode::AlreadyExists),
+        "{error}"
+    );
+
+    let named = client
+        .get_node_by_path(&root.uid, &name)
+        .await
+        .expect("resolve the name")
+        .expect("the name is still there");
+    assert_eq!(named.uid, uid, "the name still points at the first file");
+    assert_eq!(client.download_file(&uid).await.unwrap(), first);
+
+    cleanup(&client, &[uid]).await;
+}

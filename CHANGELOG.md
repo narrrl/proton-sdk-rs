@@ -17,6 +17,31 @@ This file starts after 0.9.2; earlier changes are in the git history.
   uid and the id of the revision they sealed. Drive often does not list a node
   made a moment ago, so a client that read the file back to learn that id
   often got nothing. The existing functions are unchanged.
+- **Streaming uploads use the one-request small upload.** With
+  `with_small_file_upload(true)`, the streaming calls now send a small file in
+  one request instead of three or more. These are `upload_file_from`,
+  `upload_file_replacing_draft_from`/`_sealed`, `upload_new_revision_from` and
+  `upload_new_revision_sealed`, plus the buffered `upload_file` and
+  `upload_new_revision` built on them. Before, only the buffered calls did.
+  The request is `files/small` or `revisions/small`.
+  - To decide, the call reads up to the small-upload budget plus one byte
+    into memory: at most about 116 KiB, less the thumbnails. A reader with more
+    than that sends what was read ahead, then the rest, through the block path,
+    so a file that grew since its `intended_size` was taken still goes up whole.
+  - It falls back to the block path in three cases: the API reports a name or
+    draft conflict (`AlreadyExists`), the file's keys cannot be read before a
+    small revision, or the thumbnails alone exceed the budget. As before, it
+    never resends a small request after any other failure, since one request
+    creates and seals together.
+- **The small upload carries what the block path does.** Thumbnails go in the
+  same request, one `ThumbnailBlockType_{type}` part each, and count against
+  the 128 KiB budget. A new file keeps its modification time and its AEAD
+  choice. Both endpoints return the revision they sealed. A small revision
+  drops the cached node, as a seal does. This matches the C# SDK.
+- **Telemetry names the upload path and the endpoint.** `upload_file` and
+  `upload_new_revision` events carry `backend=small` or `backend=blocks`. Each
+  `http_request` event carries `endpoint`: the path without its query, with ids
+  replaced by `{id}`.
 
 ### Fixed
 
