@@ -45,8 +45,11 @@ use proton_sdk::crypto::{
     derive_key_passphrase, generate_proofs,
 };
 use proton_sdk::error::{ProtonError, Result};
-use proton_sdk::http::{ApiHttpClient, Tokens, get_unauthenticated};
+use proton_sdk::http::{
+    ApiHttpClient, Observed, Tokens, get_unauthenticated_observed, post_unauthenticated_observed,
+};
 use proton_sdk::ids::{LinkId, NodeUid, SessionId, VolumeId};
+use proton_sdk::telemetry::{NoopTelemetry, Telemetry};
 
 use crate::client::{
     DEFAULT_MAX_INFLIGHT_BLOCKS, MAX_BATCH_COUNT, MAX_CONCURRENT_DETAIL_FETCHES,
@@ -101,7 +104,14 @@ struct Credentials {
     /// URL fragment password concatenated with any custom password — the TS SDK
     /// treats the pair as one secret throughout.
     password: String,
+    /// Where the handshake, and every session it mints, reports its requests.
+    telemetry: Arc<dyn Telemetry>,
 }
+
+/// The labels the handshake's requests report. Fixed strings, because the
+/// paths carry the link's token.
+const INFO_ENDPOINT: &str = "drive/urls/{token}/info";
+const AUTH_ENDPOINT: &str = "drive/urls/{token}/auth";
 
 /// What one completed handshake yields.
 struct AuthOutcome {
@@ -113,7 +123,15 @@ struct AuthOutcome {
 
 impl Credentials {
     async fn info(&self) -> Result<PublicLinkInfoResponse> {
-        get_unauthenticated(&self.config, &format!("drive/urls/{}/info", self.token)).await
+        get_unauthenticated_observed(
+            &self.config,
+            &format!("drive/urls/{}/info", self.token),
+            Some(Observed {
+                endpoint: INFO_ENDPOINT,
+                telemetry: &self.telemetry,
+            }),
+        )
+        .await
     }
 
     /// Run the SRP handshake and unlock the share key.
@@ -151,10 +169,15 @@ impl Credentials {
             client_ephemeral: BASE64.encode(&proofs.client_ephemeral),
             srp_session: info.srp_session,
         };
-        let response: PublicLinkAuthResponse = proton_sdk::http::post_unauthenticated(
+        let response: PublicLinkAuthResponse = post_unauthenticated_observed(
             &self.config,
             &format!("drive/urls/{}/auth", self.token),
             &request,
+            None,
+            Some(Observed {
+                endpoint: AUTH_ENDPOINT,
+                telemetry: &self.telemetry,
+            }),
         )
         .await?;
 
@@ -199,6 +222,8 @@ impl Credentials {
         // with an error about refreshing. Opt out, and let the 401 reach
         // `RevisionTransport`, which recovers by replaying *this* handshake.
         .without_token_refresh();
+        // A session minted by a later handshake reports to the same sink.
+        http.set_telemetry(self.telemetry.clone());
 
         Ok(AuthOutcome {
             http,
@@ -381,11 +406,23 @@ impl ProtonDrivePublicLinkClient {
     /// before prompting for a password. `url` is the full share URL including
     /// its `#password` fragment.
     pub async fn info(config: ProtonClientConfiguration, url: &str) -> Result<PublicLinkInfo> {
+        Self::info_with_telemetry(config, url, NoopTelemetry::shared()).await
+    }
+
+    /// [`info`](Self::info), reporting its request to `telemetry` as an
+    /// `http_request` event with the endpoint `drive/urls/{token}/info`. The
+    /// token itself is never reported.
+    pub async fn info_with_telemetry(
+        config: ProtonClientConfiguration,
+        url: &str,
+        telemetry: Arc<dyn Telemetry>,
+    ) -> Result<PublicLinkInfo> {
         let (token, password) = parse_public_link_url(url)?;
         let credentials = Credentials {
             config,
             token,
             password,
+            telemetry,
         };
         let raw = credentials.info().await?;
         Ok(PublicLinkInfo {
@@ -407,6 +444,20 @@ impl ProtonDrivePublicLinkClient {
         url: &str,
         custom_password: Option<&str>,
     ) -> Result<Self> {
+        Self::open_with_telemetry(config, url, custom_password, NoopTelemetry::shared()).await
+    }
+
+    /// [`open`](Self::open), reporting every request the client makes to
+    /// `telemetry`: the handshake's two (`drive/urls/{token}/info` and
+    /// `…/auth`), the session's API calls, its block downloads, and the
+    /// handshake again whenever an expired session is replaced. Attached
+    /// before the first request, unlike a sink set on an open client.
+    pub async fn open_with_telemetry(
+        config: ProtonClientConfiguration,
+        url: &str,
+        custom_password: Option<&str>,
+        telemetry: Arc<dyn Telemetry>,
+    ) -> Result<Self> {
         let (token, url_password) = parse_public_link_url(url)?;
         let password = match custom_password {
             Some(custom) if !custom.is_empty() => format!("{url_password}{custom}"),
@@ -417,6 +468,7 @@ impl ProtonDrivePublicLinkClient {
             config,
             token,
             password,
+            telemetry,
         })
         .await?;
 
@@ -1332,6 +1384,134 @@ mod tests {
             flags,
             vendor_type: 0,
         }
+    }
+
+    /// Every event a sink receives, for assertions.
+    #[derive(Default)]
+    struct Capture(std::sync::Mutex<Vec<proton_sdk::telemetry::TelemetryEvent>>);
+
+    impl proton_sdk::telemetry::Telemetry for Capture {
+        fn record(&self, event: &proton_sdk::telemetry::TelemetryEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// A loopback server that answers every request with `status` and `body`,
+    /// returning its base URL and the request lines it saw.
+    async fn serve(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                log.lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_owned());
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    fn config(base: &str) -> proton_sdk::config::ProtonClientConfiguration {
+        proton_sdk::config::ProtonClientConfiguration::new("test@1.0")
+            .with_base_url(base)
+            .with_retry_policy(proton_sdk::config::RetryPolicy::disabled())
+    }
+
+    /// A token no id heuristic would take for an id: letters only.
+    const TOKEN: &str = "SECRETTOKENXYZ";
+
+    fn leaks(events: &[proton_sdk::telemetry::TelemetryEvent]) -> bool {
+        events.iter().any(|e| {
+            e.attributes
+                .iter()
+                .any(|(_, v)| v.contains(TOKEN) || v.contains("pw"))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_link_handshake_is_reported_without_its_token() {
+        use proton_sdk::telemetry::Outcome;
+        // A legacy link: `open` stops after the info request.
+        let (base, seen) = serve("200 OK", r#"{"Code":1000,"Version":4,"Flags":0}"#).await;
+        let capture = std::sync::Arc::new(Capture::default());
+        let url = format!("https://drive.proton.me/urls/{TOKEN}#pw");
+        let opened = super::ProtonDrivePublicLinkClient::open_with_telemetry(
+            config(&base),
+            &url,
+            None,
+            capture.clone(),
+        )
+        .await;
+        assert!(opened.is_err(), "a legacy link is refused");
+        let info = super::ProtonDrivePublicLinkClient::info_with_telemetry(
+            config(&base),
+            &url,
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(info.is_legacy);
+
+        let events = capture.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "one event per request: {events:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "and one request per event");
+        for event in &events {
+            assert_eq!(event.operation, "http_request");
+            assert_eq!(event.outcome, Outcome::Success);
+            assert!(
+                event
+                    .attributes
+                    .contains(&("endpoint", "drive/urls/{token}/info".into()))
+            );
+            assert!(event.attributes.contains(&("status", "200".into())));
+        }
+        assert!(
+            !leaks(&events),
+            "the token reached the observer: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_is_a_failure_without_its_token() {
+        use proton_sdk::telemetry::Outcome;
+        let (base, _) = serve(
+            "404 Not Found",
+            r#"{"Code":2501,"Error":"link SECRETTOKENXYZ not found"}"#,
+        )
+        .await;
+        let capture = std::sync::Arc::new(Capture::default());
+        let url = format!("https://drive.proton.me/urls/{TOKEN}#pw");
+        let info = super::ProtonDrivePublicLinkClient::info_with_telemetry(
+            config(&base),
+            &url,
+            capture.clone(),
+        )
+        .await;
+        assert!(info.is_err());
+        let events = capture.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, Outcome::Failure);
+        assert!(events[0].attributes.contains(&("status", "404".into())));
+        assert!(
+            !leaks(&events),
+            "the token reached the observer: {events:?}"
+        );
     }
 
     #[test]

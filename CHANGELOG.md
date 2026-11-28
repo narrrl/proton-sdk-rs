@@ -7,6 +7,24 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [Unreleased]
+
+### Added
+
+- **A public link can report its requests from the first one.**
+  `ProtonDrivePublicLinkClient::open_with_telemetry` and `info_with_telemetry`
+  take a `Telemetry` sink before the handshake starts. The sink receives an
+  `http_request` event for the link's `info` and `auth` requests, every API
+  call of the anonymous session, the session's block downloads, and the
+  handshake again when an expired session is replaced. The handshake routes
+  are reported as `drive/urls/{token}/info` and `drive/urls/{token}/auth`, and
+  the token itself is never reported. `open` and `info` are unchanged and
+  report nothing.
+- `proton_sdk::http::get_unauthenticated_observed` and
+  `post_unauthenticated_observed` report one `http_request` event per call,
+  under a route label the caller gives, to the sink in `Observed`. Retries
+  inside the call are not counted separately.
+
 ## [0.12.8] — 2026-11-28
 
 ### Added
