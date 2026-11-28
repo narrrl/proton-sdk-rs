@@ -34,3 +34,7 @@ sha1.workspace = true
 sha2.workspace = true
 pgp.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# A loopback HTTP server backs the public-link telemetry test.
+tokio = { workspace = true, features = ["net"] }

@@ -669,6 +669,37 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     config: &ProtonClientConfiguration,
     path: &str,
 ) -> Result<T> {
+    get_unauthenticated_observed(config, path, None).await
+}
+
+/// A route and the sink that times a session-less request to it.
+///
+/// The route is given rather than derived from the path, because these paths
+/// can carry a secret: a public link's token is no id that
+/// `endpoint` would recognise, and must never reach an observer.
+#[derive(Clone, Copy)]
+pub struct Observed<'a> {
+    /// The label reported as the event's `endpoint`, e.g.
+    /// `drive/urls/{token}/info`.
+    pub endpoint: &'static str,
+    pub telemetry: &'a Arc<dyn Telemetry>,
+}
+
+/// [`get_unauthenticated`], reporting one `http_request` event to `observed`.
+///
+/// One event is one logical call: the retries [`RetryPolicy`] makes inside it
+/// are not counted separately.
+pub async fn get_unauthenticated_observed<T: DeserializeOwned>(
+    config: &ProtonClientConfiguration,
+    path: &str,
+    observed: Option<Observed<'_>>,
+) -> Result<T> {
+    let mut timer = observed.map(|o| {
+        let mut timer = o.telemetry.start("http_request");
+        timer.attr("method", "GET");
+        timer.attr("endpoint", o.endpoint);
+        timer
+    });
     let http = client_builder(config).build()?;
 
     let base_url = ensure_trailing_slash(&config.base_url);
@@ -686,7 +717,21 @@ pub async fn get_unauthenticated<T: DeserializeOwned>(
     })
     .await?;
 
-    parse_buffered(response)
+    observe_reply(timer.as_mut(), response)
+}
+
+/// Record `response`'s status on `timer`, and its success once it parses.
+fn observe_reply<T: DeserializeOwned>(
+    timer: Option<&mut crate::telemetry::OpTimer>,
+    response: Buffered,
+) -> Result<T> {
+    let Some(timer) = timer else {
+        return parse_buffered(response);
+    };
+    timer.attr("status", response.status.as_u16());
+    let parsed = parse_buffered(response)?;
+    timer.success();
+    Ok(parsed)
 }
 
 /// `POST {path}` without a session: no `x-pm-uid` and no bearer token.
@@ -716,6 +761,24 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
     body: &B,
     verification: Option<&HumanVerificationCredential>,
 ) -> Result<T> {
+    post_unauthenticated_observed(config, path, body, verification, None).await
+}
+
+/// [`post_unauthenticated_verified`], reporting one `http_request` event to
+/// `observed`.
+pub async fn post_unauthenticated_observed<B: Serialize, T: DeserializeOwned>(
+    config: &ProtonClientConfiguration,
+    path: &str,
+    body: &B,
+    verification: Option<&HumanVerificationCredential>,
+    observed: Option<Observed<'_>>,
+) -> Result<T> {
+    let mut timer = observed.map(|o| {
+        let mut timer = o.telemetry.start("http_request");
+        timer.attr("method", "POST");
+        timer.attr("endpoint", o.endpoint);
+        timer
+    });
     let http = client_builder(config).build()?;
 
     let base_url = ensure_trailing_slash(&config.base_url);
@@ -739,7 +802,7 @@ pub async fn post_unauthenticated_verified<B: Serialize, T: DeserializeOwned>(
     })
     .await?;
 
-    parse_buffered(response)
+    observe_reply(timer.as_mut(), response)
 }
 
 /// Read a response body, enforce the Proton success envelope, and deserialize
