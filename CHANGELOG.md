@@ -7,6 +7,26 @@ commits a change ports are recorded in [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 This file starts after 0.9.2; earlier changes are in the git history.
 
+## [0.12.8] — unreleased
+
+### Added
+
+- **A new revision can be uploaded only over the revision the caller expects.**
+  `upload_new_revision_over` takes the id of the revision the caller last saw.
+  It returns `RevisionUpload::Moved` when another client has committed one
+  since, and `RevisionUpload::Trashed` when the file is in the trash. In both
+  cases nothing is sent. The check uses the read of the file's link that the
+  upload needs for its keys anyway, so it costs no request. A caller that read
+  the file itself to make the same check can drop that read.
+
+### Changed
+
+- **A folder's hash key is read once.** Every new file, folder, rename and move
+  into a folder read the folder's link again to get the key that hashes its
+  children's names. The key is now cached next to the folder's node key, and
+  dropped with it on the folder's events. A second upload into a folder sends
+  no read of the folder.
+
 ## [0.12.7] — 2026-11-28
 
 ### Added

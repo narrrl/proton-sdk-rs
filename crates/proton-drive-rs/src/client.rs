@@ -365,6 +365,11 @@ struct DriveCache {
     /// them. Entries are also dropped on the matching remote event
     /// ([`ProtonDriveClient::invalidate_caches_for_event`]).
     folder_keys: LruCache<NodeUid, PrivateKey>,
+    /// Decrypted hash key per folder, which names its children. Every upload,
+    /// folder creation, rename and move into a folder needs it, and fetching
+    /// it cost one link read each time. A folder's hash key never changes, but
+    /// entries are dropped with [`folder_keys`](Self::folder_keys) all the same.
+    folder_hash_keys: LruCache<NodeUid, Vec<u8>>,
     /// Thumbnail lookups per file. Dropped with the node's events, and on a
     /// failed fetch, since a new revision has new thumbnail ids.
     thumbnail_targets: LruCache<NodeUid, ThumbnailTargets>,
@@ -388,6 +393,9 @@ impl Default for DriveCache {
             photos_root: None,
             photos_volume_exists: None,
             folder_keys: LruCache::new(
+                NonZeroUsize::new(FOLDER_KEY_CACHE_CAP).expect("cap is non-zero"),
+            ),
+            folder_hash_keys: LruCache::new(
                 NonZeroUsize::new(FOLDER_KEY_CACHE_CAP).expect("cap is non-zero"),
             ),
             thumbnail_targets: LruCache::new(
@@ -429,6 +437,18 @@ struct FileDraftSpec<'a> {
 pub struct SealedUpload {
     pub node_uid: NodeUid,
     pub revision_id: String,
+}
+
+/// What [`ProtonDriveClient::upload_new_revision_over`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionUpload {
+    /// The revision was sealed and is now the file's active revision.
+    Sealed(SealedUpload),
+    /// The file's active revision is no longer the expected one. Nothing was
+    /// sent.
+    Moved,
+    /// The file is in the trash. Nothing was sent.
+    Trashed,
 }
 
 struct RevisionDraft {
@@ -1397,6 +1417,7 @@ impl ProtonDriveClient {
                 {
                     let mut cache = self.cache.lock().await;
                     cache.folder_keys.pop(node_uid);
+                    cache.folder_hash_keys.pop(node_uid);
                     cache.thumbnail_targets.pop(node_uid);
                 }
                 {
@@ -1409,6 +1430,7 @@ impl ProtonDriveClient {
                 {
                     let mut cache = self.cache.lock().await;
                     cache.folder_keys.pop(node_uid);
+                    cache.folder_hash_keys.pop(node_uid);
                     cache.thumbnail_targets.pop(node_uid);
                 }
                 {
@@ -1421,6 +1443,7 @@ impl ProtonDriveClient {
                 {
                     let mut cache = self.cache.lock().await;
                     cache.folder_keys.clear();
+                    cache.folder_hash_keys.clear();
                     cache.thumbnail_targets.clear();
                 }
                 {
@@ -2689,13 +2712,29 @@ impl ProtonDriveClient {
     /// The file's keys and active revision, which a small revision upload
     /// needs before it can build its request.
     async fn small_revision_keys(&self, file_uid: &NodeUid) -> Result<SmallRevisionKeys> {
+        let detail = self.file_link_detail(file_uid).await?;
+        self.small_revision_keys_from(file_uid, detail).await
+    }
+
+    /// The link of `file_uid`, read once.
+    async fn file_link_detail(&self, file_uid: &NodeUid) -> Result<LinkDetailsDto> {
         let details = self
             .get_link_details(&file_uid.volume_id, std::slice::from_ref(&file_uid.link_id))
             .await?;
-        let detail =
-            details.links.into_iter().next().ok_or_else(|| {
-                ProtonError::invalid_operation(format!("file {file_uid} not found"))
-            })?;
+        details
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtonError::invalid_operation(format!("file {file_uid} not found")))
+    }
+
+    /// [`small_revision_keys`](Self::small_revision_keys) from the file's link
+    /// as already read.
+    async fn small_revision_keys_from(
+        &self,
+        file_uid: &NodeUid,
+        detail: LinkDetailsDto,
+    ) -> Result<SmallRevisionKeys> {
         let file = detail.file.ok_or_else(|| {
             ProtonError::invalid_operation(format!("node {file_uid} is not a file"))
         })?;
@@ -2816,40 +2855,123 @@ impl ProtonDriveClient {
     pub async fn upload_new_revision_sealed<R: Read + Send>(
         &self,
         file_uid: &NodeUid,
-        mut reader: R,
+        reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
         last_modification_time: Option<ModificationTime>,
     ) -> Result<SealedUpload> {
+        match self
+            .upload_revision(
+                file_uid,
+                None,
+                reader,
+                intended_size,
+                thumbnails,
+                last_modification_time,
+            )
+            .await?
+        {
+            RevisionUpload::Sealed(sealed) => Ok(sealed),
+            RevisionUpload::Moved | RevisionUpload::Trashed => Err(ProtonError::invalid_operation(
+                "a revision upload without an expected revision was refused",
+            )),
+        }
+    }
+
+    /// Like [`upload_new_revision_sealed`](Self::upload_new_revision_sealed),
+    /// but only over the revision `expected_revision_id`.
+    ///
+    /// The file's link is read once, before anything is sent. When the file is
+    /// in the trash, or its active revision is no longer `expected_revision_id`
+    /// because another client committed one since the caller looked, nothing is
+    /// uploaded and the answer says why. Otherwise the same read gives the keys
+    /// for the upload, so the check costs no request of its own. The revision
+    /// is then created over `expected_revision_id`, and the API refuses it if
+    /// another one was committed in between.
+    pub async fn upload_new_revision_over<R: Read + Send>(
+        &self,
+        file_uid: &NodeUid,
+        expected_revision_id: &str,
+        reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+    ) -> Result<RevisionUpload> {
+        self.upload_revision(
+            file_uid,
+            Some(expected_revision_id),
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+        )
+        .await
+    }
+
+    /// Both revision uploads. With `expected`, the file's link is read and
+    /// checked first, and that read serves the small path or the draft.
+    async fn upload_revision<R: Read + Send>(
+        &self,
+        file_uid: &NodeUid,
+        expected: Option<&str>,
+        mut reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<ModificationTime>,
+    ) -> Result<RevisionUpload> {
+        let mut detail = None;
+        if let Some(expected) = expected {
+            let read = self.file_link_detail(file_uid).await?;
+            if read.link.is_trashed() {
+                return Ok(RevisionUpload::Trashed);
+            }
+            let active = read
+                .file
+                .as_ref()
+                .and_then(|file| file.active_revision.as_ref())
+                .map(|revision| revision.id.as_str());
+            if active != Some(expected) {
+                return Ok(RevisionUpload::Moved);
+            }
+            detail = Some(read);
+        }
         let Some(budget) = self.small_upload_budget(intended_size, &thumbnails) else {
             return self
                 .upload_revision_blocks(
                     file_uid,
+                    detail,
                     reader,
                     intended_size,
                     thumbnails,
                     last_modification_time,
                 )
-                .await;
+                .await
+                .map(RevisionUpload::Sealed);
         };
         let ahead = read_ahead(&mut reader, budget)?;
         if ahead.len() > budget {
             return self
                 .upload_revision_blocks(
                     file_uid,
+                    detail,
                     Cursor::new(ahead).chain(reader),
                     intended_size,
                     thumbnails,
                     last_modification_time,
                 )
-                .await;
+                .await
+                .map(RevisionUpload::Sealed);
         }
-        match self.small_revision_keys(file_uid).await {
+        let keys = match detail.take() {
+            Some(read) => self.small_revision_keys_from(file_uid, read).await,
+            None => self.small_revision_keys(file_uid).await,
+        };
+        match keys {
             Ok(keys) => match self
                 .upload_small_revision(file_uid, keys, &ahead, &thumbnails, last_modification_time)
                 .await
             {
-                Ok(sealed) => return Ok(sealed),
+                Ok(sealed) => return Ok(RevisionUpload::Sealed(sealed)),
                 Err(error) if small_upload_should_fall_back(&error) => {
                     tracing::debug!(%error, "small revision upload conflicted; falling back to blocks");
                 }
@@ -2862,12 +2984,14 @@ impl ProtonDriveClient {
         let size = ahead.len() as i64;
         self.upload_revision_blocks(
             file_uid,
+            None,
             Cursor::new(ahead),
             size,
             thumbnails,
             last_modification_time,
         )
         .await
+        .map(RevisionUpload::Sealed)
     }
 
     /// The block path for a new revision: open a revision draft, upload the
@@ -2875,6 +2999,7 @@ impl ProtonDriveClient {
     async fn upload_revision_blocks<R: Read + Send>(
         &self,
         file_uid: &NodeUid,
+        detail: Option<LinkDetailsDto>,
         reader: R,
         intended_size: i64,
         thumbnails: Vec<Thumbnail>,
@@ -2882,7 +3007,13 @@ impl ProtonDriveClient {
     ) -> Result<SealedUpload> {
         let mut timer = self.telemetry.start("upload_new_revision");
         timer.attr("backend", "blocks");
-        let draft = self.create_revision_draft(file_uid, intended_size).await?;
+        let draft = match detail {
+            Some(detail) => {
+                self.create_revision_draft_from(file_uid, detail, intended_size)
+                    .await?
+            }
+            None => self.create_revision_draft(file_uid, intended_size).await?,
+        };
 
         let written = self.write_blocks(&draft, reader, thumbnails).await?;
         timer.attr("size", written.total_size);
@@ -5334,16 +5465,22 @@ impl ProtonDriveClient {
         file_uid: &NodeUid,
         intended_upload_size: i64,
     ) -> Result<RevisionDraft> {
+        let detail = self.file_link_detail(file_uid).await?;
+        self.create_revision_draft_from(file_uid, detail, intended_upload_size)
+            .await
+    }
+
+    /// [`create_revision_draft`](Self::create_revision_draft) from the file's
+    /// link as already read.
+    async fn create_revision_draft_from(
+        &self,
+        file_uid: &NodeUid,
+        detail: LinkDetailsDto,
+        intended_upload_size: i64,
+    ) -> Result<RevisionDraft> {
         let volume_id = file_uid.volume_id.clone();
 
         // Recover the file's existing secrets (node key + content key).
-        let details = self
-            .get_link_details(&volume_id, std::slice::from_ref(&file_uid.link_id))
-            .await?;
-        let detail =
-            details.links.into_iter().next().ok_or_else(|| {
-                ProtonError::invalid_operation(format!("file {file_uid} not found"))
-            })?;
         let link = detail.link;
         let file = detail.file.ok_or_else(|| {
             ProtonError::invalid_operation(format!("node {file_uid} is not a file"))
@@ -5985,6 +6122,9 @@ impl ProtonDriveClient {
         parent_key: &PrivateKey,
         for_photos: bool,
     ) -> Result<Vec<u8>> {
+        if let Some(key) = self.cache.lock().await.folder_hash_keys.get(parent_uid) {
+            return Ok(key.clone());
+        }
         let details = self
             .get_link_details_ctx(
                 &parent_uid.volume_id,
@@ -6003,7 +6143,13 @@ impl ProtonDriveClient {
         let folder = detail
             .folder_properties()
             .ok_or_else(|| ProtonError::invalid_operation("parent node is not a folder"))?;
-        Ok(parent_key.decrypt_armored_message(folder.hash_key)?)
+        let hash_key = parent_key.decrypt_armored_message(folder.hash_key)?;
+        self.cache
+            .lock()
+            .await
+            .folder_hash_keys
+            .put(parent_uid.clone(), hash_key.clone());
+        Ok(hash_key)
     }
 
     /// Fetch the block verification code, validating that the returned content
@@ -9899,6 +10045,7 @@ mod tests {
         // daemon leaks one decrypted folder key per folder ever visited.
         let cache = DriveCache::default();
         assert_eq!(cache.folder_keys.cap().get(), FOLDER_KEY_CACHE_CAP);
+        assert_eq!(cache.folder_hash_keys.cap().get(), FOLDER_KEY_CACHE_CAP);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use proton_sdk::telemetry::{Telemetry, TelemetryEvent};
 #[derive(Default)]
 struct OpCounter {
     counts: Mutex<HashMap<&'static str, usize>>,
+    endpoints: Mutex<HashMap<String, usize>>,
 }
 
 impl Telemetry for OpCounter {
@@ -29,6 +30,14 @@ impl Telemetry for OpCounter {
             .expect("counter poisoned")
             .entry(event.operation)
             .or_default() += 1;
+        if let Some((_, endpoint)) = event.attributes.iter().find(|(key, _)| *key == "endpoint") {
+            *self
+                .endpoints
+                .lock()
+                .expect("counter poisoned")
+                .entry(endpoint.clone())
+                .or_default() += 1;
+        }
     }
 }
 
@@ -42,8 +51,19 @@ impl OpCounter {
             .unwrap_or(0)
     }
 
+    /// Requests to an endpoint, as the SDK tags them (ids masked).
+    fn endpoint(&self, endpoint: &str) -> usize {
+        self.endpoints
+            .lock()
+            .expect("counter poisoned")
+            .get(endpoint)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn reset(&self) {
         self.counts.lock().expect("counter poisoned").clear();
+        self.endpoints.lock().expect("counter poisoned").clear();
     }
 }
 
@@ -540,17 +560,21 @@ async fn revision_history_lists_reads_restores_and_deletes() {
         "a malformed revision id must error rather than read as absent"
     );
 
-    // Superseded revisions, oldest first, are the two earlier uploads.
-    let mut superseded: Vec<_> = revisions.iter().filter(|r| !r.is_active()).collect();
-    superseded.sort_by_key(|r| r.creation_time);
+    // Superseded revisions are the two earlier uploads. Small uploads can land
+    // within one second, so they are told apart by size, not creation time.
+    let superseded: Vec<_> = revisions.iter().filter(|r| !r.is_active()).collect();
     assert_eq!(superseded.len(), 2);
-
-    let oldest = superseded[0];
+    let mut sizes: Vec<_> = superseded.iter().map(|r| r.claimed_size).collect();
+    sizes.sort();
     assert_eq!(
-        oldest.claimed_size,
-        Some(v1.len() as i64),
-        "the oldest revision must still claim the first payload's size"
+        sizes,
+        vec![Some(v1.len() as i64), Some(v2.len() as i64)],
+        "the superseded revisions must still claim the earlier payloads' sizes"
     );
+    let oldest = superseded
+        .iter()
+        .find(|r| r.claimed_size == Some(v1.len() as i64))
+        .expect("the first revision is superseded");
 
     // Reading a superseded revision must give back its own content, not the
     // active one's — the whole point of keeping history.
@@ -1065,4 +1089,170 @@ async fn a_small_upload_over_a_taken_name_is_refused_and_makes_no_duplicate() {
     assert_eq!(client.download_file(&uid).await.unwrap(), first);
 
     cleanup(&client, &[uid]).await;
+}
+
+/// A folder's keys are read once: a second small upload into the same folder
+/// is its one request, with no read of the folder's link.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_second_upload_into_a_folder_reads_none_of_its_keys_again() {
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let counter = Arc::new(OpCounter::default());
+    let client = live
+        .client
+        .clone()
+        .with_telemetry(counter.clone())
+        .with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+
+    let mut uids = Vec::new();
+    for round in 0..2 {
+        counter.reset();
+        let name = format!("rt-keys-{round}-{}.txt", common::unique_suffix());
+        let sealed = client
+            .upload_file_replacing_draft_sealed(
+                &root.uid,
+                &name,
+                "text/plain",
+                std::io::Cursor::new(b"keys".to_vec()),
+                4,
+                Vec::new(),
+                None,
+                false,
+            )
+            .await
+            .expect("small upload");
+        uids.push(sealed.node_uid);
+    }
+    assert_eq!(
+        counter.endpoint("v2/volumes/{id}/links"),
+        0,
+        "the second upload read no link"
+    );
+    assert_eq!(counter.endpoint("v2/volumes/{id}/files/small"), 1);
+
+    cleanup(&client, &uids).await;
+}
+
+/// A revision over an expected revision checks it with the link read the
+/// upload needs anyway, and sends nothing over a revision that moved on or a
+/// file in the trash.
+#[tokio::test]
+#[ignore = "live: needs test-account credentials"]
+async fn a_revision_over_an_expected_revision_is_refused_once_another_one_lands() {
+    use proton_drive_rs::RevisionUpload;
+
+    let Some(live) = common::live_client().await else {
+        return;
+    };
+    let counter = Arc::new(OpCounter::default());
+    let client = live
+        .client
+        .clone()
+        .with_telemetry(counter.clone())
+        .with_small_file_upload(true);
+    let root = client
+        .get_my_files_folder()
+        .await
+        .expect("get my-files root");
+    let name = format!("rt-over-{}.txt", common::unique_suffix());
+    let first = client
+        .upload_file_replacing_draft_sealed(
+            &root.uid,
+            &name,
+            "text/plain",
+            std::io::Cursor::new(b"one".to_vec()),
+            3,
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("upload v1");
+    let second = client
+        .upload_new_revision_sealed(
+            &first.node_uid,
+            std::io::Cursor::new(b"two".to_vec()),
+            3,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("upload v2");
+
+    let stale = client
+        .upload_new_revision_over(
+            &first.node_uid,
+            &first.revision_id,
+            std::io::Cursor::new(b"stale".to_vec()),
+            5,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("revision over v1");
+    assert_eq!(stale, RevisionUpload::Moved);
+    assert_eq!(client.download_file(&first.node_uid).await.unwrap(), b"two");
+
+    counter.reset();
+    let third = client
+        .upload_new_revision_over(
+            &first.node_uid,
+            &second.revision_id,
+            std::io::Cursor::new(b"three".to_vec()),
+            5,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("revision over v2");
+    let RevisionUpload::Sealed(third) = third else {
+        panic!("a revision over the active one was refused: {third:?}");
+    };
+    assert_eq!(
+        counter.endpoint("v2/volumes/{id}/links"),
+        1,
+        "one link read serves the check and the keys"
+    );
+    assert_eq!(
+        counter.endpoint("v2/volumes/{id}/files/{id}/revisions/small"),
+        1
+    );
+    assert_eq!(
+        client.download_file(&first.node_uid).await.unwrap(),
+        b"three"
+    );
+
+    common::log_outcomes(
+        "trash",
+        &client
+            .trash_nodes(std::slice::from_ref(&first.node_uid))
+            .await
+            .expect("trash"),
+    );
+    let trashed = client
+        .upload_new_revision_over(
+            &first.node_uid,
+            &third.revision_id,
+            std::io::Cursor::new(b"four".to_vec()),
+            4,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("revision over a trashed file");
+    assert_eq!(trashed, RevisionUpload::Trashed);
+
+    match client
+        .delete_nodes(std::slice::from_ref(&first.node_uid))
+        .await
+    {
+        Ok(outcomes) => common::log_outcomes("delete", &outcomes),
+        Err(e) => eprintln!("[cleanup] delete failed: {e}"),
+    }
 }
